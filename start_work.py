@@ -1,3 +1,10 @@
+CHANNELS = [
+	'contestgo_test'
+]
+
+KEYWORDS = [
+	'конкурс'
+]
 from telethon import TelegramClient
 from decouple import config
 
@@ -10,9 +17,20 @@ password = config('PASSWORD', default=None)
 
 client = TelegramClient(login, api_id, api_hash)
 
+from telethon import events
+
 async def main():
 	await client.start(phone=phone, password=password)
 	print("Клиент Telethon успешно запущен!")
+
+	@client.on(events.NewMessage(chats=CHANNELS))
+	async def handler(event):
+		text = event.message.message or ""
+		if any(keyword.lower() in text.lower() for keyword in KEYWORDS):
+			# Пересылка в "Избранное" (Saved Messages)
+			await event.message.forward_to('me')
+			print(f"Переслано: {text[:50]}...")
+
 	await client.run_until_disconnected()
 
 if __name__ == "__main__":
