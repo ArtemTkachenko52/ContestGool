@@ -28,11 +28,9 @@ async def main():
 	async def handler(event):
 		text = event.message.message or ""
 		if any(keyword.lower() in text.lower() for keyword in KEYWORDS):
-			# Пересылка в "Избранное" (Saved Messages)
-			await event.message.forward_to('me')
 			# Пересылка в бота
 			await event.message.forward_to(BOT_USERNAME)
-			print(f"Переслано в избранное и боту: {text[:50]}...")
+			print(f"Переслано боту: {text[:50]}...")
 
 	await client.run_until_disconnected()
 
