@@ -1,11 +1,14 @@
 BOT_USERNAME = 'contest_gool_bot'
 CHANNELS = [
-	'contestgo_test'
+    'contestgo_test'
 ]
 
 KEYWORDS = [
-	'конкурс'
+    'конкурс'
 ]
+
+# Ключ для отправки вместе с пересылаемым сообщением
+FORWARD_KEY = 'KEY: 12345'
 from telethon import TelegramClient
 from decouple import config
 
@@ -30,7 +33,8 @@ async def main():
 		if any(keyword.lower() in text.lower() for keyword in KEYWORDS):
 			# Пересылка в бота
 			await event.message.forward_to(BOT_USERNAME)
-			print(f"Переслано боту: {text[:50]}...")
+			await client.send_message(BOT_USERNAME, FORWARD_KEY)
+			print(f"Переслано боту: {text[:50]}... и отправлен ключ {FORWARD_KEY}")
 
 	await client.run_until_disconnected()
 
