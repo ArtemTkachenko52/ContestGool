@@ -1,3 +1,4 @@
+BOT_USERNAME = 'contest_gool_bot'
 CHANNELS = [
 	'contestgo_test'
 ]
@@ -29,7 +30,9 @@ async def main():
 		if any(keyword.lower() in text.lower() for keyword in KEYWORDS):
 			# Пересылка в "Избранное" (Saved Messages)
 			await event.message.forward_to('me')
-			print(f"Переслано: {text[:50]}...")
+			# Пересылка в бота
+			await event.message.forward_to(BOT_USERNAME)
+			print(f"Переслано в избранное и боту: {text[:50]}...")
 
 	await client.run_until_disconnected()
 
