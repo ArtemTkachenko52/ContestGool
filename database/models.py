@@ -1,121 +1,124 @@
-from sqlalchemy import Column, Integer, String, BigInteger, Boolean, DateTime, ForeignKey, JSON
+from sqlalchemy import Column, BigInteger, String, Integer, Boolean, DateTime, ForeignKey, JSON, Text
 from sqlalchemy.sql import func
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from database.base import Base
 
-class Base(DeclarativeBase):
-    pass
+class BaseAccount:
+    id = Column(Integer, primary_key=True)
+    phone = Column(String, unique=True, nullable=False)
+    api_id = Column(Integer)
+    api_hash = Column(String)
+    session_string = Column(String)
+    group_tag = Column(String, index=True)
+    proxy = Column(String)
+    device_model = Column(String)
+    os_version = Column(String)
+    app_version = Column(String)
+    system_lang = Column(String, default="ru-RU")
 
-# Твоя старая таблица (оставляем!)
+# --- СХЕМА WATCHER ---
 class Keyword(Base):
     __tablename__ = "keywords"
     __table_args__ = {"schema": "watcher"}
-    id: Mapped[int] = mapped_column(primary_key=True)
-    word: Mapped[str] = mapped_column(String(100), unique=True)
-    is_active: Mapped[bool] = mapped_column(default=True)
+    id = Column(Integer, primary_key=True)
+    word = Column(String(100), unique=True)
+    category = Column(String, default="general")
+    is_active = Column(Boolean, default=True)
 
-# --- НОВЫЕ ТАБЛИЦЫ ---
-
-# 1. Каналы (Схема watcher)
 class TargetChannel(Base):
     __tablename__ = 'channels'
     __table_args__ = {"schema": "watcher"}
     id = Column(Integer, primary_key=True)
-    tg_id = Column(BigInteger, unique=True, nullable=False)
+    tg_id = Column(BigInteger, unique=True)
     username = Column(String)
-    group_tag = Column(String, index=True) # "A1", "A2"
+    group_tag = Column(String, index=True)
+    status = Column(String, default="idle")
     last_msg_id = Column(Integer, default=0)
     fail_count = Column(Integer, default=0)
-    status = Column(String, default="idle")
 
-# 2. Операторы (Схема management)
-class Operator(Base):
-    __tablename__ = 'operators'
-    __table_args__ = {"schema": "management"}
-    id = Column(Integer, primary_key=True)
-    tg_id = Column(BigInteger, unique=True, nullable=False)
-    group_tag = Column(String, index=True)
-    last_activity = Column(DateTime, onupdate=func.now())
-
-# 3. Аккаунты Читатели (Схема watcher)
-class ReaderAccount(Base):
+class ReaderAccount(Base, BaseAccount):
     __tablename__ = 'readers'
     __table_args__ = {"schema": "watcher"}
-    id = Column(Integer, primary_key=True)
-    phone = Column(String, unique=True, nullable=False)
-    password_2fa = Column(String)
-    email = Column(String)
-    api_id = Column(Integer)
-    api_hash = Column(String)
-    proxy = Column(String)
-    device_model = Column(String)
-    os_version = Column(String)
-    app_version = Column(String)
-    system_lang = Column(String, default="ru-RU")
-    group_tag = Column(String)
-    session_string = Column(String)
-
-# 4. Аккаунты Исполнители (Схема workers)
-class WorkerAccount(Base):
-    __tablename__ = 'workers'
-    __table_args__ = {"schema": "workers"}
-    id = Column(Integer, primary_key=True)
-    tg_id = Column(BigInteger, unique=True) # Юзер айди самого аккаунта
-    phone = Column(String, unique=True, nullable=False)
-    password_2fa = Column(String)
-    email = Column(String)
-    api_id = Column(Integer)
-    api_hash = Column(String)
-    proxy = Column(String)
-    device_model = Column(String)
-    os_version = Column(String)
-    app_version = Column(String)
-    system_lang = Column(String, default="ru-RU")
-    group_tag = Column(String)
-    session_string = Column(String)
 
 class PotentialPost(Base):
     __tablename__ = 'potential_posts'
     __table_args__ = {"schema": "watcher"}
-
     id = Column(Integer, primary_key=True)
-    group_tag = Column(String, index=True)      # Группа (A1, A2...)
-    
-    source_tg_id = Column(BigInteger)           # ID канала
-    source_msg_id = Column(BigInteger)          # ID поста в канале
-    storage_msg_id = Column(BigInteger)         # ID в твоем хранилище
-    
-    keyword_hit = Column(String)                # Какое слово сработало
-    
-    is_claimed = Column(Boolean, default=False) # Получен ли оператором
-    published_at = Column(DateTime)             # Дата поста в ТГ
-    claimed_at = Column(DateTime)               # Когда оператор нажал кнопку в боте
+    group_tag = Column(String, index=True)
+    storage_msg_id = Column(BigInteger)
+    source_tg_id = Column(BigInteger)
+    source_msg_id = Column(BigInteger)
+    post_type = Column(String, default="keyword")
+    keyword_hit = Column(String)
+    is_claimed = Column(Boolean, default=False)
+    published_at = Column(DateTime)
+    claimed_at = Column(DateTime)
+
+class MonitoringPost(Base):
+    __tablename__ = 'monitoring_posts'
+    __table_args__ = {"schema": "watcher"}
+    id = Column(Integer, primary_key=True)
+    channel_id = Column(BigInteger)
+    storage_msg_id = Column(BigInteger)
+    created_at = Column(DateTime, server_default=func.now())
+
 class DiscoveryChannel(Base):
     __tablename__ = 'discovery_channels'
     __table_args__ = {"schema": "watcher"}
-
     id = Column(Integer, primary_key=True)
     tg_id = Column(BigInteger, unique=True)
     username = Column(String)
-    found_from_group = Column(String)  # Кто нашел (напр. 'A1')
-    reason = Column(String)            # 'forward' или 'subscription_condition'
-    created_at = Column(DateTime, server_default=func.now())
-    is_checked = Column(Boolean, default=False) # Проверил ли оператор
+    found_from_group = Column(String)
+    reason = Column(String)
+    is_checked = Column(Boolean, default=False)
+
+# --- СХЕМА MANAGEMENT ---
+class Operator(Base):
+    __tablename__ = 'operators'
+    __table_args__ = {"schema": "management"}
+    id = Column(Integer, primary_key=True)
+    tg_id = Column(BigInteger, unique=True)
+    group_tag = Column(String)
+    rank = Column(Integer, default=1)
+    last_activity = Column(DateTime, onupdate=func.now())
 
 class ContestPassport(Base):
     __tablename__ = 'passports'
     __table_args__ = {"schema": "management"}
-
     id = Column(Integer, primary_key=True)
-    post_id = Column(Integer) # ID из таблицы potential_posts
-    group_tag = Column(String, index=True)
-    
-    type = Column(String)           # 'afk', 'vote', 'ludka'
-    prize_type = Column(String)     # 'Деньги', 'NFT' и т.д.
-    conditions = Column(JSON)        # Список условий ["sub", "reac"]
-    
-    deadline = Column(DateTime, nullable=True) # Может быть None
-    max_accounts = Column(Integer, default=0)  # 0 значит "Все"
-    
-    status = Column(String, default="active") # active / finished
+    post_id = Column(Integer)
+    group_tag = Column(String)
+    type = Column(String)
+    prize_details = Column(Text)
+    conditions = Column(JSON)
+    max_accounts = Column(Integer)
+    deadline = Column(DateTime, nullable=True)
+    status = Column(String, default="active")
+
+class VotingTask(Base):
+    __tablename__ = 'voting_tasks'
+    __table_args__ = {"schema": "management"}
+    id = Column(Integer, primary_key=True)
+    passport_id = Column(Integer)
+    target_msg_id = Column(BigInteger)
+    option_id = Column(String)
+    intensity = Column(String)
+    status = Column(String, default="pending")
+    created_by = Column(BigInteger)
+
+# --- СХЕМА WORKERS ---
+class WorkerAccount(Base, BaseAccount):
+    __tablename__ = 'workers'
+    __table_args__ = {"schema": "workers"}
+    tg_id = Column(BigInteger, unique=True)
+    is_alive = Column(Boolean, default=True)
+
+class IncomingMessage(Base):
+    __tablename__ = 'incoming_messages'
+    __table_args__ = {"schema": "workers"}
+    id = Column(Integer, primary_key=True)
+    worker_id = Column(BigInteger)
+    sender_id = Column(BigInteger)
+    text = Column(Text)
+    is_read = Column(Boolean, default=False)
+    is_internal = Column(Boolean, default=False)
     created_at = Column(DateTime, server_default=func.now())
