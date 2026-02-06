@@ -87,10 +87,14 @@ class ContestPassport(Base):
     id = Column(Integer, primary_key=True)
     post_id = Column(Integer)
     group_tag = Column(String)
-    type = Column(String)
-    prize_details = Column(Text)
-    conditions = Column(JSON)
-    max_accounts = Column(Integer)
+    type = Column(String) 
+    prize_type = Column(String)     
+    prize_details = Column(Text)    # Для варианта "Другое"
+    conditions = Column(JSON)       # ['sub', 'comm'...]
+    sub_links = Column(JSON)        # НОВОЕ: ссылки на каналы
+    repost_data = Column(String)    # НОВОЕ: куда/сколько репостов
+    winners_count = Column(Integer) # НОВОЕ: призовые места
+    max_accounts = Column(Integer)  # Сколько наших участвует
     deadline = Column(DateTime, nullable=True)
     status = Column(String, default="active")
 
@@ -122,3 +126,13 @@ class IncomingMessage(Base):
     is_read = Column(Boolean, default=False)
     is_internal = Column(Boolean, default=False)
     created_at = Column(DateTime, server_default=func.now())
+
+class GroupChannelRelation(Base):
+    __tablename__ = 'group_channel_relations'
+    __table_args__ = {"schema": "management"}
+    id = Column(Integer, primary_key=True)
+    group_tag = Column(String)
+    channel_id = Column(BigInteger)
+    # Статусы: 'joined' (все вступили), 'inviting' (в процессе 24ч), 'not_joined'
+    status = Column(String, default='not_joined') 
+    invite_started_at = Column(DateTime, nullable=True)
