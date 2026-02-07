@@ -72,7 +72,6 @@ async def get_next_post(group_tag: str):
 
 
 # --- ОБРАБОТЧИКИ КОМАНД ---
-
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     op = await get_operator(message.from_user.id)
@@ -81,16 +80,24 @@ async def cmd_start(message: types.Message):
         await message.answer("❌ Доступ запрещен. Вас нет в списке операторов.")
         return
 
+    # Создаем кнопки
     kb = [
         [types.KeyboardButton(text="📥 Получить новый пост")],
-        [types.KeyboardButton(text="📊 Статистика группы")]
+        [types.KeyboardButton(text="📊 Статистика группы")],
+        [types.KeyboardButton(text="🔍 Узнать ID реакции")] # <-- Новая кнопка
     ]
-    keyboard = types.ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+    # resize_keyboard=True делает кнопки компактными
+    keyboard = types.ReplyKeyboardMarkup(
+        keyboard=kb, 
+        resize_keyboard=True,
+        input_field_placeholder="Выберите действие..."
+    )
     
     await message.answer(
-        f"👋 Привет, оператор группы {op.group_tag}!\n"
-        "Используйте кнопки ниже для работы.",
-        reply_markup=keyboard
+        f"👋 Привет, оператор группы <b>{op.group_tag}</b>!\n"
+        "Интерфейс управления фермой активен.",
+        reply_markup=keyboard,
+        parse_mode="HTML"
     )
 
 # --- ВЫДАЧА ПОСТА ---
@@ -317,6 +324,62 @@ async def trash(callback: types.CallbackQuery):
         await session.execute(update(PotentialPost).where(PotentialPost.id == post_id).values(is_claimed=True))
         await session.commit()
     await callback.message.edit_text("🗑 В мусоре.")
+
+# --- ФУНКЦИОНАЛ: УЗНАТЬ ID РЕАКЦИИ ---
+
+@dp.message(F.text == "🔍 Узнать ID реакции")
+async def start_reaction_id(message: types.Message, state: FSMContext):
+    await state.set_state(ContestForm.waiting_for_reaction)
+    await message.answer(
+        "✨ <b>Режим определения ID реакции</b>\n\n"
+        "Отправьте мне <b>Эмодзи</b> (одним сообщением), чтобы я выдал его технический ID для рапорта.\n"
+        "<i>Для отмены просто напишите любое другое слово.</i>",
+        parse_mode="HTML"
+    )
+
+@dp.message(ContestForm.waiting_for_reaction)
+async def process_reaction_id(message: types.Message, state: FSMContext):
+    # 1. Проверка на СЛОТЫ / КУБИКИ (🎰, 🎲, 🎯, 🏀)
+    if message.dice:
+        emoji_code = message.dice.emoji
+        await message.answer(
+            f"🎰 <b>Тип: Анимированный слот/кубик</b>\n"
+            f"ID для рапорта: <code>{emoji_code}</code>\n\n"
+            f"<i>Этот код заставит воркеров отправить именно такой игровой кубик.</i>",
+            parse_mode="HTML"
+        )
+        await state.clear()
+        return
+
+    # 2. Проверка на КАСТОМНЫЕ ЭМОДЗИ (Premium)
+    if message.entities:
+        for entity in message.entities:
+            if entity.type == "custom_emoji":
+                custom_id = entity.custom_emoji_id
+                await message.answer(
+                    f"🌟 <b>Тип: Кастомный эмодзи (Premium)</b>\n"
+                    f"ID для рапорта: <code>{custom_id}</code>\n\n"
+                    f"<i>Используйте это числовое ID в рапорте голосования.</i>",
+                    parse_mode="HTML"
+                )
+                await state.clear()
+                return
+
+    # 3. Проверка на ОБЫЧНЫЕ ЭМОДЗИ (Unicode)
+    if message.text:
+        # Просто берем первый символ, если прислали пачку
+        emoji = message.text.strip()
+        await message.answer(
+            f"😀 <b>Тип: Обычный эмодзи</b>\n"
+            f"ID для рапорта: <code>{emoji}</code>\n\n"
+            f"<i>Стандартная реакция или текстовый символ.</i>",
+            parse_mode="HTML"
+        )
+        await state.clear()
+        return
+
+    await message.answer("❌ Не удалось распознать тип. Отправьте эмодзи, кубик или кастомный смайл.")
+
 
 # --- ЗАПУСК ---
 

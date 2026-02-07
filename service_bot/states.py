@@ -17,3 +17,4 @@ class ContestForm(StatesGroup):
     
     setting_intensity = State()     # Уровень интенсивности (1-4)
     confirming = State()            # Финальное подтверждение
+    waiting_for_reaction = State() 

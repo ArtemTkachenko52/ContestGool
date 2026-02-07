@@ -141,15 +141,17 @@ async def main():
         print(f"❌ Читатель для группы {GROUP_TAG} не найден в БД!")
         return
 
-    # 2. Инициализация Telethon
+       # 2. Инициализация Telethon с уникальными данными из БД
     client = TelegramClient(
         StringSession(acc.session_string), 
         acc.api_id, 
         acc.api_hash,
         device_model=acc.device_model,
-        system_version="10.0",
-        app_version="1.0.0"
+        system_version=acc.os_version, # Поле из обновленной БД
+        app_version=acc.app_version     # Поле из обновленной БД
     )
+
+
     
     await client.start()
     

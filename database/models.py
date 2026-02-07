@@ -11,9 +11,14 @@ class BaseAccount:
     api_hash = Column(String)
     session_string = Column(String)
     group_tag = Column(String, index=True)
-    proxy = Column(String) # Формат: http://user:pass@ip:port
+    proxy = Column(String) 
     device_model = Column(String)
+    # --- ДОБАВЬ ЭТИ ДВЕ СТРОКИ НИЖЕ ---
+    os_version = Column(String)
+    app_version = Column(String)
+    # ----------------------------------
     system_lang = Column(String, default="ru-RU")
+
 
 # --- СХЕМА WATCHER (Мониторинг) ---
 class Keyword(Base):
