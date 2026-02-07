@@ -25,3 +25,13 @@ INSERT INTO watcher.keywords (word, category, is_active) VALUES
 ('розыгрыш', 'general', true);
 INSERT INTO workers.workers (tg_id, phone, group_tag, is_alive) 
 VALUES (8539434410, '+380933277858', 'A1', true);
+
+-- Полная зачистка всех схем со всеми данными
+DROP SCHEMA IF EXISTS watcher CASCADE;
+DROP SCHEMA IF EXISTS management CASCADE;
+DROP SCHEMA IF EXISTS workers CASCADE;
+
+-- Создание пустых схем обратно
+CREATE SCHEMA watcher;
+CREATE SCHEMA management;
+CREATE SCHEMA workers;

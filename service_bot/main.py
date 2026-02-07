@@ -9,7 +9,7 @@ from datetime import datetime
 
 # Импорты из твоего проекта
 from database.config import async_session
-from database.models import Operator, PotentialPost
+from database.models import Operator, PotentialPost, ContestPassport, VotingReport
 from service_bot.states import ContestForm
 
 # Настройки
@@ -47,8 +47,20 @@ def get_conditions_kb(selected_conditions: list):
     ))
     return builder.as_markup()
 
+def get_intensity_kb():
+    builder = InlineKeyboardBuilder()
+    levels = {
+        "1": "1ур (1акк/20мин)",
+        "2": "2ур (1акк/10мин)",
+        "3": "3ур (1акк/5мин)",
+        "4": "4ур (1акк/1мин)"
+    }
+    for k, v in levels.items():
+        builder.row(types.InlineKeyboardButton(text=v, callback_data=f"int_{k}"))
+    return builder.as_markup()
+
 async def get_next_post(group_tag: str):
-    """Поиск следующего свободного поста"""
+    """Поиск следующего свободного поста (БЕЗ пометки о получении)"""
     async with async_session() as session:
         query = select(PotentialPost).where(
             PotentialPost.group_tag == group_tag,
@@ -56,14 +68,8 @@ async def get_next_post(group_tag: str):
         ).order_by(PotentialPost.id.asc()).limit(1)
         
         result = await session.execute(query)
-        post = result.scalars().first()
-        
-        if post:
-            post.is_claimed = True
-            post.claimed_at = datetime.now()
-            await session.commit()
-            return post
-        return None
+        return result.scalars().first()
+
 
 # --- ОБРАБОТЧИКИ КОМАНД ---
 
@@ -124,212 +130,193 @@ async def send_new_post(message: types.Message):
         await message.answer(f"❌ Ошибка пересылки: {e}")
 
 # --- FSM: ОФОРМЛЕНИЕ ПАСПОРТА ---
-
+# --- ШАГ 1: ТИП КОНКУРСА ---
 @dp.callback_query(F.data.startswith("setup_"))
 async def start_setup(callback: types.CallbackQuery, state: FSMContext):
-    post_id = callback.data.split("_")[1]
-    
+    post_id = int(callback.data.split("_")[1])
     await state.update_data(current_post_id=post_id)
     await state.set_state(ContestForm.choosing_type)
     
     builder = InlineKeyboardBuilder()
     builder.row(types.InlineKeyboardButton(text="🕹 АФК участие", callback_data="type_afk"))
     builder.row(types.InlineKeyboardButton(text="🗳 Голосование", callback_data="type_vote"))
-    builder.row(types.InlineKeyboardButton(text="🎰 Лудка", callback_data="type_ludka"))
     
-    await callback.message.answer(
-        "📝 <b>Шаг 1: Тип конкурса</b>\nВыберите механику участия:",
-        reply_markup=builder.as_markup(),
-        parse_mode="HTML"
-    )
-    await callback.answer()
+    await callback.message.edit_text("📝 <b>Шаг 1: Тип конкурса</b>", reply_markup=builder.as_markup(), parse_mode="HTML")
 
+# --- ШАГ 2: ПРИЗ ---
 @dp.callback_query(ContestForm.choosing_type)
 async def process_type(callback: types.CallbackQuery, state: FSMContext):
     await state.update_data(contest_type=callback.data.replace("type_", ""))
     await state.set_state(ContestForm.choosing_prize)
     
     builder = InlineKeyboardBuilder()
-    prizes = ["Деньги 💵", "Звезды ⭐", "NFT 🖼", "TG Premium 💎", "Ценности 🎮", "Другое 🎁"]
+    prizes = ["Деньги 💵", "Звезды ⭐", "NFT 🖼", "Подарок 🎁", "Ценности 🎮", "Другое ⚙️"]
     for p in prizes:
         builder.add(types.InlineKeyboardButton(text=p, callback_data=f"prize_{p}"))
     builder.adjust(2)
-    
-    await callback.message.edit_text(
-        "📝 <b>Шаг 2: Приз</b>\nЧто разыгрывается?", 
-        reply_markup=builder.as_markup(), 
-        parse_mode="HTML"
-    )
-    await callback.answer()
+    await callback.message.edit_text("📝 <b>Шаг 2: Приз</b>", reply_markup=builder.as_markup())
 
+# --- ШАГ 2.1: ОБРАБОТКА ПРИЗА ---
 @dp.callback_query(ContestForm.choosing_prize)
 async def process_prize(callback: types.CallbackQuery, state: FSMContext):
-    prize = callback.data.replace("prize_", "")
-    await state.update_data(prize=prize, selected_conds=[])
-    await state.set_state(ContestForm.filling_conditions)
-    
-    await callback.message.edit_text(
-        "📝 <b>Шаг 3: Условия участия</b>\nВыберите необходимые действия:",
-        reply_markup=get_conditions_kb([]),
-        parse_mode="HTML"
-    )
-    await callback.answer()
+    prize_raw = callback.data.replace("prize_", "")
+    if "Другое" in prize_raw:
+        await state.set_state(ContestForm.input_prize_custom)
+        await callback.message.edit_text("⌨️ Введите название приза вручную:")
+    else:
+        await state.update_data(prize=prize_raw)
+        await proceed_from_prize(callback.message, state)
+
+@dp.message(ContestForm.input_prize_custom)
+async def process_custom_prize(message: types.Message, state: FSMContext):
+    await state.update_data(prize=message.text)
+    await proceed_from_prize(message, state)
+
+async def proceed_from_prize(message, state: FSMContext):
+    data = await state.get_data()
+    if data['contest_type'] == 'vote':
+        await state.set_state(ContestForm.input_vote_executor)
+        await message.answer("👤 <b>Шаг 3 (Голосование):</b> Введите Nickname/ID аккаунта-исполнителя для регистрации:", parse_mode="HTML")
+    else:
+        await state.set_state(ContestForm.filling_conditions)
+        await message.answer("📝 <b>Шаг 3: Условия</b>", reply_markup=get_conditions_kb([]), parse_mode="HTML")
+
+# --- ШАГ 3 (ГОЛОСОВАНИЕ): ДАННЫЕ РЕГИСТРАЦИИ ---
+@dp.message(ContestForm.input_vote_executor)
+async def vote_exec(message: types.Message, state: FSMContext):
+    await state.update_data(vote_executor=message.text)
+    await state.set_state(ContestForm.input_vote_data)
+    await message.answer("📄 Введите данные для регистрации (Ник, текст или описание фото):")
+
+@dp.message(ContestForm.input_vote_data)
+async def vote_data(message: types.Message, state: FSMContext):
+    await state.update_data(vote_reg_data=message.text)
+    await state.set_state(ContestForm.input_vote_place)
+    await message.answer("📍 Где регистрироваться? (Напр: ЛС @user или Комменты):")
+
+@dp.message(ContestForm.input_vote_place)
+async def vote_place(message: types.Message, state: FSMContext):
+    await state.update_data(vote_reg_place=message.text)
+    await ask_intensity(message, state)
+
+# --- ШАГ 3 (АФК): УСЛОВИЯ ---
 @dp.callback_query(ContestForm.filling_conditions)
 async def process_conditions(callback: types.CallbackQuery, state: FSMContext):
     if callback.data == "cond_done":
-        await state.set_state(ContestForm.setting_deadline)
-        
-        # Создаем кнопку для пропуска ввода даты
-        builder = InlineKeyboardBuilder()
-        builder.add(types.InlineKeyboardButton(text="🗓 Без точной даты", callback_data="deadline_none"))
-        
-        await callback.message.edit_text(
-            "📝 <b>Шаг 4: Дедлайн</b>\nВведите дату завершения в формате:\n<code>ДД.ММ.ГГГГ ЧЧ:ММ</code>\n\n"
-            "Или нажмите кнопку ниже, если дата неизвестна:", 
-            reply_markup=builder.as_markup(),
-            parse_mode="HTML"
-        )
-        await callback.answer()
+        await check_afk_substeps(callback.message, state)
         return
-
-    # Логика галочек
     code = callback.data.replace("cond_", "")
     data = await state.get_data()
     selected = data.get("selected_conds", [])
-    if code in selected:
-        selected.remove(code)
-    else:
-        selected.append(code)
+    if code in selected: selected.remove(code)
+    else: selected.append(code)
     await state.update_data(selected_conds=selected)
     await callback.message.edit_reply_markup(reply_markup=get_conditions_kb(selected))
-    await callback.answer()
 
-# Обработка кнопки "Без даты"
-@dp.callback_query(F.data == "deadline_none", ContestForm.setting_deadline)
-async def process_deadline_none(callback: types.CallbackQuery, state: FSMContext):
-    await state.update_data(deadline=None)
-    await state.set_state(ContestForm.choosing_accounts)
-    
-    builder = InlineKeyboardBuilder()
-    nums = ["5", "10", "20", "50", "Все"]
-    for n in nums:
-        builder.add(types.InlineKeyboardButton(text=n, callback_data=f"accs_{n}"))
-    builder.adjust(3)
-
-    await callback.message.edit_text(
-        "✅ Дата: <b>Не установлена</b>\n\n"
-        "📝 <b>Шаг 5: Охват</b>\nСколько аккаунтов должно участвовать?",
-        reply_markup=builder.as_markup(),
-        parse_mode="HTML"
-    )
-    await callback.answer()
-
-# Обработка текстового ввода даты
-@dp.message(ContestForm.setting_deadline)
-async def process_deadline(message: types.Message, state: FSMContext):
-    try:
-        deadline_dt = datetime.strptime(message.text, "%d.%m.%Y %H:%M")
-        if deadline_dt < datetime.now():
-            await message.answer("❌ Дата не может быть в прошлом! Попробуйте еще раз:")
-            return
-
-        await state.update_data(deadline=deadline_dt)
-        await state.set_state(ContestForm.choosing_accounts)
-        
-        builder = InlineKeyboardBuilder()
-        nums = ["5", "10", "20", "50", "Все"]
-        for n in nums:
-            builder.add(types.InlineKeyboardButton(text=n, callback_data=f"accs_{n}"))
-        builder.adjust(3)
-
-        await message.answer(
-            f"✅ Дата принята: {deadline_dt.strftime('%d.%m.%Y %H:%M')}\n\n"
-            "📝 <b>Шаг 5: Охват</b>\nСколько аккаунтов должно участвовать?",
-            reply_markup=builder.as_markup(),
-            parse_mode="HTML"
-        )
-    except ValueError:
-        await message.answer(
-            "⚠️ Неверный формат! Напишите дату строго по шаблону:\n"
-            "<code>ДД.ММ.ГГГГ ЧЧ:ММ</code>",
-            parse_mode="HTML"
-        )
-
-@dp.callback_query(ContestForm.choosing_accounts)
-async def process_accounts(callback: types.CallbackQuery, state: FSMContext):
-    count = callback.data.replace("accs_", "")
-    await state.update_data(account_count=count)
-    
-    # Собираем все данные из памяти для итогового вывода
+async def check_afk_substeps(message, state: FSMContext):
     data = await state.get_data()
+    conds = data.get("selected_conds", [])
+    if "sub" in conds:
+        await state.set_state(ContestForm.input_sub_links)
+        await message.answer("🔗 Введите ссылки на ТГК для подписки:")
+    elif "repost" in conds:
+        await state.set_state(ContestForm.input_repost_count)
+        await message.answer("🔄 Введите количество чатов для репоста:")
+    else:
+        await ask_intensity(message, state)
+
+@dp.message(ContestForm.input_sub_links)
+async def sub_links(message: types.Message, state: FSMContext):
+    await state.update_data(sub_links=message.text)
+    data = await state.get_data()
+    if "repost" in data.get("selected_conds", []):
+        await state.set_state(ContestForm.input_repost_count)
+        await message.answer("🔄 Введите количество чатов для репоста:")
+    else:
+        await ask_intensity(message, state)
+
+@dp.message(ContestForm.input_repost_count)
+async def repost_count(message: types.Message, state: FSMContext):
+    await state.update_data(repost_count=message.text)
+    await ask_intensity(message, state)
+
+# --- ШАГ 4: ИНТЕНСИВНОСТЬ ---
+async def ask_intensity(message, state: FSMContext):
+    await state.set_state(ContestForm.setting_intensity)
+    await message.answer("🚀 <b>Шаг 4: Интенсивность</b>", reply_markup=get_intensity_kb(), parse_mode="HTML")
+
+@dp.callback_query(ContestForm.setting_intensity)
+async def process_intensity(callback: types.CallbackQuery, state: FSMContext):
+    level = callback.data.replace("int_", "")
+    await state.update_data(intensity=level)
     
-    # Формируем красивое резюме
-    deadline_str = data['deadline'].strftime('%d.%m.%Y %H:%M') if data['deadline'] else "Не установлена"
-    conds_str = ", ".join(data['selected_conds']) if data['selected_conds'] else "Без условий"
-    
-    summary = (
-        "🏁 <b>Проверка паспорта конкурса</b>\n\n"
-        f"🔹 Тип: <code>{data['contest_type']}</code>\n"
-        f"🔹 Приз: <code>{data['prize']}</code>\n"
-        f"🔹 Условия: <code>{conds_str}</code>\n"
-        f"🔹 Дедлайн: <code>{deadline_str}</code>\n"
-        f"🔹 Охват: <code>{data['account_count']} аккаунтов</code>\n\n"
-        "Все верно? После подтверждения паспорт будет сохранен в БД."
-    )
+    data = await state.get_data()
+    summary = f"🏁 <b>Проверка паспорта</b>\nТип: {data['contest_type']}\nПриз: {data['prize']}\nИнтенсивность: {level} уровень"
     
     builder = InlineKeyboardBuilder()
-    builder.row(types.InlineKeyboardButton(text="✅ Подтвердить и запустить", callback_data="passport_confirm"))
-    builder.row(types.InlineKeyboardButton(text="🔄 Сбросить", callback_data="passport_cancel"))
+    builder.row(types.InlineKeyboardButton(text="✅ Запустить", callback_data="passport_confirm"))
+    builder.row(types.InlineKeyboardButton(text="❌ Отмена", callback_data="passport_cancel"))
     
     await state.set_state(ContestForm.confirming)
     await callback.message.edit_text(summary, reply_markup=builder.as_markup(), parse_mode="HTML")
-    await callback.answer()
 
-from database.models import ContestPassport
-
+# --- ФИНАЛ: СОХРАНЕНИЕ ---
+@dp.callback_query(ContestForm.confirming, F.data == "passport_confirm")
 @dp.callback_query(ContestForm.confirming, F.data == "passport_confirm")
 async def save_passport(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     op = await get_operator(callback.from_user.id)
     
     async with async_session() as session:
-        # Создаем запись паспорта
+        # 1. Помечаем пост как отработанный
+        await session.execute(
+            update(PotentialPost)
+            .where(PotentialPost.id == int(data['current_post_id']))
+            .values(is_claimed=True, claimed_at=datetime.now())
+        )
+        
+        # 2. Собираем условия (ссылки, репосты и т.д.) в один JSON
+        conditions_data = {
+            "selected": data.get("selected_conds", []),
+            "sub_links": data.get("sub_links", ""),
+            "repost_count": data.get("repost_count", "0"),
+            "vote_details": {
+                "executor": data.get("vote_executor"),
+                "reg_data": data.get("vote_reg_data"),
+                "reg_place": data.get("vote_reg_place")
+            } if data['contest_type'] == 'vote' else {}
+        }
+
+        # 3. Создаем запись паспорта
         new_passport = ContestPassport(
             post_id=int(data['current_post_id']),
             group_tag=op.group_tag,
             type=data['contest_type'],
             prize_type=data['prize'],
-            conditions=data['selected_conds'], # JSON формат
-            deadline=data['deadline'],
-            max_accounts=0 if data['account_count'] == "Все" else int(data['account_count']),
+            conditions=conditions_data, # Теперь тут вся пачка данных
+            intensity_level=int(data['intensity']),
             status="active"
         )
+        
         session.add(new_passport)
         await session.commit()
     
-    await state.clear() # Очищаем состояние
-    await callback.message.edit_text("🚀 <b>Паспорт успешно создан!</b>\nДанные переданы в систему исполнения.", parse_mode="HTML")
+    await state.clear()
+    await callback.message.edit_text("🚀 <b>Паспорт успешно создан!</b>\nДанные записаны в БД.", parse_mode="HTML")
     await callback.answer()
 
 @dp.callback_query(F.data == "passport_cancel")
-async def cancel_passport(callback: types.CallbackQuery, state: FSMContext):
+async def cancel(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
-    await callback.message.edit_text("❌ Оформление отменено. Данные удалены.")
-    await callback.answer()
+    await callback.message.edit_text("❌ Отменено.")
 
 @dp.callback_query(F.data.startswith("trash_"))
-async def process_trash(callback: types.CallbackQuery):
+async def trash(callback: types.CallbackQuery):
     post_id = int(callback.data.split("_")[1])
-    
     async with async_session() as session:
-        # Помечаем пост как отработанный, но паспорт для него не создаем
-        await session.execute(
-            update(PotentialPost).where(PotentialPost.id == post_id).values(is_claimed=True)
-        )
+        await session.execute(update(PotentialPost).where(PotentialPost.id == post_id).values(is_claimed=True))
         await session.commit()
-    
-    await callback.message.edit_text("🗑 Пост отправлен в мусор и удален из очереди.")
-    await callback.answer()
+    await callback.message.edit_text("🗑 В мусоре.")
 
 # --- ЗАПУСК ---
 
