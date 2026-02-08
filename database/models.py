@@ -84,10 +84,18 @@ class VotingReport(Base):
     id = Column(Integer, primary_key=True)
     passport_id = Column(Integer, ForeignKey("management.passports.id"))
     target_msg_id = Column(BigInteger) # Пост, где крутим
+    # Новое: ID канала, куда пересылали пост (чтобы воркер знал, где искать сообщение)
+    target_chat_id = Column(BigInteger) 
     vote_type = Column(String) # 'poll' (опрос) или 'reaction'
     option_id = Column(String) # ID кнопки или смайлика
+    # --- ДОБАВЬ ЭТИ ДВЕ СТРОКИ ---
+    target_groups = Column(JSON)      # Список групп ['A1', 'A2']
+    accounts_count = Column(Integer)  # Кол-во участников (если группа одна)
+    # -----------------------------
     intensity = Column(Integer)
     status = Column(String, default="pending") # 'pending', 'approved', 'declined', 'completed'
+    created_by = Column(BigInteger) # Кто создал рапорт (ID оператора)
+
 
 # --- СХЕМА WORKERS (Исполнители) ---
 class WorkerAccount(Base, BaseAccount):

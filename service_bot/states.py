@@ -20,3 +20,11 @@ class ContestForm(StatesGroup):
     waiting_for_reaction = State() 
     viewing_current_contests = State() # Просмотр списка ТГК
     viewing_specific_contest = State() # Просмотр конкретного конкурса и постов
+    editing_field = State() # Специальное состояние для правки данных
+    v_rep_fwd = State()          # Ожидание пересылки поста
+    v_rep_method = State()       # Выбор: Опрос / Реакция
+    v_rep_option = State()       # Номер ответа или ID эмодзи
+    v_rep_choose_groups = State() # Выбор групп (A1, A2...)
+    v_rep_count = State()        # Ввод кол-ва аккаунтов (если выбрана 1 группа)
+    v_rep_intensity = State()    # Уровень интенсивности (1-4)
+    v_rep_confirm = State()      # Финальное подтверждение
