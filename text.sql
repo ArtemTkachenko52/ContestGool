@@ -35,3 +35,19 @@ DROP SCHEMA IF EXISTS workers CASCADE;
 CREATE SCHEMA watcher;
 CREATE SCHEMA management;
 CREATE SCHEMA workers;
+
+-- Добавляем колонки для Читателей
+ALTER TABLE watcher.readers ADD COLUMN IF NOT EXISTS os_version VARCHAR;
+ALTER TABLE watcher.readers ADD COLUMN IF NOT EXISTS app_version VARCHAR;
+
+-- Добавляем колонки для Исполнителей
+ALTER TABLE workers.workers ADD COLUMN IF NOT EXISTS os_version VARCHAR;
+ALTER TABLE workers.workers ADD COLUMN IF NOT EXISTS app_version VARCHAR;
+
+-- Проверка результата
+SELECT table_schema, table_name, column_name 
+FROM information_schema.columns 
+WHERE column_name IN ('os_version', 'app_version');
+
+-- Добавляем колонку для отслеживания прочитанных постов в таблицу каналов
+ALTER TABLE watcher.channels ADD COLUMN IF NOT EXISTS last_read_post_id INTEGER DEFAULT 0;

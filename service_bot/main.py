@@ -4,19 +4,20 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from decouple import config
-from sqlalchemy import select, update
+from sqlalchemy import select, update, func, text  # <-- Добавь func сюда
 from datetime import datetime
 
 # Импорты из твоего проекта
 from database.config import async_session
-from database.models import Operator, PotentialPost, ContestPassport, VotingReport
+from database.models import Operator, PotentialPost, ContestPassport, VotingReport, TargetChannel
 from service_bot.states import ContestForm
 
 # Настройки
 BOT_TOKEN = config('BOT_TOKEN')
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-
+TARGET_GROUP = -1003723379200 
+MONITOR_STORAGE = -1003753624654
 # --- ФУНКЦИИ БАЗЫ ДАННЫХ ---
 
 async def get_operator(tg_id: int):
@@ -60,15 +61,17 @@ def get_intensity_kb():
     return builder.as_markup()
 
 async def get_next_post(group_tag: str):
-    """Поиск следующего свободного поста (БЕЗ пометки о получении)"""
     async with async_session() as session:
         query = select(PotentialPost).where(
             PotentialPost.group_tag == group_tag,
-            PotentialPost.is_claimed == False
+            PotentialPost.is_claimed == False,
+            PotentialPost.post_type != "monitoring" # СТРОГО ИГНОРИМ ЗЕРКАЛО
         ).order_by(PotentialPost.id.asc()).limit(1)
         
         result = await session.execute(query)
         return result.scalars().first()
+
+
 
 
 # --- ОБРАБОТЧИКИ КОМАНД ---
@@ -83,22 +86,23 @@ async def cmd_start(message: types.Message):
     # Создаем кнопки
     kb = [
         [types.KeyboardButton(text="📥 Получить новый пост")],
-        [types.KeyboardButton(text="📊 Статистика группы")],
-        [types.KeyboardButton(text="🔍 Узнать ID реакции")] # <-- Новая кнопка
+        [types.KeyboardButton(text="📋 Текущие конкурсы")],  # <--- КНОПКА ТУТ
+        [types.KeyboardButton(text="🔍 Узнать ID реакции"), types.KeyboardButton(text="📊 Статистика")]
     ]
-    # resize_keyboard=True делает кнопки компактными
+    
     keyboard = types.ReplyKeyboardMarkup(
         keyboard=kb, 
         resize_keyboard=True,
-        input_field_placeholder="Выберите действие..."
+        input_field_placeholder="Управление фермой..."
     )
     
     await message.answer(
         f"👋 Привет, оператор группы <b>{op.group_tag}</b>!\n"
-        "Интерфейс управления фермой активен.",
+        f"Выберите раздел для работы:",
         reply_markup=keyboard,
         parse_mode="HTML"
     )
+
 
 # --- ВЫДАЧА ПОСТА ---
 
@@ -269,20 +273,34 @@ async def process_intensity(callback: types.CallbackQuery, state: FSMContext):
 
 # --- ФИНАЛ: СОХРАНЕНИЕ ---
 @dp.callback_query(ContestForm.confirming, F.data == "passport_confirm")
-@dp.callback_query(ContestForm.confirming, F.data == "passport_confirm")
 async def save_passport(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     op = await get_operator(callback.from_user.id)
     
     async with async_session() as session:
-        # 1. Помечаем пост как отработанный
+        # 1. Помечаем пост-триггер как отработанный
         await session.execute(
             update(PotentialPost)
             .where(PotentialPost.id == int(data['current_post_id']))
             .values(is_claimed=True, claimed_at=datetime.now())
         )
         
-        # 2. Собираем условия (ссылки, репосты и т.д.) в один JSON
+        # --- НОВЫЙ БЛОК: ШАГ 4 ---
+        # 2. Узнаем ID канала из этого поста, чтобы включить "тотальный мониторинг"
+        post_query = await session.execute(
+            select(PotentialPost.source_tg_id).where(PotentialPost.id == int(data['current_post_id']))
+        )
+        source_channel_id = post_query.scalar()
+
+        if source_channel_id:
+            await session.execute(
+                update(TargetChannel)
+                .where(TargetChannel.tg_id == source_channel_id)
+                .values(status="active_monitor") # Теперь start_work.py начнет пересылать ВСЁ
+            )
+        # -------------------------
+
+        # 3. Собираем условия в JSON (это у тебя уже было)
         conditions_data = {
             "selected": data.get("selected_conds", []),
             "sub_links": data.get("sub_links", ""),
@@ -294,13 +312,13 @@ async def save_passport(callback: types.CallbackQuery, state: FSMContext):
             } if data['contest_type'] == 'vote' else {}
         }
 
-        # 3. Создаем запись паспорта
+        # 4. Создаем запись паспорта
         new_passport = ContestPassport(
             post_id=int(data['current_post_id']),
             group_tag=op.group_tag,
             type=data['contest_type'],
             prize_type=data['prize'],
-            conditions=conditions_data, # Теперь тут вся пачка данных
+            conditions=conditions_data,
             intensity_level=int(data['intensity']),
             status="active"
         )
@@ -309,7 +327,7 @@ async def save_passport(callback: types.CallbackQuery, state: FSMContext):
         await session.commit()
     
     await state.clear()
-    await callback.message.edit_text("🚀 <b>Паспорт успешно создан!</b>\nДанные записаны в БД.", parse_mode="HTML")
+    await callback.message.edit_text("🚀 <b>Паспорт успешно создан!</b>\nКанал переведен в режим активного мониторинга.", parse_mode="HTML")
     await callback.answer()
 
 @dp.callback_query(F.data == "passport_cancel")
@@ -380,6 +398,141 @@ async def process_reaction_id(message: types.Message, state: FSMContext):
 
     await message.answer("❌ Не удалось распознать тип. Отправьте эмодзи, кубик или кастомный смайл.")
 
+@dp.message(F.text == "📋 Текущие конкурсы")
+async def show_contests_types(message: types.Message):
+    builder = InlineKeyboardBuilder()
+    builder.row(types.InlineKeyboardButton(text="🕹 АФК", callback_data="cur_afk"))
+    builder.row(types.InlineKeyboardButton(text="🗳 Голосование", callback_data="cur_vote"))
+    await message.answer("Выберите тип активных конкурсов:", reply_markup=builder.as_markup())
+
+@dp.callback_query(F.data.startswith("cur_"))
+async def list_active_channels(callback: types.CallbackQuery, state: FSMContext):
+    c_type = callback.data.replace("cur_", "")
+    op = await get_operator(callback.from_user.id)
+    
+    async with async_session() as session:
+        # Сложный запрос: Берем каналы, считаем посты > last_read_post_id
+        # Используем подзапрос для подсчета, чтобы не терять каналы с 0 новых постов
+        query = (
+            select(
+                TargetChannel,
+                func.count(PotentialPost.id).label("new_count")
+            )
+            .join(PotentialPost, PotentialPost.source_tg_id == TargetChannel.tg_id)
+            .join(ContestPassport, ContestPassport.post_id == PotentialPost.id)
+            .where(
+                ContestPassport.group_tag == op.group_tag,
+                ContestPassport.type == c_type,
+                ContestPassport.status == "active"
+            )
+            .group_by(TargetChannel.id)
+            .order_by(text("new_count DESC")) # Сортировка: сначала те, где больше новых
+        )
+        
+        result = await session.execute(query)
+        channels_data = result.all()
+
+    if not channels_data:
+        await callback.message.edit_text(f"📭 У группы {op.group_tag} нет активных конкурсов типа {c_type}.")
+        return
+
+    builder = InlineKeyboardBuilder()
+    for ch, new_count in channels_data:
+        # Кнопка всегда видна, даже если (+0)
+        status_tag = f" (+{new_count})" if new_count > 0 else ""
+        btn_text = f"{ch.username or ch.tg_id}{status_tag}"
+        builder.row(types.InlineKeyboardButton(text=btn_text, callback_data=f"viewch_{ch.tg_id}_{c_type}"))
+    
+    await callback.message.edit_text(f"📡 Активные каналы ({c_type}):", reply_markup=builder.as_markup())
+@dp.callback_query(F.data.startswith("viewch_"))
+async def view_contest_details(callback: types.CallbackQuery, state: FSMContext):
+    # 1. Разбор данных (viewch_ID_TYPE)
+    _, tg_id_str, c_type = callback.data.split("_")
+    tg_id = int(tg_id_str)
+    op = await get_operator(callback.from_user.id)
+    
+    # Константы хранилищ
+    TARGET_GROUP = -1003723379200   # Группа для находок
+    MONITOR_STORAGE = -1003753624654 # Группа для отслеживаемых (ВСЁ подряд)
+    
+    async with async_session() as session:
+        # Получаем объект канала
+        ch_query = select(TargetChannel).where(TargetChannel.tg_id == tg_id)
+        channel = (await session.execute(ch_query)).scalar_one_or_none()
+        
+        if not channel:
+            await callback.answer("❌ Канал не найден.")
+            return
+
+        # 2. Ищем новые посты для этого канала
+                # Ищем новые посты, но если пост продублирован (monitoring + keyword), 
+        # берем только версию monitoring для красивого отображения в ленте
+               # Теперь для ленты берем ТОЛЬКО мониторинговые посты этого канала
+                # Находим посты для ленты
+        posts_query = select(PotentialPost).where(
+            PotentialPost.source_tg_id == tg_id,
+            PotentialPost.source_msg_id > channel.last_read_post_id,
+            PotentialPost.post_type == "monitoring" # БЕРЕМ ТОЛЬКО ЗЕРКАЛО
+        ).order_by(PotentialPost.source_msg_id.asc())
+
+
+        # Сортировка по типу заставит 'monitoring' быть приоритетнее при обработке ID
+
+        
+        new_posts = (await session.execute(posts_query)).scalars().all()
+
+        # 3. Пересылка и пометка мониторинговых постов
+        if new_posts:
+            await callback.message.answer(f"⬇️ <b>Новые сообщения в канале ({len(new_posts)} шт):</b>", parse_mode="HTML")
+            max_id = channel.last_read_post_id
+            
+            for p in new_posts:
+                try:
+                    source_chat = MONITOR_STORAGE if p.post_type == "monitoring" else TARGET_GROUP
+                    await bot.forward_message(callback.message.chat.id, source_chat, p.storage_msg_id)
+                    if p.source_msg_id > max_id:
+                        max_id = p.source_msg_id
+                except Exception as e:
+                    print(f"❌ Ошибка пересылки: {e}")
+                    if p.source_msg_id > max_id:
+                        max_id = p.source_msg_id
+
+            channel.last_read_post_id = max_id
+            await session.commit()
+
+        else:
+            await callback.message.answer("🧐 Новых постов пока нет.")
+
+        # 4. Получаем данные всех активных паспортов для этого канала
+        p_query = select(ContestPassport).join(PotentialPost, ContestPassport.post_id == PotentialPost.id).\
+            where(PotentialPost.source_tg_id == tg_id, 
+                  ContestPassport.type == c_type,
+                  ContestPassport.status == "active")
+        passports = (await session.execute(p_query)).scalars().all()
+
+    # 5. Выводим резюме и кнопки управления
+    for passp in passports:
+        summary = (
+            f"📝 <b>Паспорт конкурса #{passp.id}</b>\n"
+            f"🔹 Тип: <code>{passp.type}</code>\n"
+            f"🔹 Приз: <code>{passp.prize_type}</code>\n"
+            f"🔹 Интенсивность: <code>{passp.intensity_level} ур.</code>"
+        )
+        
+        builder = InlineKeyboardBuilder()
+        if c_type == "afk":
+            builder.row(types.InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"edit_{passp.id}"))
+            builder.add(types.InlineKeyboardButton(text="🛑 Остановить", callback_data=f"stop_{passp.id}"))
+            builder.row(types.InlineKeyboardButton(text="👥 Добавить группы", callback_data=f"addgr_{passp.id}"))
+            builder.row(types.InlineKeyboardButton(text="📢 Отправить другим группам", callback_data=f"share_{passp.id}"))
+        else: # vote
+            builder.row(types.InlineKeyboardButton(text="🗳 Голосование (Рапорт)", callback_data=f"v_rep_{passp.id}"))
+            builder.add(types.InlineKeyboardButton(text="🛑 Остановить", callback_data=f"stop_{passp.id}"))
+            builder.row(types.InlineKeyboardButton(text="👥 Добавить группы", callback_data=f"addgr_{passp.id}"))
+        
+        await callback.message.answer(summary, reply_markup=builder.as_markup(), parse_mode="HTML")
+    
+    await callback.answer()
 
 # --- ЗАПУСК ---
 

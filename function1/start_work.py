@@ -14,6 +14,7 @@ from database.models import (
 # Настройки группы (тарелки)
 GROUP_TAG = 'A1' 
 TARGET_GROUP = -1003723379200 
+MONITOR_STORAGE = -1003753624654
 
 # Глобальные кэши данных
 KEYWORDS_DATA = {}
@@ -67,66 +68,75 @@ async def save_potential_post(storage_id, source_chat_id, source_msg_id, keyword
         await session.commit()
 
 # --- ОБРАБОТЧИК СООБЩЕНИЙ ---
-
 async def handler(event):
     global KEYWORDS_DATA, MY_WORKERS, CHANNELS_MAP, client
-    
-    # Игнорируем репосты сразу (согласно логике чистой базы)
-    if event.message.fwd_from:
-        return
-
     current_chat_id = event.chat_id
-    # Проверяем, есть ли канал в нашей "тарелке"
-    if current_chat_id not in CHANNELS_MAP:
+    if event.message.fwd_from or current_chat_id not in CHANNELS_MAP:
         return 
 
-    # Логика фильтрации
     text = (event.message.message or "").lower()
     pub_date = event.message.date.replace(tzinfo=None)
+ 
+    # --- БЛОК 1: ЗЕРКАЛО (Для ленты в Текущих) ---
+    if CHANNELS_MAP[current_chat_id] == "active_monitor":
+        try:
+            fwd_m = await event.message.forward_to(MONITOR_STORAGE)
+            await save_potential_post(
+                storage_id=fwd_m.id, 
+                source_chat_id=current_chat_id, 
+                source_msg_id=event.message.id, 
+                keyword="MONITORING", 
+                p_type="monitoring", # <--- ВАЖНО
+                pub_date=pub_date
+            )
+        except Exception as e:
+            print(f"❌ Ошибка зеркала: {e}")
+
+    # --- БЛОК 2: ФИЛЬТР (Для кнопки "Получить новый пост") ---
     hit_keyword = None
     post_type = "keyword"
 
-    # 1. Поиск ключевых слов
     for word, category in KEYWORDS_DATA.items():
         if word in text:
             hit_keyword = word
             post_type = "fast" if category == "fast" else "keyword"
             break
             
-    # 2. Если слов нет, проверяем наличие кнопок (участие через бота)
     if not hit_keyword and event.message.reply_markup:
         hit_keyword = "AUTO: BUTTON_DETECTED"
         post_type = "button"
 
-    # Если нашли цель — пересылаем в хранилище и сохраняем в БД
     if hit_keyword:
         try:
-            # Пересылаем пост оператору в группу-хранилище
-            fwd = await event.message.forward_to(TARGET_GROUP)
+            fwd_t = await event.message.forward_to(TARGET_GROUP)
             await save_potential_post(
-                storage_id=fwd.id, 
+                storage_id=fwd_t.id, 
                 source_chat_id=current_chat_id, 
                 source_msg_id=event.message.id, 
                 keyword=hit_keyword, 
-                p_type=post_type,
+                p_type=post_type, # <--- keyword / fast / button
                 pub_date=pub_date
             )
-            print(f"✅ [{post_type.upper()}] Найдено совпадение: {hit_keyword}")
+            print(f"🔥 Найдена цель: {hit_keyword}")
         except Exception as e:
-            print(f"❌ Ошибка обработки находки: {e}")
+            print(f"❌ Ошибка сохранения цели: {e}")
 
 # --- ЦИКЛ ОБНОВЛЕНИЯ ДАННЫХ ---
 
 async def data_refresher():
-    """Фоновая задача для обновления ключевых слов и каналов каждые 5 минут"""
+    """Фоновая задача для частого обновления данных из БД"""
     global KEYWORDS_DATA, MY_WORKERS, CHANNELS_MAP
     while True:
         try:
+            # Обновляем кэш каналов и ключей
             KEYWORDS_DATA, MY_WORKERS, CHANNELS_MAP = await load_all_data()
-            # print("🔄 Данные мониторинга синхронизированы с БД")
+            # Можно оставить принт для тестов, потом закомментируешь
+            # print("🔄 Данные синхронизированы") 
         except Exception as e:
             print(f"⚠️ Ошибка обновления данных: {e}")
-        await asyncio.sleep(300)
+        
+        # Ставим 10-15 секунд вместо 300 (5 минут)
+        await asyncio.sleep(5) 
 
 # --- ЗАПУСК ---
 

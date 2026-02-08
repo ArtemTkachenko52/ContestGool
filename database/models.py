@@ -36,6 +36,8 @@ class TargetChannel(Base):
     username = Column(String)
     group_tag = Column(String, index=True)
     status = Column(String, default="idle") # 'idle' или 'active_monitor'
+    last_read_post_id = Column(Integer, default=0) # ID последнего просмотренного PotentialPost
+
 
 class ReaderAccount(Base, BaseAccount):
     __tablename__ = 'readers'
