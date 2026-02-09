@@ -51,3 +51,24 @@ WHERE column_name IN ('os_version', 'app_version');
 
 -- Добавляем колонку для отслеживания прочитанных постов в таблицу каналов
 ALTER TABLE watcher.channels ADD COLUMN IF NOT EXISTS last_read_post_id INTEGER DEFAULT 0;
+UPDATE watcher.potential_posts SET post_type = 'monitoring' WHERE keyword_hit = 'MONITORING';
+ALTER TABLE management.voting_reports ADD COLUMN IF NOT EXISTS target_groups JSON;
+ALTER TABLE management.voting_reports ADD COLUMN IF NOT EXISTS accounts_count INTEGER;
+ALTER TABLE management.voting_reports ADD COLUMN IF NOT EXISTS target_chat_id BIGINT;
+ALTER TABLE management.voting_reports ADD COLUMN IF NOT EXISTS created_by BIGINT;
+
+
+-- Таблица для рапортов на отправку Звезд
+CREATE TABLE IF NOT EXISTS management.star_reports (
+    id SERIAL PRIMARY KEY,
+    passport_id INTEGER REFERENCES management.passports(id),
+    target_user VARCHAR(255),    -- Юз организатора
+    method VARCHAR(50),          -- 'gift' или 'paid_msg'
+    star_count INTEGER,
+    executor_id BIGINT,          -- Тот самый лид-аккаунт из паспорта
+    status VARCHAR(50) DEFAULT 'pending',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Добавляем колонку в отношения групп и каналов для инвайтинга
+ALTER TABLE management.group_channel_relations ADD COLUMN IF NOT EXISTS invite_started_at TIMESTAMP;

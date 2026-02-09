@@ -1,30 +1,43 @@
 from aiogram.fsm.state import StatesGroup, State
 
 class ContestForm(StatesGroup):
-    choosing_type = State()         # Выбор: АФК / Голосование
-    choosing_prize = State()        # Выбор приза (Деньги, Звезды и т.д.)
-    input_prize_custom = State()    # Ввод своего приза (если выбрано "Другое")
+    # --- МОНИТОРИНГ И РЕАКЦИИ ---
+    waiting_for_reaction = State()  # ТА САМАЯ СТРОКА ДЛЯ ОПРЕДЕЛИТЕЛЯ ID
+
+    # --- ПАСПОРТ (ОСНОВНОЙ) ---
+    choosing_type = State()
+    choosing_prize = State()
+    input_prize_custom = State()
+    filling_conditions = State()
+    input_sub_links = State()
+    input_repost_count = State()
     
-    # Блок для типа "АФК"
-    filling_conditions = State()    # Выбор чекбоксов (Подписка, Реакция...)
-    input_sub_links = State()       # Ввод ссылок (если выбрана подписка)
-    input_repost_count = State()    # Ввод кол-ва репостов (если выбран репост)
+    # --- ГОЛОСОВАНИЕ (РЕГИСТРАЦИЯ ЛИДА) ---
+    input_vote_executor = State()
+    input_vote_data = State()
+    input_vote_place = State()
     
-    # Блок для типа "Голосование"
-    input_vote_executor = State()   # Аккаунт-участник
-    input_vote_data = State()       # Данные для регистрации (ник/фото)
-    input_vote_place = State()      # Место регистрации (ЛС/комменты)
+    # --- ОБЩИЕ ПАРАМЕТРЫ ---
+    setting_intensity = State()
+    confirming = State()
+    editing_field = State()
+
+    # --- ИНВАЙТИНГ ---
+    choosing_group_to_invite = State()
     
-    setting_intensity = State()     # Уровень интенсивности (1-4)
-    confirming = State()            # Финальное подтверждение
-    waiting_for_reaction = State() 
-    viewing_current_contests = State() # Просмотр списка ТГК
-    viewing_specific_contest = State() # Просмотр конкретного конкурса и постов
-    editing_field = State() # Специальное состояние для правки данных
-    v_rep_fwd = State()          # Ожидание пересылки поста
-    v_rep_method = State()       # Выбор: Опрос / Реакция
-    v_rep_option = State()       # Номер ответа или ID эмодзи
-    v_rep_choose_groups = State() # Выбор групп (A1, A2...)
-    v_rep_count = State()        # Ввод кол-ва аккаунтов (если выбрана 1 группа)
-    v_rep_intensity = State()    # Уровень интенсивности (1-4)
-    v_rep_confirm = State()      # Финальное подтверждение
+    # --- РАПОРТ НА ЗВЕЗДЫ ---
+    star_target = State()
+    star_method = State()
+    star_amount = State()
+    star_confirm = State()
+
+    # --- РАПОРТ НА ГОЛОСОВАНИЕ (НАКРУТКА) ---
+    v_rep_fwd = State()
+    v_rep_method = State()
+    v_rep_option = State()
+    v_rep_choose_groups = State()
+    v_rep_count = State()
+    v_rep_intensity = State()
+    v_rep_confirm = State()
+
+    sharing_to_groups = State() # Выбор групп для пересылки конкурса

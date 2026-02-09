@@ -121,3 +121,24 @@ class AuditLog(Base):
     group_tag = Column(String, index=True)
     action = Column(Text)
     created_at = Column(DateTime, server_default=func.now())
+    
+class StarReport(Base):
+    __tablename__ = 'star_reports'
+    __table_args__ = {"schema": "management"}
+    id = Column(Integer, primary_key=True)
+    passport_id = Column(Integer, ForeignKey("management.passports.id"))
+    target_user = Column(String)
+    method = Column(String)
+    star_count = Column(Integer)
+    executor_id = Column(BigInteger) # Лид-аккаунт
+    status = Column(String, default="pending")
+    created_at = Column(DateTime, server_default=func.now())
+class GroupChannelRelation(Base):
+    __tablename__ = 'group_channel_relations'
+    __table_args__ = {"schema": "management"}
+    id = Column(Integer, primary_key=True)
+    group_tag = Column(String)
+    channel_id = Column(BigInteger)
+    # Статусы: 'not_joined', 'inviting', 'joined'
+    status = Column(String, default='not_joined') 
+    invite_started_at = Column(DateTime, nullable=True)
