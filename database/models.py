@@ -103,16 +103,21 @@ class WorkerAccount(Base, BaseAccount):
     __table_args__ = {"schema": "workers"}
     is_alive = Column(Boolean, default=True)
     last_action = Column(DateTime)
+    last_sync_subscriptions = Column(DateTime, nullable=True)
 
 class AccountMessage(Base):
     __tablename__ = 'messages'
     __table_args__ = {"schema": "workers"}
     id = Column(Integer, primary_key=True)
-    worker_id = Column(Integer, ForeignKey("workers.workers.id"))
-    sender_id = Column(BigInteger) # Кто написал (настоящий юзер)
+    msg_id = Column(Integer)          # ID сообщения в самом Telegram (для Reply)
+    worker_tg_id = Column(BigInteger) 
+    sender_id = Column(BigInteger)    
     text = Column(Text)
+    media_type = Column(String, default="text") # text, photo, voice, video, document
     is_read = Column(Boolean, default=False)
     created_at = Column(DateTime, server_default=func.now())
+        # ... старые поля ...
+    storage_media_id = Column(BigInteger, nullable=True) # ID сообщения в группе-хранилище
 
 class AuditLog(Base):
     __tablename__ = 'audit_logs'
@@ -142,3 +147,46 @@ class GroupChannelRelation(Base):
     # Статусы: 'not_joined', 'inviting', 'joined'
     status = Column(String, default='not_joined') 
     invite_started_at = Column(DateTime, nullable=True)
+class ReserveChannel(Base):
+    """Таблица для потенциальных каналов (Пункт 5)"""
+    __tablename__ = 'reserve'
+    __table_args__ = {"schema": "watcher"}
+    id = Column(Integer, primary_key=True)
+    tg_id = Column(BigInteger, unique=True)
+    username = Column(String)
+    source_group_tag = Column(String) # Кто нашел
+    reason = Column(String) # Ключевое слово или 'button'
+    created_at = Column(DateTime, server_default=func.now())
+
+class LuckEvent(Base):
+    """Логирование триггеров удачи для тестов (Пункт 2)"""
+    __tablename__ = 'luck_events'
+    __table_args__ = {"schema": "watcher"}
+    id = Column(Integer, primary_key=True)
+    chat_id = Column(BigInteger)
+    post_id = Column(Integer)
+    emoji = Column(String)
+    status = Column(String, default="detected") # detected / working / finished
+
+class MentionTask(Base):
+    """Очередь задач на авто-комментарий при упоминании (Пункт 1)"""
+    __tablename__ = 'mention_tasks'
+    __table_args__ = {"schema": "workers"}
+    id = Column(Integer, primary_key=True)
+    worker_tg_id = Column(BigInteger)
+    channel_id = Column(BigInteger)
+    post_id = Column(Integer)
+    status = Column(String, default="pending")
+    created_at = Column(DateTime, server_default=func.now())
+
+class OutgoingMessage(Base):
+    """Очередь ответов оператора (Пункт 3 ТЗ)"""
+    __tablename__ = 'outgoing_messages'
+    __table_args__ = {"schema": "workers"}
+    id = Column(Integer, primary_key=True)
+    worker_tg_id = Column(BigInteger) # Кто отправляет
+    receiver_id = Column(BigInteger)  # Кому отправляем
+    reply_to_msg_id = Column(Integer, nullable=True) # ID для точечного ответа
+    text = Column(Text)
+    status = Column(String, default="pending") # pending / sent / error
+    created_at = Column(DateTime, server_default=func.now())

@@ -41,3 +41,4 @@ class ContestForm(StatesGroup):
     v_rep_confirm = State()
 
     sharing_to_groups = State() # Выбор групп для пересылки конкурса
+    waiting_for_ls_reply = State()

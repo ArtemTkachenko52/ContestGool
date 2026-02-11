@@ -91,6 +91,7 @@ async def cmd_start(message: types.Message):
     kb = [
         [types.KeyboardButton(text="📥 Получить новый пост")],
         [types.KeyboardButton(text="📋 Текущие конкурсы")],  # <--- КНОПКА ТУТ
+        [types.KeyboardButton(text="📬 ЛС исполнителей")],
         [types.KeyboardButton(text="🔍 Узнать ID реакции"), types.KeyboardButton(text="📊 Статистика")]
     ]
         # ✅ Добавляем кнопку админки ТОЛЬКО для ранга 2
@@ -1281,6 +1282,179 @@ async def process_invite_decision(callback: types.CallbackQuery):
         await session.commit()
     
     await callback.message.edit_text(f"⚖️ Статус инвайта: <b>{txt}</b>", parse_mode="HTML")
+
+# --- РАЗДЕЛ ЛС: СПИСОК АККАУНТОВ ГРУППЫ ---
+@dp.message(F.text == "📬 ЛС исполнителей")
+async def show_worker_accounts(message: types.Message):
+    op = await get_operator(message.from_user.id)
+    if not op: return
+
+    async with async_session() as session:
+        # Считаем непрочитанные сообщения для каждого воркера из этой "тарелки" (group_tag)
+        query = text("""
+            SELECT w.tg_id, COUNT(m.id) as unread_count 
+            FROM workers.workers w
+            LEFT JOIN workers.messages m ON w.tg_id = m.worker_tg_id AND m.is_read = False
+            WHERE w.group_tag = :tag
+            GROUP BY w.tg_id
+        """)
+        result = await session.execute(query, {"tag": op.group_tag})
+        workers_data = result.all()
+
+    if not workers_data:
+        await message.answer("📭 В вашей группе пока нет активных исполнителей.")
+        return
+
+    builder = InlineKeyboardBuilder()
+    for tg_id, count in workers_data:
+        status = f" (✉️ {count})" if count > 0 else ""
+        builder.row(types.InlineKeyboardButton(
+            text=f"🤖 Аккаунт {tg_id}{status}", 
+            callback_data=f"ls_acc_{tg_id}"
+        ))
+
+    await message.answer(f"📱 <b>Управление ЛС группы {op.group_tag}</b>\nВыберите аккаунт:", 
+                         reply_markup=builder.as_markup(), parse_mode="HTML")
+
+# --- РАЗДЕЛ ЛС: СПИСОК ДИАЛОГОВ ВНУТРИ АККАУНТА ---
+@dp.callback_query(F.data.startswith("ls_acc_"))
+async def show_dialogs(callback: types.CallbackQuery):
+    worker_id = int(callback.data.split("_")[2]) # Берем ID из ls_acc_ID
+    
+    async with async_session() as session:
+        # Группируем сообщения по отправителям
+        query = text("""
+            SELECT sender_id, MAX(created_at) as last_date, COUNT(id) FILTER (WHERE is_read = False) as new_msgs
+            FROM workers.messages
+            WHERE worker_tg_id = :wid
+            GROUP BY sender_id
+            ORDER BY last_date DESC
+        """)
+        result = await session.execute(query, {"wid": worker_id})
+        dialogs = result.all()
+
+    if not dialogs:
+        await callback.message.edit_text("📭 У этого аккаунта пока нет входящих сообщений.")
+        return
+
+    builder = InlineKeyboardBuilder()
+    for sender_id, last_date, new_count in dialogs:
+        status = f" 🔥 +{new_count}" if new_count > 0 else ""
+        builder.row(types.InlineKeyboardButton(
+            text=f"👤 Юзер {sender_id}{status}", 
+            callback_data=f"ls_view_{worker_id}_{sender_id}"
+        ))
+    builder.row(types.InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main_ls"))
+
+    await callback.message.edit_text(f"📩 <b>Диалоги аккаунта {worker_id}:</b>", 
+                                     reply_markup=builder.as_markup(), parse_mode="HTML")
+
+# --- РАЗДЕЛ ЛС: ПРОСМОТР ИСТОРИИ ЧАТА ---
+@dp.callback_query(F.data.startswith("ls_view_"))
+async def view_chat_history(callback: types.CallbackQuery):
+    _, _, worker_id, sender_id = callback.data.split("_")
+    worker_id, sender_id = int(worker_id), int(sender_id)
+
+    async with async_session() as session:
+        from database.models import AccountMessage
+        # Берем последние 10 сообщений
+        query = select(AccountMessage).where(
+            AccountMessage.worker_tg_id == worker_id,
+            AccountMessage.sender_id == sender_id
+        ).order_by(AccountMessage.created_at.desc()).limit(10)
+        
+        msgs = (await session.execute(query)).scalars().all()
+        
+        # Помечаем как прочитанные
+        await session.execute(
+            update(AccountMessage).where(
+                AccountMessage.worker_tg_id == worker_id,
+                AccountMessage.sender_id == sender_id
+            ).values(is_read=True)
+        )
+        await session.commit()
+
+    history_text = f"💬 <b>Чат с {sender_id}</b> (через воркера {worker_id})\n"
+    history_text += "━━━━━━━━━━━━━━\n"
+        # ... внутри view_chat_history после получения msgs ...
+    for m in reversed(msgs):
+        time_str = m.created_at.strftime("%H:%M")
+        caption = f"🕒 <code>[{time_str}]</code> от {sender_id}\n{m.text or ''}"
+        
+        # Кнопки для каждого сообщения (Reply и Реакция)
+        builder = InlineKeyboardBuilder()
+        builder.row(
+            types.InlineKeyboardButton(
+                text="✍️ Ответить", 
+                callback_data=f"ls_rep_{worker_id}_{sender_id}_{m.msg_id}" # Используем ls_rep_
+            ),
+            types.InlineKeyboardButton(text="👍", callback_data=f"ls_reac_{worker_id}_{sender_id}_{m.msg_id}_👍")
+        )
+
+        # Если в базе есть ID медиа — пересылаем его из хранилища
+        if m.storage_media_id:
+            try:
+                await bot.copy_message(
+                    chat_id=callback.message.chat.id,
+                    from_chat_id=MONITOR_STORAGE,
+                    message_id=m.storage_media_id,
+                    reply_markup=builder.as_markup()
+                )
+            except Exception:
+                await callback.message.answer(f"❌ Медиа удалено из хранилища\n{caption}", reply_markup=builder.as_markup())
+        else:
+            # Если просто текст
+            await callback.message.answer(caption, reply_markup=builder.as_markup(), parse_mode="HTML")
+
+# --- РАЗДЕЛ ЛС: НАЧАЛО ОТВЕТА (ИСПРАВЛЕННЫЙ) ---
+@dp.callback_query(F.data.startswith("ls_rep_"))
+async def start_ls_reply(callback: types.CallbackQuery, state: FSMContext):
+    print(f"DEBUG: Нажата кнопка ответить! Data: {callback.data}") # Увидишь это в консоли бота
+    
+    # Разбираем данные: ls_rep_{worker_id}_{sender_id}_{msg_id}
+    parts = callback.data.split("_")
+    
+    try:
+        worker_id = int(parts[2])
+        sender_id = int(parts[3])
+        msg_id = int(parts[4]) if len(parts) > 4 else None
+        
+        await state.update_data(rep_worker=worker_id, rep_receiver=sender_id, rep_msg_id=msg_id)
+        await state.set_state(ContestForm.waiting_for_ls_reply)
+        
+        await callback.message.answer(
+            f"✍️ <b>Введите ответ для {sender_id}:</b>\n"
+            f"<i>Воркер {worker_id} ответит на конкретное сообщение.</i>", 
+            parse_mode="HTML"
+        )
+        await callback.answer()
+    except Exception as e:
+        print(f"❌ Ошибка парсинга кнопки: {e}")
+        await callback.answer("Ошибка данных кнопки", show_alert=True)
+
+
+# --- РАЗДЕЛ ЛС: СОХРАНЕНИЕ ОТВЕТА В ОЧЕРЕДЬ ---
+@dp.message(ContestForm.waiting_for_ls_reply)
+async def process_ls_reply_send(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    # Проверяем, что мы сейчас именно в контексте ЛС, а не паспорта
+    if 'rep_worker' not in data:
+        return # Если это не ответ в ЛС, пусть работают другие хендлеры
+
+    async with async_session() as session:
+        from database.models import OutgoingMessage
+        new_out = OutgoingMessage(
+            worker_tg_id=data['rep_worker'],
+            receiver_id=data['rep_receiver'],
+            reply_to_msg_id=data.get('rep_msg_id'),
+            text=message.text,
+            status="pending"
+        )
+        session.add(new_out)
+        await session.commit()
+    
+    await state.clear()
+    await message.answer("✅ <b>Сообщение поставлено в очередь на отправку!</b>")
 
 # --- ЗАПУСК ---
 
