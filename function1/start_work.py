@@ -3,7 +3,8 @@ import re
 import random
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from telethon.tl.types import MessageEntityMentionName, MessageEntityMention
+from telethon.tl.functions.messages import SendReactionRequest
+from telethon.tl.types import MessageEntityMentionName, MessageEntityMention, ReactionEmoji
 from sqlalchemy import select
 from datetime import datetime
 
@@ -12,7 +13,7 @@ from datetime import datetime
 from database.config import async_session
 from database.models import (
     Keyword, PotentialPost, WorkerAccount, 
-    TargetChannel, ReaderAccount, ContestPassport, LuckEvent
+    TargetChannel, ReaderAccount, ContestPassport, LuckEvent, OutgoingMessage
 )
 
 # Настройки группы (тарелки)
@@ -119,73 +120,89 @@ async def check_and_save_reserve(msg, source_id):
 
 
 async def monitor_luck_emojis(chat_id, post_id):
-    """Динамический анализ комментариев на 'Удачу' (Пункт 2)"""
+    """Динамический анализ: запускает десант и останавливает его (Миротворец)"""
+    from database.models import LuckRaid
+    from sqlalchemy import update
+    
     print(f"📊 [УДАЧА] Начало мониторинга поста {post_id}. Окно: 5 минут.")
-    # Список текстовых эмодзи
     LUCK_TEXT_EMOJIS = ['🎰', '🏀', '🎯', '🎲', '🎳', '⚽️']
     
     start_time = datetime.now()
     timeout = 300 
+    raid_activated = False # Флаг, чтобы не создавать рейд повторно в одном цикле
 
     while (datetime.now() - start_time).total_seconds() < timeout:
         await asyncio.sleep(20) 
         
         unique_users = set()
         emoji_stats = {}
-        found_any = 0
         
         try:
-            async for msg in client.iter_messages(chat_id, reply_to=post_id, limit=200):
-                found_any += 1
+            async for msg in client.iter_messages(chat_id, reply_to=post_id, limit=100):
                 hit_emoji = None
                 
-                # 1. Проверка на Dice (анимированные игровые кости/слоты)
+                # 1. Проверка на Dice (анимированные)
                 if msg.media and hasattr(msg.media, 'emoticon'):
                     if msg.media.emoticon in LUCK_TEXT_EMOJIS:
                         hit_emoji = msg.media.emoticon
                 
-                # 2. Проверка на Текст (включая если эмодзи внутри предложения)
+                # 2. Проверка на Текст
                 if not hit_emoji and msg.message:
                     for emo in LUCK_TEXT_EMOJIS:
-                        if emo in msg.message: # Используем 'in', а не strip()
+                        if emo in msg.message:
                             hit_emoji = emo
                             break
 
-                # 3. Проверка на СТИКЕРЫ (если у стикера есть привязанный эмодзи удачи)
-                if not hit_emoji and msg.sticker:
-                    if msg.file.emoji in LUCK_TEXT_EMOJIS:
-                        hit_emoji = msg.file.emoji
-
                 if hit_emoji and msg.sender_id:
-                    unique_users.add(msg.sender_id)
-                    emoji_stats[hit_emoji] = emoji_stats.get(hit_emoji, 0) + 1
+                    # Игнорируем наших воркеров при подсчете активности людей
+                    if msg.sender_id not in MY_WORKERS:
+                        unique_users.add(msg.sender_id)
+                        emoji_stats[hit_emoji] = emoji_stats.get(hit_emoji, 0) + 1
 
-            print(f"🔍 [DEBUG] Пост {post_id}: Комментов {found_any}, Юзеров с удачей {len(unique_users)}, Всего эмодзи {sum(emoji_stats.values())}")
+            # --- ЛОГИКА ЗАПУСКА ---
+            if not raid_activated:
+                # Твои тестовые условия: 1 юзер и 3 эмодзи
+                if len(unique_users) >= 1 and sum(emoji_stats.values()) >= 3:
+                    top_emoji = max(emoji_stats, key=emoji_stats.get)
+                    print(f"🔥 [УДАЧА] ТРИГГЕР ПРОБИТ! Начинаю десант {top_emoji}...")
+                    
+                    async with async_session() as session_start:
+                        new_raid = LuckRaid(
+                            channel_id=chat_id,
+                            post_id=post_id,
+                            emoji=top_emoji,
+                            status="active"
+                        )
+                        session_start.add(new_raid)
+                        await session_start.commit()
+                    raid_activated = True
 
-            if len(unique_users) >= 2 and sum(emoji_stats.values()) >= 5:
-                top_emoji = max(emoji_stats, key=emoji_stats.get)
-                print(f"🔥 [УДАЧА] ТРИГГЕР ПРОБИТ! Пост: {post_id}. Эмодзи: {top_emoji}")
-                
-                # --- НОВЫЙ БЛОК СОХРАНЕНИЯ В БД ---
-                async with async_session() as session_luck:
-                    new_event = LuckEvent(
-                        chat_id=chat_id,
-                        post_id=post_id,
-                        emoji=top_emoji,
-                        status="detected"
-                    )
-                    session_luck.add(new_event)
-                    await session_luck.commit()
-                print(f"💾 [БАЗА] Событие удачи для поста {post_id} сохранено в luck_events.")
-                # ----------------------------------
-                return 
-
+            # --- ЛОГИКА ОСТАНОВКИ (МИРОТВОРЕЦ) ---
+            else:
+                # Если рейд идет, но живые люди прислали меньше 2 эмодзи за последние 20 сек
+                if sum(emoji_stats.values()) < 2:
+                    async with async_session() as session_stop:
+                        await session_stop.execute(
+                            update(LuckRaid).where(
+                                LuckRaid.post_id == post_id, 
+                                LuckRaid.status == "active"
+                            ).values(status="finished")
+                        )
+                        await session_stop.commit()
+                    print(f"🏳️ [УДАЧА] Активность людей спала. Рейд для поста {post_id} ОСТАНОВЛЕН.")
+                    return # Полностью выходим из мониторинга поста
 
         except Exception as e:
-            print(f"⚠️ [УДАЧА] Ошибка анализа: {e}")
+            print(f"⚠️ [УДАЧА] Ошибка мониторинга: {e}")
             break
 
-    print(f"💤 [УДАЧА] Время вышло для поста {post_id}.")
+    # Если вышли по таймауту (5 мин), на всякий случай закрываем рейд
+    async with async_session() as session_final:
+        await session_final.execute(
+            update(LuckRaid).where(LuckRaid.post_id == post_id).values(status="finished")
+        )
+        await session_final.commit()
+    print(f"💤 [УДАЧА] Время мониторинга истекло для поста {post_id}.")
 
 # --- ОБРАБОТЧИК СООБЩЕНИЙ ---
 async def handler(event):
@@ -306,73 +323,158 @@ async def data_refresher():
 
 # --- ПУНКТ 3: РУКИ (ОТПРАВКА ИСХОДЯЩИХ) ---
 async def worker_outgoing_loop():
-    """Фоновая проверка очереди сообщений"""
-    print("🦾 [РУКИ] Модуль отправки запущен и слушает базу...")
     while True:
-        await asyncio.sleep(10) # Проверяем базу каждые 10 секунд
-        
-        async with async_session() as session_out:
-            from database.models import OutgoingMessage
-            
-            # Узнаем свой ID
+        await asyncio.sleep(5)
+        async with async_session() as session:
             me = await client.get_me()
-            
-            # Ищем сообщения для НАС со статусом pending
-            query = select(OutgoingMessage).where(
-                OutgoingMessage.worker_tg_id == me.id,
+            # Берем задачи для текущего воркера
+            tasks = (await session.execute(select(OutgoingMessage).where(
+                OutgoingMessage.worker_tg_id == me.id, 
                 OutgoingMessage.status == "pending"
-            )
-            result = await session_out.execute(query)
-            tasks = result.scalars().all()
-            
+            ))).scalars().all()
+
             for task in tasks:
                 try:
-                    myself = await client.get_me()
+                    receiver = await client.get_input_entity(task.receiver_id)
                     
-                    # --- ЛОГ ДЛЯ ТЕБЯ ---
-                    print(f"DEBUG: Мой ID {myself.id} | ID в базе {task.receiver_id}")
-                    # --------------------
+                    # ПУНКТ 1: ПОМЕТКА ПРОЧИТАННЫМ (Всегда при ответе)
+                    await client.send_read_acknowledge(receiver)
 
-                    # Самый надежный способ для теста на одном аккаунте: 
-                    # если ID совпадает ИЛИ если мы ловим ошибку сущности при отправке себе
-                    if str(task.receiver_id) == str(myself.id):
-                        receiver = 'me'
-                        print("📝 [РУКИ] Определен как 'САМ СЕБЕ'. Использую 'me'.")
-                    else:
-                        try:
-                            receiver = await client.get_entity(int(task.receiver_id))
-                        except:
-                            receiver = await client.get_input_entity(int(task.receiver_id))
+                    # ПУНКТ 3: РЕАКЦИИ
+                    if task.task_type == "reaction":
+                        await client(SendReactionRequest(
+                            peer=receiver,
+                            msg_id=task.reply_to_msg_id,
+                            reaction=[ReactionEmoji(emoticon=task.reaction_data)]
+                        ))
+                        print(f"✅ [РЕАКЦИЯ] Поставил {task.reaction_data}")
 
-                    delay = random.randint(2, 5)
-                    print(f"⏳ [РУКИ] Отправка для {task.receiver_id}...")
+                    # ПУНКТ 2: ТЕКСТ И МЕДИА
+                    elif task.task_type == "text":
+                        async with client.action(receiver, 'typing'):
+                            await asyncio.sleep(random.randint(3, 7))
+                            await client.send_message(receiver, task.text, reply_to=task.reply_to_msg_id)
                     
+                                        # ПУНКТ 2: ТЕКСТ
+                    elif task.task_type == "text":
+                        if not task.text: raise Exception("Пустое текстовое сообщение")
+                        async with client.action(receiver, 'typing'):
+                            await asyncio.sleep(random.randint(3, 7))
+                            await client.send_message(receiver, task.text, reply_to=task.reply_to_msg_id)
+                    
+                    # ПУНКТ 4: МЕДИА (ФОТО/ГС/ВИДЕО)
+                    elif task.task_type == "media":
+                        print(f"🖼 [РУКИ] Пересылка медиа из хранилища для {task.receiver_id}...")
+                        
+                        # Копируем сообщение из хранилища напрямую пользователю
+                        # send_message с объектом сообщения — это самый чистый способ
+                        storage_msg = await client.get_messages(MONITOR_STORAGE, ids=task.storage_msg_id)
+                        
+                        await client.send_message(
+                            receiver,
+                            storage_msg, # Передаем весь объект сообщения (фото+текст)
+                            reply_to=task.reply_to_msg_id
+                        )
+
+
+                    task.status = "sent"
+                except Exception as e:
+                    print(f"❌ [ОШИБКА РУК]: {e}")
+                    task.status = "error"
+            await session.commit()
+
+
+# --- ПУНКТ 1: РУКИ (АВТО-КОММЕНТАРИЙ ПРИ УПОМИНАНИИ) ---
+async def worker_mention_task_loop():
+    """Следит за таблицей упоминаний и отвечает в комменты"""
+    print("💬 [РУКИ] Модуль авто-комментариев запущен.")
+    # Список фраз для рандома (потом вынесем в БД)
+    RANDOM_PHRASES = ["мать те трахал", "здохни", "сука", "да", "тут", "бабку помой", "бля тут"]
+
+    while True:
+        await asyncio.sleep(15) # Проверка раз в 15 секунд
+        async with async_session() as session:
+            from database.models import MentionTask
+            me = await client.get_me()
+            
+            # Ищем задачи для нашего аккаунта
+            query = select(MentionTask).where(
+                MentionTask.worker_tg_id == me.id,
+                MentionTask.status == "pending"
+            )
+            tasks = (await session.execute(query)).scalars().all()
+
+            for task in tasks:
+                try:
+                    # Рандомная задержка (мимикрия)
+                    delay = random.randint(10, 45)
+                    print(f"⏳ [КОММЕНТ] Отвечу в пост {task.post_id} через {delay}с...")
+                    await asyncio.sleep(delay)
+
+                    # Пишем комментарий
+                    # Telethon автоматически находит группу обсуждения через reply_to
                     await client.send_message(
-                        receiver, 
-                        task.text, 
-                        reply_to=task.reply_to_msg_id
+                        entity=task.channel_id,
+                        message=random.choice(RANDOM_PHRASES),
+                        comment_to=task.post_id
                     )
                     
-                    task.status = "sent"
-                    print(f"✅ [РУКИ] УСПЕХ! Сообщение доставлено.")
-                    
+                    task.status = "completed"
+                    print(f"✅ [КОММЕНТ] Успешно ответил на упоминание в посте {task.post_id}")
                 except Exception as e:
-                    # Если всё равно ошибка сущности - пробуем отправить в 'me' как последний шанс
-                    if "Could not find the input entity" in str(e):
-                         print("🛠 [РУКИ] Попытка форсированной отправки в 'me'...")
-                         await client.send_message('me', f"ФОРС-ОТПРАВКА: {task.text}")
-                         task.status = "sent"
-                    else:
-                        print(f"❌ [РУКИ] Критическая ошибка: {e}")
-                        task.status = "error"
+                    print(f"❌ [КОММЕНТ] Ошибка: {e}")
+                    task.status = "error"
+            
+            await session.commit()
+
+# --- ПУНКТ 2: РУКИ (ДЕСАНТ УДАЧИ) ---
+async def worker_luck_raid_loop():
+    print("🎯 [РУКИ] Модуль десанта удачи запущен.")
+    while True:
+        await asyncio.sleep(15) 
+        async with async_session() as session:
+            from database.models import LuckRaid
+            # Ищем только активные рейды
+            active_raids = (await session.execute(select(LuckRaid).where(LuckRaid.status == "active"))).scalars().all()
+
+            for raid in active_raids:
+                me = await client.get_me()
                 
-                await session_out.commit()
+                # ИМИТАЦИЯ: Шанс 30%, что этот воркер вступит в этот цикл (так мы получим 3-5 юзеров)
+                if random.random() > 0.3: 
+                    continue
+
+                try:
+                    delay = random.randint(15, 60) # Увеличили паузы для беспалевности
+                    print(f"🎰 [ДЕСАНТ] Аккаунт {me.id} подкинет {raid.emoji} через {delay}с...")
+                    await asyncio.sleep(delay)
+                    
+                    # ПУНКТ 3: ОТПРАВКА АНИМИРОВАННОГО КУБИКА (УНИВЕРСАЛЬНО)
+                    if raid.emoji in ['🎰', '🎯', '🎲', '🏀', '⚽️', '🎳']:
+                        from telethon.tl.types import InputMediaDice
+                        await client.send_message(
+                            raid.channel_id,
+                            file=InputMediaDice(raid.emoji), # Отправка анимации
+                            comment_to=raid.post_id
+                        )
+                    else:
+                        await client.send_message(
+                            raid.channel_id, 
+                            raid.emoji, 
+                            comment_to=raid.post_id
+                        )
+
+                        
+                    print(f"✅ [ДЕСАНТ] Аккаунт {me.id} успешно высадился.")
+                except Exception as e:
+                    print(f"❌ [ДЕСАНТ] Ошибка: {e}")
 
 
 # --- ЗАПУСК ---
 
 async def main():
     global client, KEYWORDS_DATA, MY_WORKERS, CHANNELS_MAP
+    asyncio.create_task(worker_mention_task_loop())
     
     print(f"📡 Запуск мониторинга группы {GROUP_TAG}...")
     
@@ -408,6 +510,9 @@ async def main():
     print(f"🚀 Система онлайн. Слов: {len(KEYWORDS_DATA)}, Каналов: {len(CHANNELS_MAP)}")
         # Запускаем "руки" в фоновом режиме
     asyncio.create_task(worker_outgoing_loop())
+        # Запускаем десант в фоновом режиме
+    asyncio.create_task(worker_luck_raid_loop())
+
     await client.run_until_disconnected()
 
 # --- ПУНКТ 3: ЗЕРКАЛО ЛС (ПРИЕМ СООБЩЕНИЙ) ---

@@ -11,7 +11,7 @@ from datetime import datetime
 from database.config import async_session
 from database.models import (
     Operator, PotentialPost, ContestPassport, 
-    TargetChannel, VotingReport, StarReport, GroupChannelRelation
+    TargetChannel, VotingReport, StarReport, GroupChannelRelation, OutgoingMessage
 )
 
 from service_bot.states import ContestForm
@@ -1344,28 +1344,36 @@ async def show_dialogs(callback: types.CallbackQuery):
             text=f"👤 Юзер {sender_id}{status}", 
             callback_data=f"ls_view_{worker_id}_{sender_id}"
         ))
-    builder.row(types.InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main_ls"))
+    builder.row(types.InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_accounts"))
 
     await callback.message.edit_text(f"📩 <b>Диалоги аккаунта {worker_id}:</b>", 
                                      reply_markup=builder.as_markup(), parse_mode="HTML")
+    
+@dp.callback_query(F.data == "back_to_accounts")
+async def back_to_accounts(callback: types.CallbackQuery):
+    await show_worker_accounts(callback.message)
+    await callback.answer()
 
 # --- РАЗДЕЛ ЛС: ПРОСМОТР ИСТОРИИ ЧАТА ---
+# --- 1. ВЫБОР ЮЗЕРА (ИСПРАВЛЕННЫЙ) ---
 @dp.callback_query(F.data.startswith("ls_view_"))
-async def view_chat_history(callback: types.CallbackQuery):
-    _, _, worker_id, sender_id = callback.data.split("_")
-    worker_id, sender_id = int(worker_id), int(sender_id)
+async def view_chat_history(callback: types.CallbackQuery, state: FSMContext):
+    # Разбираем: ls_view_{worker_id}_{sender_id}
+    parts = callback.data.split("_")
+    worker_id = int(parts[2])
+    sender_id = int(parts[3])
 
     async with async_session() as session:
         from database.models import AccountMessage
-        # Берем последние 10 сообщений
+        # Берем последние 5 сообщений (для теста, чтобы не спамить)
         query = select(AccountMessage).where(
             AccountMessage.worker_tg_id == worker_id,
             AccountMessage.sender_id == sender_id
-        ).order_by(AccountMessage.created_at.desc()).limit(10)
+        ).order_by(AccountMessage.created_at.desc()).limit(5)
         
         msgs = (await session.execute(query)).scalars().all()
         
-        # Помечаем как прочитанные
+        # Помечаем сообщения в БД как прочитанные
         await session.execute(
             update(AccountMessage).where(
                 AccountMessage.worker_tg_id == worker_id,
@@ -1374,37 +1382,48 @@ async def view_chat_history(callback: types.CallbackQuery):
         )
         await session.commit()
 
-    history_text = f"💬 <b>Чат с {sender_id}</b> (через воркера {worker_id})\n"
-    history_text += "━━━━━━━━━━━━━━\n"
-        # ... внутри view_chat_history после получения msgs ...
+    if not msgs:
+        await callback.answer("История сообщений пуста.")
+        return
+
+    await callback.message.answer(f"📜 <b>История чата с {sender_id}</b> (через {worker_id}):", parse_mode="HTML")
+
+    # Выводим каждое сообщение отдельным постом с кнопками (как ты и хотел)
     for m in reversed(msgs):
         time_str = m.created_at.strftime("%H:%M")
-        caption = f"🕒 <code>[{time_str}]</code> от {sender_id}\n{m.text or ''}"
+        caption = f"🕒 <code>[{time_str}]</code>\n{m.text or ''}"
         
-        # Кнопки для каждого сообщения (Reply и Реакция)
         builder = InlineKeyboardBuilder()
-        builder.row(
-            types.InlineKeyboardButton(
-                text="✍️ Ответить", 
-                callback_data=f"ls_rep_{worker_id}_{sender_id}_{m.msg_id}" # Используем ls_rep_
-            ),
-            types.InlineKeyboardButton(text="👍", callback_data=f"ls_reac_{worker_id}_{sender_id}_{m.msg_id}_👍")
-        )
+        # Кнопка ОТВЕТА
+        builder.row(types.InlineKeyboardButton(
+            text="✍️ Ответить", 
+            callback_data=f"ls_rep_{worker_id}_{sender_id}_{m.msg_id}"
+        ))
+        # Кнопки РЕАКЦИЙ
+        reacs = ["👍", "❤️", "🔥", "🤡", "⚡️"]
+        reac_btns = [
+            types.InlineKeyboardButton(text=r, callback_data=f"reac_{worker_id}_{sender_id}_{m.msg_id}_{r}") 
+            for r in reacs
+        ]
+        builder.row(*reac_btns)
 
-        # Если в базе есть ID медиа — пересылаем его из хранилища
+        # Если есть медиа — копируем из хранилища, если нет — текстом
         if m.storage_media_id:
             try:
                 await bot.copy_message(
                     chat_id=callback.message.chat.id,
                     from_chat_id=MONITOR_STORAGE,
                     message_id=m.storage_media_id,
-                    reply_markup=builder.as_markup()
+                    caption=caption,
+                    reply_markup=builder.as_markup(),
+                    parse_mode="HTML"
                 )
             except Exception:
-                await callback.message.answer(f"❌ Медиа удалено из хранилища\n{caption}", reply_markup=builder.as_markup())
+                await callback.message.answer(f"🖼 [Медиа недоступно]\n{caption}", reply_markup=builder.as_markup())
         else:
-            # Если просто текст
             await callback.message.answer(caption, reply_markup=builder.as_markup(), parse_mode="HTML")
+    
+    await callback.answer()
 
 # --- РАЗДЕЛ ЛС: НАЧАЛО ОТВЕТА (ИСПРАВЛЕННЫЙ) ---
 @dp.callback_query(F.data.startswith("ls_rep_"))
@@ -1433,13 +1452,19 @@ async def start_ls_reply(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer("Ошибка данных кнопки", show_alert=True)
 
 
-# --- РАЗДЕЛ ЛС: СОХРАНЕНИЕ ОТВЕТА В ОЧЕРЕДЬ ---
+
+# --- ЕДИНЫЙ ХЕНДЛЕР ОТВЕТА (ТЕКСТ + МЕДИА) ---
 @dp.message(ContestForm.waiting_for_ls_reply)
-async def process_ls_reply_send(message: types.Message, state: FSMContext):
+async def process_ls_reply_universal(message: types.Message, state: FSMContext):
     data = await state.get_data()
-    # Проверяем, что мы сейчас именно в контексте ЛС, а не паспорта
-    if 'rep_worker' not in data:
-        return # Если это не ответ в ЛС, пусть работают другие хендлеры
+    m_type = "text"
+    s_msg_id = None
+
+    if message.photo or message.voice or message.video or message.document:
+        m_type = "media"
+        # Пересылаем файл в хранилище, чтобы воркер его увидел
+        fwd = await message.forward(MONITOR_STORAGE)
+        s_msg_id = fwd.message_id
 
     async with async_session() as session:
         from database.models import OutgoingMessage
@@ -1447,14 +1472,36 @@ async def process_ls_reply_send(message: types.Message, state: FSMContext):
             worker_tg_id=data['rep_worker'],
             receiver_id=data['rep_receiver'],
             reply_to_msg_id=data.get('rep_msg_id'),
-            text=message.text,
+            task_type=m_type,
+            storage_msg_id=s_msg_id, # Сохраняем "ссылку" на файл
+            text=message.text or message.caption or "",
             status="pending"
         )
         session.add(new_out)
         await session.commit()
     
     await state.clear()
-    await message.answer("✅ <b>Сообщение поставлено в очередь на отправку!</b>")
+    await message.answer(f"✅ {m_type.capitalize()}-ответ в очереди.")
+
+
+
+@dp.callback_query(F.data.startswith("reac_"))
+async def process_ls_reaction(callback: types.CallbackQuery):
+    _, w_id, s_id, m_id, emoji = callback.data.split("_")
+    
+    async with async_session() as session:
+        from database.models import OutgoingMessage
+        new_reac = OutgoingMessage(
+            worker_tg_id=int(w_id),
+            receiver_id=int(s_id),
+            reply_to_msg_id=int(m_id),
+            task_type="reaction",
+            reaction_data=emoji
+        )
+        session.add(new_reac)
+        await session.commit()
+    
+    await callback.answer(f"Задача на реакцию {emoji} создана!")
 
 # --- ЗАПУСК ---
 

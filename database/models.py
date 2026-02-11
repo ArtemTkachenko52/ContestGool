@@ -180,13 +180,29 @@ class MentionTask(Base):
     created_at = Column(DateTime, server_default=func.now())
 
 class OutgoingMessage(Base):
-    """Очередь ответов оператора (Пункт 3 ТЗ)"""
     __tablename__ = 'outgoing_messages'
     __table_args__ = {"schema": "workers"}
     id = Column(Integer, primary_key=True)
-    worker_tg_id = Column(BigInteger) # Кто отправляет
-    receiver_id = Column(BigInteger)  # Кому отправляем
-    reply_to_msg_id = Column(Integer, nullable=True) # ID для точечного ответа
-    text = Column(Text)
-    status = Column(String, default="pending") # pending / sent / error
+    worker_tg_id = Column(BigInteger)
+    receiver_id = Column(BigInteger)
+    reply_to_msg_id = Column(Integer, nullable=True)
+    text = Column(Text, nullable=True)
+    # НОВЫЕ ПОЛЯ
+    task_type = Column(String, default="text") # text, reaction, media
+    file_id = Column(String, nullable=True)     # Для фото/ГС от оператора
+    reaction_data = Column(String, nullable=True) # "👍" или ID кастомного
+    status = Column(String, default="pending")
     created_at = Column(DateTime, server_default=func.now())
+    storage_msg_id = Column(BigInteger, nullable=True) # ID сообщения в хранилище
+
+class LuckRaid(Base):
+    """Активные рейды десанта (Пункт 2 ТЗ)"""
+    __tablename__ = 'luck_raids'
+    __table_args__ = {"schema": "workers"}
+    id = Column(Integer, primary_key=True)
+    channel_id = Column(BigInteger)
+    post_id = Column(Integer)
+    emoji = Column(String)
+    status = Column(String, default="active") # active / finished
+    created_at = Column(DateTime, server_default=func.now())
+
