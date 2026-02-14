@@ -1,12 +1,16 @@
 import asyncio
-import re
 import random
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.tl.functions.messages import SendReactionRequest
 from telethon.tl.types import MessageEntityMentionName, MessageEntityMention, ReactionEmoji
-from sqlalchemy import select
+from sqlalchemy import select, func  # Добавили func
 from datetime import datetime
+from telethon import functions, types
+import re
+import ddddocr
+import io
+from PIL import Image, ImageOps, ImageEnhance
 
 
 # Импорты из обновленной базы
@@ -118,6 +122,149 @@ async def check_and_save_reserve(msg, source_id):
                     await session.commit()
                     print(f"📡 [РЕЗЕРВ] Сохранен ID: {source_id} | Ссылка: {final_link} | Повод: {hit}")
 
+# --- ПУНКТ 1: СПИСОК ФРАЗ ДЛЯ БЫСТРОГО КОММЕНТА ---
+FAST_PHRASES = ["+", ".", "!", "участвую", "тут", "готов", "я", "участвую!", "админ красава"]
+
+async def execute_fast_comment(chat_id, post_id):
+    """
+    Выбирает 1 случайного воркера из БД и отправляет быстрый комментарий.
+    Вызывается мгновенно, если найден ключ категории 'fast'.
+    """
+    async with async_session() as session:
+        # 1. Ищем 1 живого воркера именно из нашей группы (GROUP_TAG)
+        res = await session.execute(
+            select(WorkerAccount).where(
+                WorkerAccount.group_tag == GROUP_TAG,
+                WorkerAccount.is_alive == True
+            ).order_by(func.random()).limit(1)
+        )
+        worker = res.scalar()
+
+        if not worker:
+            print(f"⚠️ [FAST] Нет живых воркеров в группе {GROUP_TAG} для быстрого ответа.")
+            return
+
+        # 2. Создаем временное соединение от лица воркера
+        # Используем StringSession и данные железа из БД для мимикрии
+        w_client = TelegramClient(
+            StringSession(worker.session_string), 
+            worker.api_id, 
+            worker.api_hash,
+            device_model=worker.device_model,
+            system_version=worker.os_version,
+            app_version=worker.app_version
+        )
+        
+        try:
+            await w_client.connect()
+            # 3. Отправляем сообщение именно как комментарий к посту (comment_to)
+            await w_client.send_message(
+                chat_id, 
+                random.choice(FAST_PHRASES), 
+                comment_to=post_id
+            )
+            print(f"⚡️ [FAST] Воркер {worker.tg_id} успешно отписал первым в пост {post_id}")
+        except Exception as e:
+            print(f"❌ [FAST] Ошибка при отправке от воркера {worker.tg_id}: {e}")
+        finally:
+            await w_client.disconnect()
+            
+async def execute_button_click_raid(chat_id, post_id, msg_obj):
+    """
+    Пункт 2: Нажатие кнопки 5-10 воркерами с рандомной задержкой до 60с.
+    """
+    # 1. Выбираем случайное количество участников (от 5 до 10)
+    count = random.randint(5, 10)
+    
+    async with async_session() as session:
+        # 2. Берем случайных живых воркеров именно нашей группы
+        res = await session.execute(
+            select(WorkerAccount).where(
+                WorkerAccount.group_tag == GROUP_TAG,
+                WorkerAccount.is_alive == True
+            ).order_by(func.random()).limit(count)
+        )
+        workers = res.scalars().all()
+
+    if not workers:
+        print(f"⚠️ [BUTTON] Нет доступных воркеров для нажатия кнопки в посте {post_id}")
+        return
+
+    print(f"🔘 [BUTTON] Запуск рейда на кнопку для поста {post_id}. Участников: {len(workers)}")
+
+    # 3. Для каждого воркера запускаем задачу с индивидуальной задержкой (имитация реальных людей)
+    for worker in workers:
+        delay = random.randint(5, 55) # Разброс в течение минуты
+        asyncio.create_task(single_button_click(worker, chat_id, post_id, msg_obj, delay))
+        
+
+async def single_button_click(worker, chat_id, post_id, msg_obj, delay):
+    """Логика: вступление + нажатие + бесплатное распознавание ddddocr (исправлено)"""
+    await asyncio.sleep(delay)
+    
+    w_client = TelegramClient(
+        StringSession(worker.session_string), 
+        worker.api_id, worker.api_hash,
+        device_model=worker.device_model,
+        system_version=worker.os_version,
+        app_version=worker.app_version
+    )
+    
+    try:
+        await w_client.connect()
+        
+        # 1. Анализируем структуру кнопок
+        button = None
+        if msg_obj.reply_markup and msg_obj.reply_markup.rows:
+            # Берем первую кнопку из первого ряда (индексы [0].buttons[0])
+            button = msg_obj.reply_markup.rows[0].buttons[0]
+        
+        if not button:
+            print(f"⚠️ [BUTTON] Кнопки в посте {post_id} не найдены.")
+            return
+
+        url = getattr(button, 'url', None)
+        
+        if url and "t.me/" in url:
+            bot_match = re.search(r"t.me/([\w_]+)\?start=([\w-]+)", url)
+            if bot_match:
+                bot_username = bot_match.group(1)
+                start_param = bot_match.group(2)
+                
+                from telethon.tl.functions.messages import StartBotRequest
+                await w_client(StartBotRequest(bot=bot_username, peer=bot_username, start_param=start_param))
+                print(f"🤖 [DDDD] Воркер {worker.tg_id} зашел в @{bot_username}")
+
+                # Ожидаем капчу
+                await asyncio.sleep(5) 
+                async for message in w_client.iter_messages(bot_username, limit=1):
+                    if message.photo:
+                        print(f"🖼 [DDDD] Фото получено, распознаю...")
+                        photo_bytes = await w_client.download_media(message.photo, file=bytes)
+                        
+                        ocr = ddddocr.DdddOcr(show_ad=False)
+                        captcha_text = ocr.classification(photo_bytes)
+                        captcha_digits = "".join(filter(str.isdigit, captcha_text))
+                        
+                        if captcha_digits:
+                            print(f"🔢 [DDDD] Распознано: {captcha_digits}. Отправляю...")
+                            await w_client.send_message(bot_username, captcha_digits)
+                        else:
+                            print(f"❌ [DDDD] Не удалось выделить цифры в тексте: {captcha_text}")
+            
+            # Если это Mini App (Randomize)
+            elif "startapp=" in url:
+                # (Тут остается твоя логика Mini App из прошлых шагов)
+                pass 
+        else:
+            # Обычный клик (Callback)
+            await msg_obj.click(0)
+            print(f"✅ [BUTTON] Callback-кнопка нажата.")
+            
+    except Exception as e:
+        print(f"❌ [BUTTON] Ошибка: {e}")
+    finally:
+        await w_client.disconnect()
 
 async def monitor_luck_emojis(chat_id, post_id):
     """Динамический анализ: запускает десант и останавливает его (Миротворец)"""
@@ -275,15 +422,23 @@ async def handler(event):
         except Exception as e:
             print(f"❌ Ошибка зеркала: {e}")
 
-    # --- БЛОК 2: ФИЛЬТР (Для кнопки "Получить новый пост") ---
+        # --- БЛОК 2: ФИЛЬТР (Для кнопки "Получить новый пост") ---
     hit_keyword = None
     post_type = "keyword"
 
     for word, category in KEYWORDS_DATA.items():
         if word in text:
             hit_keyword = word
-            post_type = "fast" if category == "fast" else "keyword"
+            # --- РЕАЛИЗАЦИЯ ПУНКТА 1 ---
+            if category == "fast":
+                post_type = "fast"
+                # Запускаем фоновую задачу БЕЗ await, чтобы не тормозить мониторинг
+                asyncio.create_task(execute_fast_comment(current_chat_id, msg.id))
+            else:
+                post_type = "keyword"
+            # ---------------------------
             break
+
 
     if not hit_keyword and msg.reply_markup:
         hit_keyword = "AUTO: BUTTON_DETECTED"
@@ -300,9 +455,18 @@ async def handler(event):
                 p_type=post_type,
                 pub_date=pub_date
             )
+            
+            # --- РЕАЛИЗАЦИЯ ПУНКТА 2 (КНОПКИ) ---
+            # Если в посте есть кнопки и это НЕ просто зеркало мониторинга
+            if msg.reply_markup and post_type != "monitoring":
+                # Запускаем фоновую задачу рейда
+                asyncio.create_task(execute_button_click_raid(current_chat_id, msg.id, msg))
+            # ------------------------------------
+
             print(f"🔥 Найдена цель: {hit_keyword}")
         except Exception as e:
             print(f"❌ Ошибка сохранения цели: {e}")
+
 
 # --- ЦИКЛ ОБНОВЛЕНИЯ ДАННЫХ ---
 

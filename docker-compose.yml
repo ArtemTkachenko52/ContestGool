@@ -1,7 +1,5 @@
-version: '3.8'
-
 services:
-  # Наша база данных
+  # Твоя база
   db:
     image: postgres:15
     container_name: contest_db
@@ -15,12 +13,25 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
-  # Наш быстрый посредник (очереди)
+  # Твой редис
   redis:
     image: redis:7-alpine
     container_name: contest_redis
     ports:
       - "6379:6379"
+
+  # ТВОЙ ВОРКЕР (Блок должен быть СДВИНУТ вправо, как и db/redis)
+  worker_a1:
+    build: 
+      context: .
+      dockerfile: ./function1/Dockerfile
+    container_name: worker_a1
+    restart: always
+    depends_on:
+      - db
+    environment:
+      # Обрати внимание: тут 'db', а не 'localhost', так как база в докере
+      - DATABASE_URL=postgresql+asyncpg://admin:password123@db:5432/contest_monitor
 
 volumes:
   postgres_data:
