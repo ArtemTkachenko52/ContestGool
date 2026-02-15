@@ -660,9 +660,9 @@ async def save_edit_data(event, state: FSMContext):
     await state.clear()
     await message.answer(f"✅ Данные паспорта #{passport_id} обновлены!")
 
+# --- 2. ФИНАЛЬНОЕ СОХРАНЕНИЕ (УБЕДИСЬ, ЧТО ИМЕНА СОВПАДАЮТ) ---
 @dp.callback_query(ContestForm.v_rep_confirm, F.data == "final_v_confirm")
-async def save_voting_report(callback: types.CallbackQuery, state: FSMContext):
-    # Весь внутренний код функции остается прежним!
+async def save_voting_report_final(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     
     async with async_session() as session:
@@ -671,9 +671,10 @@ async def save_voting_report(callback: types.CallbackQuery, state: FSMContext):
             target_msg_id=data['v_target_msg_id'],
             target_chat_id=data['v_target_chat_id'],
             vote_type=data['v_method'],
-            option_id=data['v_option'],
-            target_groups=data['selected_groups'],
-            accounts_count=data['v_rep_count'],
+            # ПРОВЕРЬ ЭТУ СТРОКУ: берем именно v_option
+            option_id=str(data.get('v_option')), 
+            target_groups=data['v_selected_groups'],
+            accounts_count=data.get('v_rep_count', 0),
             intensity=int(data['v_intensity']),
             created_by=callback.from_user.id,
             status="pending"
@@ -682,9 +683,13 @@ async def save_voting_report(callback: types.CallbackQuery, state: FSMContext):
         await session.commit()
     
     await state.clear()
-    await callback.message.edit_text("✅ <b>Рапорт отправлен!</b>\nОжидайте подтверждения от Старшего Оператора.", parse_mode="HTML")
-    
-    # ТУТ МОЖНО ДОБАВИТЬ УВЕДОМЛЕНИЕ СТАРШЕМУ (если есть его ID)
+    await callback.message.edit_text("✅ <b>Рапорт успешно отправлен!</b>", parse_mode="HTML")
+    await callback.answer()
+# --- ОТМЕНА РАПОРТА ---
+@dp.callback_query(ContestForm.v_rep_confirm, F.data == "final_v_cancel")
+async def cancel_voting_report_final(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text("❌ Создание рапорта отменено.")
     await callback.answer()
 
 @dp.callback_query(F.data == "final_v_cancel")
@@ -693,171 +698,137 @@ async def cancel_voting_report(callback: types.CallbackQuery, state: FSMContext)
     await state.clear()
     await callback.message.edit_text("❌ Создание рапорта отменено.")
     await callback.answer()
-# --- 1. СТАРТ СОЗДАНИЯ РАПОРТА ---
-# Теперь этот фильтр пропустит "v_rep_confirm", потому что после v_rep_ нет цифр
+
+
+# --- 1. СТАРТ: ВЫБОР ГРУПП (ТОЛЬКО JOINED) ---
 @dp.callback_query(F.data.startswith("v_rep_"))
 async def start_voting_report(callback: types.CallbackQuery, state: FSMContext):
-    # Если в кнопке есть слова confirm или cancel, эта функция НЕ должна работать
-    if "confirm" in callback.data or "cancel" in callback.data:
+    passport_id = int(callback.data.split("_")[2])
+    
+    async with async_session() as session:
+        res = await session.execute(
+            select(PotentialPost.source_tg_id).join(ContestPassport).where(ContestPassport.id == passport_id)
+        )
+        tg_id = res.scalar()
+        
+        query = select(GroupChannelRelation.group_tag).where(
+            GroupChannelRelation.channel_id == tg_id,
+            GroupChannelRelation.status == 'joined'
+        )
+        res_gr = await session.execute(query)
+        available_groups = [row[0] for row in res_gr.all()]
+
+    if not available_groups:
+        await callback.answer("⚠️ Нет групп, прошедших инвайт в этот канал!", show_alert=True)
         return
 
-    # А здесь твой обычный код...
-    passport_id = int(callback.data.split("_")[2]) # Или [1], в зависимости от твоего сплита
-    await state.update_data(v_passport_id=passport_id, selected_groups=[])
-    # ... и так далее
-
+    await state.update_data(v_passport_id=passport_id, v_available_groups=available_groups, v_selected_groups=[])
     
-    await state.set_state(ContestForm.v_rep_fwd)
-    await callback.message.answer(
-        "🗳 <b>Новый рапорт голосования</b>\n\n"
-        "Перешлите в этот чат пост из канала, на который нужно совершить накрутку.",
-        parse_mode="HTML"
-    )
+    builder = InlineKeyboardBuilder()
+    for g in available_groups:
+        builder.row(types.InlineKeyboardButton(text=f"Группа {g}", callback_data=f"vsel_{g}"))
+    builder.row(types.InlineKeyboardButton(text="➡️ Далее", callback_data="vsel_done"))
+    
+    await state.set_state(ContestForm.v_rep_choose_groups)
+    await callback.message.answer("👥 <b>Выберите группы для голосования:</b>", reply_markup=builder.as_markup(), parse_mode="HTML")
     await callback.answer()
 
-# --- 2. ПРИЕМ ПЕРЕСЛАННОГО ПОСТА ---
+# --- 2. ОБРАБОТКА ГАЛОЧЕК И ВЫБОР КОЛИЧЕСТВА ---
+@dp.callback_query(ContestForm.v_rep_choose_groups, F.data.startswith("vsel_"))
+async def process_v_groups(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    selected = data.get("v_selected_groups", [])
+
+    if callback.data == "vsel_done":
+        if not selected:
+            await callback.answer("Выберите хотя бы одну группу!", show_alert=True)
+            return
+        if len(selected) == 1:
+            await state.set_state(ContestForm.v_rep_count)
+            await callback.message.edit_text(f"🔢 <b>Выбрана Группа {selected[0]}</b>\nВведите количество исполнителей:")
+        else:
+            await state.update_data(v_rep_count=0) # Все
+            await state.set_state(ContestForm.v_rep_fwd)
+            await callback.message.edit_text("🗳 <b>Группы выбраны.</b>\nПерешлите пост-голосование из канала:")
+        return
+
+    group = callback.data.replace("vsel_", "")
+    if group in selected: selected.remove(group)
+    else: selected.append(group)
+    await state.update_data(v_selected_groups=selected)
+    
+    builder = InlineKeyboardBuilder()
+    for g in data['v_available_groups']:
+        mark = " ✅" if g in selected else ""
+        builder.row(types.InlineKeyboardButton(text=f"Группа {g}{mark}", callback_data=f"vsel_{g}"))
+    builder.row(types.InlineKeyboardButton(text="➡️ Далее", callback_data="vsel_done"))
+    await callback.message.edit_reply_markup(reply_markup=builder.as_markup())
+
+# --- 3. ПРИЕМ КОЛИЧЕСТВА (ДЛЯ ОДНОЙ ГРУППЫ) ---
+@dp.message(ContestForm.v_rep_count)
+async def process_v_count(message: types.Message, state: FSMContext):
+    if not message.text.isdigit():
+        await message.answer("Введите число!")
+        return
+    await state.update_data(v_rep_count=int(message.text))
+    await state.set_state(ContestForm.v_rep_fwd)
+    await message.answer("🗳 Теперь перешлите пост-голосование из канала:")
+
+# --- 4. ПРИЕМ ПОСТА И СПОСОБ ---
 @dp.message(ContestForm.v_rep_fwd)
 async def process_v_fwd(message: types.Message, state: FSMContext):
     if not message.forward_from_message_id:
-        await message.answer("❌ Ошибка! Нужно именно <b>переслать</b> пост из канала.")
+        await message.answer("❌ Нужно именно ПЕРЕСЛАТЬ пост!")
         return
-
-    await state.update_data(
-        v_target_msg_id=message.forward_from_message_id,
-        v_target_chat_id=message.forward_from_chat.id
-    )
+    await state.update_data(v_target_msg_id=message.forward_from_message_id, v_target_chat_id=message.forward_from_chat.id)
     
     builder = InlineKeyboardBuilder()
-    builder.row(types.InlineKeyboardButton(text="📊 Опрос (Poll)", callback_data="v_meth_poll"))
-    builder.row(types.InlineKeyboardButton(text="🔥 Реакция (Emoji)", callback_data="v_meth_reac"))
-    
+    builder.row(types.InlineKeyboardButton(text="📊 Опрос", callback_data="v_meth_poll"),
+                types.InlineKeyboardButton(text="🔥 Реакция", callback_data="v_meth_reac"))
     await state.set_state(ContestForm.v_rep_method)
-    await message.answer("Выберите способ накрутки:", reply_markup=builder.as_markup())
+    await message.answer("Выберите способ:", reply_markup=builder.as_markup())
 
-# --- 3. ВВОД ВАРИАНТА (ОПЦИИ) ---
+# --- 5. ВАРИАНТ (ОПЦИЯ) ---
 @dp.callback_query(ContestForm.v_rep_method)
 async def process_v_method(callback: types.CallbackQuery, state: FSMContext):
     method = callback.data.replace("v_meth_", "")
     await state.update_data(v_method=method)
-    
-    prompt = "Введите <b>номер варианта</b> (1, 2, 3...):" if method == "poll" else "Введите <b>ID/Эмодзи</b> реакции:"
-    
+    prompt = "Введите номер варианта (1, 2...):" if method == "poll" else "Введите ID/Эмодзи реакции:"
     await state.set_state(ContestForm.v_rep_option)
-    await callback.message.edit_text(prompt, parse_mode="HTML")
-    await callback.answer()
+    await callback.message.edit_text(prompt)
 
-# --- 3. ВЫБОР ГРУПП (ИСПРАВЛЕННЫЙ) ---
+# --- 1. ПРИЕМ ВАРИАНТА ---
 @dp.message(ContestForm.v_rep_option)
 async def process_v_option(message: types.Message, state: FSMContext):
-    await state.update_data(v_option=message.text, selected_groups=[])
-    op = await get_operator(message.from_user.id)
-    
-    async with async_session() as session:
-        # Берем все уникальные теги групп из таблицы воркеров
-        result = await session.execute(text("SELECT DISTINCT group_tag FROM workers.workers"))
-        # Извлекаем только значения строк (первый элемент кортежа)
-        all_groups = [row[0] for row in result.all() if row[0]]
-
-    # Если в базе нет воркеров, принудительно добавляем группу оператора для теста
-    if not all_groups:
-        all_groups = [op.group_tag]
-
-    builder = InlineKeyboardBuilder()
-    for g in all_groups:
-        builder.row(types.InlineKeyboardButton(text=f"Группа {g}", callback_data=f"v_grp_{g}"))
-    
-    builder.row(types.InlineKeyboardButton(text="➡️ Далее (К интенсивности)", callback_data="v_grp_done"))
-    
-    await state.set_state(ContestForm.v_rep_choose_groups)
-    await message.answer("Выберите группы для участия:", reply_markup=builder.as_markup())
-
-# --- 4. ОБРАБОТКА КЛИКОВ (ИСПРАВЛЕННЫЙ) ---
-@dp.callback_query(ContestForm.v_rep_choose_groups, F.data.startswith("v_grp_"))
-async def process_v_groups(callback: types.CallbackQuery, state: FSMContext):
-    if callback.data == "v_grp_done":
-        data = await state.get_data()
-        selected = data.get("selected_groups", [])
-        if not selected:
-            await callback.answer("⚠️ Выберите хотя бы одну группу!", show_alert=True)
-            return
-
-        if len(selected) == 1:
-            await state.set_state(ContestForm.v_rep_count)
-            await callback.message.edit_text("🔢 <b>Сколько аккаунтов</b> задействовать?", parse_mode="HTML")
-        else:
-            await state.update_data(v_rep_count=0)
-            await ask_v_intensity(callback.message, state)
-        await callback.answer()
-        return
-
-    group_tag = callback.data.replace("v_grp_", "")
-    data = await state.get_data()
-    selected = data.get("selected_groups", [])
-    
-    if group_tag in selected: selected.remove(group_tag)
-    else: selected.append(group_tag)
-    
-    await state.update_data(selected_groups=selected)
-    
-    # Перерисовываем список групп
-    op = await get_operator(callback.from_user.id)
-    async with async_session() as session:
-        result = await session.execute(text("SELECT DISTINCT group_tag FROM workers.workers"))
-        all_groups = [row[0] for row in result.all() if row[0]]
-    
-    if not all_groups: all_groups = [op.group_tag]
-
-    builder = InlineKeyboardBuilder()
-    for g in all_groups:
-        mark = " ✅" if g in selected else ""
-        builder.row(types.InlineKeyboardButton(text=f"Группа {g}{mark}", callback_data=f"v_grp_{g}"))
-    
-    builder.row(types.InlineKeyboardButton(text="➡️ Далее", callback_data="v_grp_done"))
-    await callback.message.edit_reply_markup(reply_markup=builder.as_markup())
-    await callback.answer()
-
-# --- 5. ВВОД КОЛИЧЕСТВА (ДЛЯ 1 ГРУППЫ) ---
-@dp.message(ContestForm.v_rep_count)
-async def process_v_count(message: types.Message, state: FSMContext):
-    if not message.text.isdigit():
-        await message.answer("❌ Введите число!")
-        return
-    await state.update_data(v_rep_count=int(message.text))
+    # Сохраняем текст сообщения (будь то "1", "🏀" или ID)
+    await state.update_data(v_option=message.text) 
     await ask_v_intensity(message, state)
 
-# --- 6. ИНТЕНСИВНОСТЬ РАПОРТА ---
+# --- 6. ИНТЕНСИВНОСТЬ И ФИНАЛ ---
 async def ask_v_intensity(message, state: FSMContext):
     await state.set_state(ContestForm.v_rep_intensity)
-    await message.answer("🚀 Выберите <b>интенсивность накрутки</b> для рапорта:", reply_markup=get_intensity_kb(), parse_mode="HTML")
+    await message.answer("🚀 Выберите интенсивность:", reply_markup=get_intensity_kb())
 
 @dp.callback_query(ContestForm.v_rep_intensity)
 async def process_v_intensity(callback: types.CallbackQuery, state: FSMContext):
     intensity = callback.data.replace("int_", "")
     await state.update_data(v_intensity=intensity)
-    
-    # Финальное превью перед отправкой Старшему
     data = await state.get_data()
+    
     summary = (
-        "📊 <b>ПРЕДПРОСМОТР РАПОРТА</b>\n\n"
-        f"📍 Пост ID: <code>{data['v_target_msg_id']}</code>\n"
+        f"📊 <b>ПРЕДПРОСМОТР РАПОРТА</b>\n"
+        f"📍 Пост: <code>{data['v_target_msg_id']}</code>\n"
         f"🛠 Метод: <code>{data['v_method']}</code>\n"
-        f"🎯 Вариант: <code>{data['v_option']}</code>\n"
-        f"👥 Группы: <code>{', '.join(data['selected_groups'])}</code>\n"
-        f"🔢 Аккаунтов: <code>{'Все' if data['v_rep_count'] == 0 else data['v_rep_count']}</code>\n"
-        f"🚀 Интенсивность: <code>{intensity} ур.</code>\n\n"
-        "Отправить на подтверждение Старшему Оператору?"
+        f"👥 Группы: <code>{', '.join(data['v_selected_groups'])}</code>\n"
+        f"🔢 Кол-во: <code>{'Все' if data['v_rep_count'] == 0 else data['v_rep_count']}</code>\n"
+        f"🚀 Интенсивность: {intensity} ур."
     )
-    
     builder = InlineKeyboardBuilder()
-    # Мы добавили слово final_, чтобы фильтр v_rep_ их не подхватывал по ошибке
-    builder.row(types.InlineKeyboardButton(text="📤 Отправить", callback_data="final_v_confirm"))
-    builder.row(types.InlineKeyboardButton(text="❌ Отмена", callback_data="final_v_cancel"))
-
-
-    
+    builder.row(types.InlineKeyboardButton(text="📤 Отправить Старшему", callback_data="final_v_confirm"),
+                types.InlineKeyboardButton(text="❌ Отмена", callback_data="final_v_cancel"))
     await state.set_state(ContestForm.v_rep_confirm)
     await callback.message.edit_text(summary, reply_markup=builder.as_markup(), parse_mode="HTML")
-    await callback.answer()
+
 
 @dp.message(F.text == "🛡 Админ-панель")
 async def admin_panel(message: types.Message):
@@ -925,13 +896,15 @@ async def admin_view_pending(callback: types.CallbackQuery):
         summary = (
             f"⚠️ <b>РАПОРТ НА ПРОВЕРКУ #{report.id}</b>\n"
             f"━━━━━━━━━━━━━━\n"
-            f"<b>КОНКУРС:</b> {passport.prize_type} (ID:{passport.id})\n"
-            f"<b>МЕТОД:</b> {report.vote_type.upper()}\n"
-            f"<b>ЦЕЛЬ:</b> {report.option_id}\n"
-            f"<b>ГРУППЫ:</b> {', '.join(report.target_groups)}\n"
-            f"<b>ИНТЕНСИВНОСТЬ:</b> {report.intensity} ур.\n"
+            f"📋 <b>ПАСПОРТ:</b> {passport.prize_type} (ID:{passport.id})\n"
+            f"🧩 <b>УСЛОВИЯ:</b> {passport.conditions.get('selected', [])}\n"
+            f"📊 <b>ЦЕЛЬ:</b> {report.vote_type.upper()} -> {report.option_id}\n"
+            f"👥 <b>ГРУППЫ:</b> {', '.join(report.target_groups)}\n"
+            f"🔢 <b>АККАУНТОВ:</b> {'Все' if report.accounts_count == 0 else report.accounts_count}\n"
+            f"🚀 <b>ИНТЕНСИВНОСТЬ:</b> {report.intensity} ур.\n"
             f"━━━━━━━━━━━━━━"
         )
+
         
         builder = InlineKeyboardBuilder()
         builder.row(
@@ -942,21 +915,37 @@ async def admin_view_pending(callback: types.CallbackQuery):
         await callback.message.answer(summary, reply_markup=builder.as_markup(), parse_mode="HTML")
     await callback.answer()
 
-# --- АДМИНКА: СМЕНА СТАТУСА ---
-@dp.callback_query(F.data.startswith("adm_appr_"))
-@dp.callback_query(F.data.startswith("adm_decl_"))
+# --- ИСПРАВЛЕННЫЙ ПРИЕМ РЕШЕНИЯ СТАРШЕГО ---
+@dp.callback_query(F.data.startswith("adm_appr_")) # Для кнопок Одобрить
+@dp.callback_query(F.data.startswith("adm_decl_")) # Для кнопок Отклонить
 async def process_report_decision(callback: types.CallbackQuery):
-    action, _, report_id = callback.data.split("_")
-    new_status = "approved" if action == "appr" else "declined"
+    # Разбираем данные: adm_appr_ID или adm_decl_ID
+    parts = callback.data.split("_")
+    action = parts[1]     # 'appr' или 'decl'
+    report_id = int(parts[2])
+    
+    # Четко прописываем статус
+    if action == "appr":
+        new_status = "approved"
+        status_text = "🟢 ОДОБРЕН"
+    else:
+        new_status = "declined"
+        status_text = "🔴 ОТКЛОНЕН"
     
     async with async_session() as session:
+        # Обновляем статус рапорта в базе
         await session.execute(
-            update(VotingReport).where(VotingReport.id == int(report_id)).values(status=new_status)
+            update(VotingReport)
+            .where(VotingReport.id == report_id)
+            .values(status=new_status)
         )
         await session.commit()
     
-    status_text = "🟢 ОДОБРЕН" if new_status == "approved" else "🔴 ОТКЛОНЕН"
-    await callback.message.edit_text(f"⚖️ Рапорт #{report_id} изменен на: <b>{status_text}</b>", parse_mode="HTML")
+    await callback.message.edit_text(
+        f"⚖️ Рапорт #{report_id} изменен на: <b>{status_text}</b>\n"
+        f"<i>Исполнители получили задачу.</i>", 
+        parse_mode="HTML"
+    )
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("addgr_"))

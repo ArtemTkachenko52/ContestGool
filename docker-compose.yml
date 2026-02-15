@@ -27,10 +27,15 @@ services:
       dockerfile: ./function1/Dockerfile
     container_name: worker_a1
     restart: always
+    # УДАЛИ network_mode: "host"
+    # ДОБАВИ DNS для интернета:
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     depends_on:
       - db
     environment:
-      # Обрати внимание: тут 'db', а не 'localhost', так как база в докере
+      # ВЕРНИ 'db', чтобы воркер видел контейнер базы
       - DATABASE_URL=postgresql+asyncpg://admin:password123@db:5432/contest_monitor
 
 volumes:

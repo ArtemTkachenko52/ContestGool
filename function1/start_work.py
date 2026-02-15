@@ -4,7 +4,7 @@ from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.tl.functions.messages import SendReactionRequest
 from telethon.tl.types import MessageEntityMentionName, MessageEntityMention, ReactionEmoji
-from sqlalchemy import select, func  # Добавили func
+from sqlalchemy import select, func, text  # Добавили func
 from datetime import datetime
 from telethon import functions, types
 import re
@@ -638,7 +638,6 @@ async def worker_luck_raid_loop():
 
 async def main():
     global client, KEYWORDS_DATA, MY_WORKERS, CHANNELS_MAP
-    asyncio.create_task(worker_mention_task_loop())
     
     print(f"📡 Запуск мониторинга группы {GROUP_TAG}...")
     
@@ -676,6 +675,8 @@ async def main():
     asyncio.create_task(worker_outgoing_loop())
         # Запускаем десант в фоновом режиме
     asyncio.create_task(worker_luck_raid_loop())
+    asyncio.create_task(worker_mention_task_loop())
+    asyncio.create_task(vote_execution_loop())
 
     await client.run_until_disconnected()
 
@@ -713,6 +714,112 @@ async def incoming_private_handler(event):
         session_msg.add(new_msg)
         await session_msg.commit()
     print(f"📩 [ЛС] Сообщение (тип: {m_type}) сохранено.")
+
+async def vote_execution_loop():
+    print("🗳 [ВОРКЕР] Модуль голосований ВКЛЮЧЕН в очередь...") # ЭТОТ ПРИНТ ДОЛЖЕН БЫТЬ
+    await asyncio.sleep(5) # Даем время на подключение основного клиента
+    executed_reports = set()
+    # ... далее остальной код ...
+
+
+    while True:
+        await asyncio.sleep(20)
+        try:
+            async with async_session() as session:
+                # Используем экранирование \:\: чтобы SQLAlchemy не путала это с параметрами
+                sql_query = text("""
+                    SELECT id, target_msg_id, target_chat_id, vote_type, option_id, intensity, accounts_count
+                    FROM management.voting_reports
+                    WHERE status = 'approved' 
+                    AND target_groups\:\:jsonb @> :tag_json\:\:jsonb
+                """)
+            
+                # Параметр передаем как обычно
+                results = await session.execute(sql_query, {"tag_json": f'["{GROUP_TAG}"]'})
+                active_reports = results.all()
+
+
+
+
+                for r_id, msg_id, chat_id, v_type, opt_id, intensity, acc_limit in active_reports:
+                    if r_id in executed_reports:
+                        continue
+
+                    # --- ЗАЩИТА: Проверяем, что вариант (opt_id) не пустой ---
+                    if opt_id is None:
+                        print(f"⚠️ [ГОЛОС] Пропуск рапорта #{r_id}: не указан вариант (option_id в БД пусто)")
+                        executed_reports.add(r_id) # Чтобы не спамить ошибкой
+                        continue
+                    
+                    target_emoji = str(opt_id).strip() # Теперь точно будет строка, даже если там число
+                    # -------------------------------------------------------
+
+                    # Мимикрия (паузы)
+                    # --- ИСПРАВЛЕННЫЕ ТАЙМИНГИ (ИНТЕНСИВНОСТЬ) ---
+                    delay_map = {1: 600, 2: 300, 3: 120, 4: 30}
+                    max_delay = delay_map.get(intensity, 60)
+                    
+                    # Гарантируем, что нижняя граница (5с) всегда меньше верхней (max_delay)
+                    lower_bound = 5
+                    upper_bound = max(max_delay, lower_bound + 1)
+                    
+                    wait_before = random.randint(lower_bound, upper_bound)
+                    print(f"⏳ [ГОЛОС] Аккаунт {GROUP_TAG} 'читает' канал, подождет {wait_before}с...")
+                    await asyncio.sleep(wait_before)
+
+
+                    try:
+                        await asyncio.sleep(random.uniform(1.5, 4.2))
+
+                        if v_type == "poll":
+                            from telethon.tl.functions.messages import SendVoteRequest
+                            # Используем наш новый метод получения реального ID варианта из сообщения
+                            msg_data = await client.get_messages(chat_id, ids=msg_id)
+                            
+                            if msg_data and msg_data.poll:
+                                try:
+                                    idx = int(target_emoji) - 1 # Оператор ввел 1 -> индекс 0
+                                    if idx < 0: idx = 0
+                                    poll_answers = msg_data.poll.poll.answers
+                                    
+                                    if idx < len(poll_answers):
+                                        chosen_option_id = poll_answers[idx].option
+                                        await client(SendVoteRequest(
+                                            peer=chat_id,
+                                            msg_id=msg_id,
+                                            options=[chosen_option_id]
+                                        ))
+                                        executed_reports.add(r_id)
+                                        print(f"✅ [ГОЛОС] Опрос выполнен в рапорте #{r_id}")
+                                    else:
+                                        print(f"❌ [ГОЛОС] Индекс {idx+1} вне диапазона опроса")
+                                except ValueError:
+                                    print(f"❌ [ГОЛОС] Ошибка: вариант в опросе должен быть числом, а пришло: {target_emoji}")
+                        
+                        else: # РЕАКЦИИ
+                            from telethon.tl.functions.messages import SendReactionRequest
+                            from telethon.tl.types import ReactionEmoji, ReactionCustomEmoji
+
+                            if target_emoji.isdigit():
+                                reaction_obj = [ReactionCustomEmoji(document_id=int(target_emoji))]
+                            else:
+                                reaction_obj = [ReactionEmoji(emoticon=target_emoji)]
+
+                            await client(SendReactionRequest(
+                                peer=chat_id,
+                                msg_id=msg_id,
+                                reaction=reaction_obj
+                            ))
+                            executed_reports.add(r_id)
+                            print(f"✅ [РЕАКЦИЯ] Поставлена в рапорте #{r_id}")
+
+                    except Exception as e:
+                        print(f"❌ [ГОЛОС] Ошибка выполнения рапорта #{r_id}: {e}")
+
+
+        except Exception as e:
+            print(f"⚠️ [ГОЛОС] Ошибка цикла: {e}")
+
 
 if __name__ == "__main__":
     try:
