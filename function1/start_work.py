@@ -4,7 +4,7 @@ from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.tl.functions.messages import SendReactionRequest
 from telethon.tl.types import MessageEntityMentionName, MessageEntityMention, ReactionEmoji
-from sqlalchemy import select, func, text  # Добавили func
+from sqlalchemy import select, func, text, update  # <-- ДОБАВИЛИ update
 from datetime import datetime
 from telethon import functions, types
 import re
@@ -12,13 +12,14 @@ import ddddocr
 import io
 from PIL import Image, ImageOps, ImageEnhance
 
-
 # Импорты из обновленной базы
 from database.config import async_session
 from database.models import (
     Keyword, PotentialPost, WorkerAccount, 
-    TargetChannel, ReaderAccount, ContestPassport, LuckEvent, OutgoingMessage
+    TargetChannel, ReaderAccount, ContestPassport, 
+    LuckEvent, OutgoingMessage, StarReport  # <-- ДОБАВИЛИ StarReport
 )
+
 
 # Настройки группы (тарелки)
 GROUP_TAG = 'A1' 
@@ -633,6 +634,82 @@ async def worker_luck_raid_loop():
                 except Exception as e:
                     print(f"❌ [ДЕСАНТ] Ошибка: {e}")
 
+async def star_execution_loop():
+    """Фоновая задача: отправка подарков (Медведь, Роза и т.д.)"""
+    print(f"⭐ [ВОРКЕР {GROUP_TAG}] Модуль подарков запущен.")
+    
+    # Словарь соответствия: Название в боте -> Технический slug подарка в TG
+    # Внимание: Slug-и могут меняться Telegram-ом. 
+    GIFT_SLUGS = {
+        "🧸 Медведь": "bear",
+        "🌹 Роза": "rose",
+        "💐 Букет": "bouquet",
+        "🏆 Кубок": "cup"
+    }
+
+    while True:
+        await asyncio.sleep(30)
+        try:
+            async with async_session() as session:
+                me = await client.get_me()
+                
+                # Ищем одобренные рапорты
+                stmt = text("""
+                    SELECT id, target_user, method, star_count 
+                    FROM management.star_reports 
+                    WHERE status = 'approved' AND executor_id = :my_id
+                """)
+                res = await session.execute(stmt, {"my_id": me.id})
+                reports = res.all()
+
+                for r_id, target, gift_name, count in reports:
+                    print(f"💰 [ЗВЕЗДЫ] Начинаю процесс отправки '{gift_name}' для {target}...")
+                    
+                    try:
+                        # 1. Получаем ID получателя
+                        peer = await client.get_input_entity(target)
+                        
+                        from telethon import functions, types
+                        
+                        # 2. Получаем список подарков через универсальный запрос
+                        # Если GetStarsGiftsRequest не виден как атрибут, вызываем его через класс
+                        try:
+                            # Попытка вызвать через общий конструктор
+                            all_gifts = await client(functions.payments.GetStarsGiftsRequest())
+                        except AttributeError:
+                            # Если Telethon "не видит" имя, используем альтернативный путь
+                            from telethon.tl.functions.payments import GetStarsGiftsRequest as GSG
+                            all_gifts = await client(GSG())
+
+                        # Ищем подарок
+                        target_gift = all_gifts.gifts[0] # Берем первый (самый дешевый) по умолчанию
+                        for g in all_gifts.gifts:
+                            if "bear" in g.slug.lower() or "bear" in gift_name.lower():
+                                target_gift = g
+                                break
+
+                        # 3. ОТПРАВЛЯЕМ ФОРМУ ОПЛАТЫ (ЗВЕЗДНЫЙ ПОДАРК)
+                        await client(functions.payments.SendStarsFormRequest(
+                            purpose=types.InputStorePaymentStarsGift(
+                                user_id=peer,
+                                gift=target_gift
+                            )
+                        ))
+
+                        print(f"✅ [ЗВЕЗДЫ] Подарок {gift_name} успешно отправлен через StarsForm!")
+                        
+                        await session.execute(
+                            update(StarReport).where(StarReport.id == r_id).values(status="completed")
+                        )
+                        await session.commit()
+                        
+                    except Exception as e:
+                        print(f"❌ [ЗВЕЗДЫ] Ошибка: {e}")
+                        await session.execute(update(StarReport).where(StarReport.id == r_id).values(status="failed"))
+                        await session.commit()
+
+        except Exception as e:
+            print(f"⚠️ [ЗВЕЗДЫ] Ошибка цикла: {e}")
 
 # --- ЗАПУСК ---
 
@@ -677,6 +754,7 @@ async def main():
     asyncio.create_task(worker_luck_raid_loop())
     asyncio.create_task(worker_mention_task_loop())
     asyncio.create_task(vote_execution_loop())
+    asyncio.create_task(star_execution_loop())
 
     await client.run_until_disconnected()
 

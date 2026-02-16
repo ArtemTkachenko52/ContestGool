@@ -12,10 +12,12 @@ class ContestForm(StatesGroup):
     input_sub_links = State()
     input_repost_count = State()
     
-    # --- ГОЛОСОВАНИЕ (РЕГИСТРАЦИЯ ЛИДА) ---
-    input_vote_executor = State()
-    input_vote_data = State()
-    input_vote_place = State()
+    # --- ПАСПОРТ ГОЛОСОВАНИЕ (ОБНОВЛЕННОЕ) ---
+    vote_choose_executor = State() # Выбор исполнителя из кнопок
+    input_vote_reg_data = State()   # Ник, текст или медиа
+    vote_choose_place = State()    # Выбор: ЛС или Комменты
+    input_vote_org_username = State() # Если выбрали ЛС - ввод юзернейма
+
     
     # --- ОБЩИЕ ПАРАМЕТРЫ ---
     setting_intensity = State()
@@ -26,10 +28,11 @@ class ContestForm(StatesGroup):
     choosing_group_to_invite = State()
     
     # --- РАПОРТ НА ЗВЕЗДЫ ---
-    star_target = State()
-    star_method = State()
-    star_amount = State()
-    star_confirm = State()
+    star_target = State()      # Кому (username)
+    star_gift_type = State()   # Выбор: Медведь, Роза и т.д.
+    star_amount = State()      # Сколько звезд
+    star_confirm = State()     # Финальное подтверждение
+
 
     # --- РАПОРТ НА ГОЛОСОВАНИЕ (НАКРУТКА) ---
     v_rep_fwd = State()

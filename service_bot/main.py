@@ -11,8 +11,10 @@ from datetime import datetime
 from database.config import async_session
 from database.models import (
     Operator, PotentialPost, ContestPassport, 
-    TargetChannel, VotingReport, StarReport, GroupChannelRelation, OutgoingMessage
+    TargetChannel, VotingReport, StarReport, 
+    GroupChannelRelation, OutgoingMessage, WorkerAccount  # <-- ДОБАВИЛИ ЭТО
 )
+
 
 from service_bot.states import ContestForm
 
@@ -186,39 +188,101 @@ async def process_prize(callback: types.CallbackQuery, state: FSMContext):
         await callback.message.edit_text("⌨️ Введите название приза вручную:")
     else:
         await state.update_data(prize=prize_raw)
-        await proceed_from_prize(callback.message, state)
+        # Передаем callback.message (само сообщение с кнопками) и callback.from_user.id
+        await proceed_from_prize(callback.message, state, callback.from_user.id)
+    await callback.answer()
+ 
 
 @dp.message(ContestForm.input_prize_custom)
 async def process_custom_prize(message: types.Message, state: FSMContext):
     await state.update_data(prize=message.text)
     await proceed_from_prize(message, state)
 
-async def proceed_from_prize(message, state: FSMContext):
+async def proceed_from_prize(message: types.Message, state: FSMContext, user_id: int):
     data = await state.get_data()
+    op = await get_operator(user_id)
+    
+    if not op:
+        await message.answer("❌ Ошибка: оператор не найден в БД.")
+        return
+
     if data['contest_type'] == 'vote':
-        await state.set_state(ContestForm.input_vote_executor)
-        await message.answer("👤 <b>Шаг 3 (Голосование):</b> Введите Nickname/ID аккаунта-исполнителя для регистрации:", parse_mode="HTML")
+        async with async_session() as session:
+            # Получаем воркеров этой группы
+            res = await session.execute(
+                select(WorkerAccount.tg_id).where(WorkerAccount.group_tag == op.group_tag)
+            )
+            # row[0] достает само число из кортежа БД
+            workers = [row[0] for row in res.all()]
+
+        if not workers:
+            # Редактируем старое сообщение вместо отправки нового
+            await message.edit_text(f"❌ В вашей группе ({op.group_tag}) нет исполнителей!")
+            await state.clear()
+            return
+
+        builder = InlineKeyboardBuilder()
+        for w_id in workers:
+            builder.row(types.InlineKeyboardButton(text=f"🤖 Аккаунт {w_id}", callback_data=f"vexec_{w_id}"))
+        
+        await state.set_state(ContestForm.vote_choose_executor)
+        # РЕДАКТИРУЕМ сообщение
+        await message.edit_text("👤 <b>Шаг 3: Кто участвует?</b>\nВыберите исполнителя для регистрации:", 
+                                reply_markup=builder.as_markup(), parse_mode="HTML")
     else:
         await state.set_state(ContestForm.filling_conditions)
-        await message.answer("📝 <b>Шаг 3: Условия</b>", reply_markup=get_conditions_kb([]), parse_mode="HTML")
+        await message.edit_text("📝 <b>Шаг 3: Условия</b>", 
+                                reply_markup=get_conditions_kb([]), parse_mode="HTML")
 
-# --- ШАГ 3 (ГОЛОСОВАНИЕ): ДАННЫЕ РЕГИСТРАЦИИ ---
-@dp.message(ContestForm.input_vote_executor)
-async def vote_exec(message: types.Message, state: FSMContext):
-    await state.update_data(vote_executor=message.text)
-    await state.set_state(ContestForm.input_vote_data)
-    await message.answer("📄 Введите данные для регистрации (Ник, текст или описание фото):")
+# --- ШАГ 4 (ГОЛОСОВАНИЕ): ДАННЫЕ ДЛЯ РЕГИСТРАЦИИ ---
+@dp.callback_query(ContestForm.vote_choose_executor, F.data.startswith("vexec_"))
+async def process_vote_executor(callback: types.CallbackQuery, state: FSMContext):
+    executor_id = callback.data.replace("vexec_", "")
+    await state.update_data(vote_executor=executor_id)
+    
+    await state.set_state(ContestForm.input_vote_reg_data)
+    await callback.message.edit_text(
+        "📝 <b>Шаг 4: Данные для регистрации</b>\n"
+        "Введите ник, текст или отправьте изображение, которое исполнитель использует для заявки:",
+        parse_mode="HTML"
+    )
+    await callback.answer()
 
-@dp.message(ContestForm.input_vote_data)
-async def vote_data(message: types.Message, state: FSMContext):
-    await state.update_data(vote_reg_data=message.text)
-    await state.set_state(ContestForm.input_vote_place)
-    await message.answer("📍 Где регистрироваться? (Напр: ЛС @user или Комменты):")
+@dp.message(ContestForm.input_vote_reg_data)
+async def process_vote_reg_data(message: types.Message, state: FSMContext):
+    # Сохраняем текст или ID медиа (если прислали фото)
+    reg_content = message.text or message.caption or "[Медиа-файл]"
+    await state.update_data(vote_reg_data=reg_content)
+    
+    # Если прислали фото/видео - можно сохранить storage_id, но пока упростим до текста
+    
+    builder = InlineKeyboardBuilder()
+    builder.row(types.InlineKeyboardButton(text="💬 Комментарии", callback_data="vplace_comm"))
+    builder.row(types.InlineKeyboardButton(text="👤 ЛС Организатора", callback_data="vplace_ls"))
+    
+    await state.set_state(ContestForm.vote_choose_place)
+    await message.answer("📍 <b>Шаг 5: Куда писать?</b>\nГде исполнитель должен оставить заявку?", 
+                         reply_markup=builder.as_markup(), parse_mode="HTML")
 
-@dp.message(ContestForm.input_vote_place)
-async def vote_place(message: types.Message, state: FSMContext):
-    await state.update_data(vote_reg_place=message.text)
+# --- ШАГ 5 (ГОЛОСОВАНИЕ): МЕСТО РЕГИСТРАЦИИ ---
+@dp.callback_query(ContestForm.vote_choose_place)
+async def process_vote_place(callback: types.CallbackQuery, state: FSMContext):
+    place = callback.data.replace("vplace_", "")
+    
+    if place == "ls":
+        await state.set_state(ContestForm.input_vote_org_username)
+        await callback.message.edit_text("⌨️ Введите <b>@username</b> организатора:")
+    else:
+        await state.update_data(vote_reg_place="Комментарии под постом")
+        await ask_intensity(callback.message, state)
+    await callback.answer()
+
+@dp.message(ContestForm.input_vote_org_username)
+async def process_org_username(message: types.Message, state: FSMContext):
+    await state.update_data(vote_reg_place=f"ЛС {message.text}")
     await ask_intensity(message, state)
+
+
 
 # --- ШАГ 3 (АФК): УСЛОВИЯ ---
 @dp.callback_query(ContestForm.filling_conditions)
@@ -310,17 +374,18 @@ async def save_passport(callback: types.CallbackQuery, state: FSMContext):
             )
         # -------------------------
 
-        # 3. Собираем условия в JSON (это у тебя уже было)
+        # 3. Собираем условия в JSON
         conditions_data = {
             "selected": data.get("selected_conds", []),
             "sub_links": data.get("sub_links", ""),
             "repost_count": data.get("repost_count", "0"),
             "vote_details": {
-                "executor": data.get("vote_executor"),
-                "reg_data": data.get("vote_reg_data"),
-                "reg_place": data.get("vote_reg_place")
+                "executor": data.get("vote_executor"),     # КТО (ID воркера)
+                "reg_data": data.get("vote_reg_data"),     # ДАННЫЕ (Ник/Текст)
+                "reg_place": data.get("vote_reg_place")    # КУДА (Место)
             } if data['contest_type'] == 'vote' else {}
         }
+
 
         # 4. Создаем запись паспорта
         new_passport = ContestPassport(
@@ -1014,74 +1079,125 @@ async def process_inviting(callback: types.CallbackQuery, state: FSMContext):
     )
     await state.clear()
 
+
+
+# --- 1. СТАРТ: УЗНАЕМ КТО ИСПОЛНИТЕЛЬ ИЗ ПАСПОРТА ---
 @dp.callback_query(F.data.startswith("stars_"))
 async def start_stars_report(callback: types.CallbackQuery, state: FSMContext):
+    # Разбираем ID паспорта из кнопки (stars_ID)
     passport_id = int(callback.data.split("_")[1])
-    await state.update_data(star_passport_id=passport_id)
-    await state.set_state(ContestForm.star_target)
-    await callback.message.answer("⭐ <b>Рапорт на Звезды</b>\nВведите @username организатора или ссылку на пост для оплаты:")
+    
+    async with async_session() as session:
+        # Достаем данные паспорта, чтобы найти Лид-исполнителя (executor)
+        res = await session.execute(select(ContestPassport).where(ContestPassport.id == passport_id))
+        passport = res.scalar_one_or_none()
+        
+        if not passport:
+            await callback.answer("❌ Паспорт не найден в базе.", show_alert=True)
+            return
 
+        # Ищем в JSON-поле conditions данные об исполнителе
+        executor = passport.conditions.get("vote_details", {}).get("executor")
+        
+        if not executor:
+            await callback.answer("❌ В паспорте этого конкурса не указан исполнитель-участник!", show_alert=True)
+            return
+
+    # Сохраняем ID паспорта и ID исполнителя в память бота
+    await state.update_data(star_passport_id=passport_id, star_executor=executor)
+    
+    await state.set_state(ContestForm.star_target)
+    await callback.message.answer(
+        f"⭐ <b>Рапорт на Звезды</b>\n"
+        f"👤 Платит исполнитель: <code>{executor}</code>\n\n"
+        f"Введите <b>@username</b> организатора, кому шлем звезды:", 
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+# --- 2. ВЫБОР ТИПА ПОДАРКА (КНОПКАМИ) ---
 @dp.message(ContestForm.star_target)
 async def star_target_proc(message: types.Message, state: FSMContext):
     await state.update_data(s_target=message.text)
+    
     builder = InlineKeyboardBuilder()
-    builder.row(types.InlineKeyboardButton(text="🎁 Подарок", callback_data="smeth_gift"))
-    builder.row(types.InlineKeyboardButton(text="💬 Платное сообщение", callback_data="smeth_paid"))
-    await state.set_state(ContestForm.star_method)
-    await message.answer("Выберите способ отправки:", reply_markup=builder.as_markup())
+    # Список подарков для выбора
+    gifts = ["🧸 Медведь", "🌹 Роза", "💐 Букет", "🏆 Кубок"]
+    for gift in gifts:
+        builder.row(types.InlineKeyboardButton(text=gift, callback_data=f"sgift_{gift}"))
+    
+    await state.set_state(ContestForm.star_gift_type)
+    await message.answer("🎁 <b>Выберите, какой подарок отправить:</b>", reply_markup=builder.as_markup(), parse_mode="HTML")
 
-@dp.callback_query(ContestForm.star_method)
-async def star_meth_proc(callback: types.CallbackQuery, state: FSMContext):
-    await state.update_data(s_method=callback.data.replace("smeth_", ""))
-    await state.set_state(ContestForm.star_amount)
-    await callback.message.edit_text("💰 Введите количество звезд (число):")
+# --- 3. ВЫБОР ПОДАРКА И АВТО-ПЕРЕХОД К ФИНАЛУ ---
+@dp.callback_query(ContestForm.star_gift_type)
+async def star_gift_proc(callback: types.CallbackQuery, state: FSMContext):
+    gift_name = callback.data.replace("sgift_", "")
+    # Сохраняем только тип подарка, сумму ставим 0 (она не будет видна)
+    await state.update_data(s_gift=gift_name, s_amount=0) 
+    
+    # Сразу вызываем показ финальной карточки
+    await show_star_summary(callback.message, state)
+    await callback.answer()
 
-@dp.message(ContestForm.star_amount)
-async def star_amount_proc(message: types.Message, state: FSMContext):
-    if not message.text.isdigit():
-        await message.answer("Введите число!")
-        return
-    await state.update_data(s_amount=int(message.text))
+async def show_star_summary(message: types.Message, state: FSMContext):
     data = await state.get_data()
     
     summary = (
-        f"⭐ <b>ПРОВЕРКА РАПОРТА (ЗВЕЗДЫ)</b>\n"
-        f"Кому: {data['s_target']}\n"
-        f"Метод: {data['s_method']}\n"
-        f"Кол-во: {data['s_amount']} звезд\n\n"
-        "Отправить Старшему на подтверждение?"
+        f"🚨 <b>РАПОРТ НА ЗВЕЗДЫ (ПРОВЕРКА)</b>\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"👤 <b>Отправитель:</b> <code>{data['star_executor']}</code>\n"
+        f"🎯 <b>Получатель:</b> <code>{data['s_target']}</code>\n"
+        f"🎁 <b>Подарок:</b> {data['s_gift']}\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"Отправить Старшему оператору на одобрение?"
     )
+    
     builder = InlineKeyboardBuilder()
-    builder.row(types.InlineKeyboardButton(text="✅ Отправить", callback_data="star_confirm"))
+    builder.row(
+        types.InlineKeyboardButton(text="✅ Отправить", callback_data="star_final_confirm"),
+        types.InlineKeyboardButton(text="❌ Отмена", callback_data="star_final_cancel")
+    )
+    
     await state.set_state(ContestForm.star_confirm)
-    await message.answer(summary, reply_markup=builder.as_markup(), parse_mode="HTML")
+    # Редактируем сообщение, чтобы убрать кнопки выбора подарков
+    await message.edit_text(summary, reply_markup=builder.as_markup(), parse_mode="HTML")
 
-@dp.callback_query(ContestForm.star_confirm, F.data == "star_confirm")
-async def save_star_report(callback: types.CallbackQuery, state: FSMContext):
+
+# --- 5. ФИНАЛЬНОЕ СОХРАНЕНИЕ В БАЗУ ---
+@dp.callback_query(ContestForm.star_confirm, F.data == "star_final_confirm")
+async def save_star_report_final(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     
     async with async_session() as session:
-        # Получаем данные из паспорта, чтобы найти исполнителя-лида
-        res = await session.execute(select(ContestPassport).where(ContestPassport.id == data['star_passport_id']))
-        passport = res.scalar_one()
-        
-        # Извлекаем ID исполнителя из JSON-данных паспорта
-        executor_val = passport.conditions.get("vote_details", {}).get("executor", "0")
-        
-        new_star_rep = StarReport(
+        # Пытаемся превратить executor в ID (число)
+        raw_executor = data['star_executor']
+        try:
+            executor_id = int(raw_executor)
+        except:
+            executor_id = 0 # Если там никнейм, запишем 0 (нужно будет искать по нику)
+
+        new_report = StarReport(
             passport_id=data['star_passport_id'],
             target_user=data['s_target'],
-            method=data['s_method'],
+            method=data['s_gift'], # Сохраняем название подарка (Медведь и т.д.)
             star_count=data['s_amount'],
-            executor_id=int(executor_val) if str(executor_val).isdigit() else 0,
+            executor_id=executor_id,
             status="pending"
         )
-        session.add(new_star_rep)
+        session.add(new_report)
         await session.commit()
     
     await state.clear()
-    await callback.message.edit_text("✅ <b>Рапорт на Звезды отправлен!</b>\nСтарший оператор проверит заявку.", parse_mode="HTML")
+    await callback.message.edit_text("✅ <b>Рапорт отправлен!</b>\nОжидайте одобрения Старшим оператором.")
     await callback.answer()
+
+@dp.callback_query(ContestForm.star_confirm, F.data == "star_final_cancel")
+async def cancel_star_report(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text("❌ Создание рапорта отменено.")
+    await callback.answer()
+
 
 @dp.callback_query(F.data.startswith("share_"))
 async def start_sharing_contest(callback: types.CallbackQuery, state: FSMContext):
