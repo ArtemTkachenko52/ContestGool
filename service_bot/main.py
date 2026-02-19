@@ -250,11 +250,19 @@ async def process_vote_executor(callback: types.CallbackQuery, state: FSMContext
 
 @dp.message(ContestForm.input_vote_reg_data)
 async def process_vote_reg_data(message: types.Message, state: FSMContext):
-    # Сохраняем текст или ID медиа (если прислали фото)
-    reg_content = message.text or message.caption or "[Медиа-файл]"
-    await state.update_data(vote_reg_data=reg_content)
+    reg_text = message.text or message.caption or ""
+    storage_id = None
     
-    # Если прислали фото/видео - можно сохранить storage_id, но пока упростим до текста
+    # Если прислали фото/видео/документ - пересылаем в хранилище
+    if message.photo or message.document or message.video:
+        # Пересылаем в MONITOR_STORAGE (как в CRM)
+        fwd = await message.forward(MONITOR_STORAGE)
+        storage_id = fwd.message_id
+        if not reg_text:
+            reg_text = "[Медиа-заявка]"
+
+    # Сохраняем и текст, и ID медиа
+    await state.update_data(vote_reg_data=reg_text, vote_reg_media_id=storage_id)
     
     builder = InlineKeyboardBuilder()
     builder.row(types.InlineKeyboardButton(text="💬 Комментарии", callback_data="vplace_comm"))
@@ -263,6 +271,7 @@ async def process_vote_reg_data(message: types.Message, state: FSMContext):
     await state.set_state(ContestForm.vote_choose_place)
     await message.answer("📍 <b>Шаг 5: Куда писать?</b>\nГде исполнитель должен оставить заявку?", 
                          reply_markup=builder.as_markup(), parse_mode="HTML")
+
 
 # --- ШАГ 5 (ГОЛОСОВАНИЕ): МЕСТО РЕГИСТРАЦИИ ---
 @dp.callback_query(ContestForm.vote_choose_place)
@@ -385,7 +394,8 @@ async def save_passport(callback: types.CallbackQuery, state: FSMContext):
             "source_msg_id": post_raw.source_msg_id,
             "vote_details": {
                 "executor": data.get("vote_executor"),     # ID лид-аккаунта
-                "reg_data": data.get("vote_reg_data"),     # Данные ника/текста
+                "reg_data": data.get("vote_reg_data"),  # Данные ника/текста
+                "reg_media_id": data.get("vote_reg_media_id"),
                 "reg_place": data.get("vote_reg_place")    # Куда писать (ЛС/Комменты)
             } if data['contest_type'] == 'vote' else {}
         }
@@ -489,14 +499,16 @@ async def show_contests_types(message: types.Message):
     builder.row(types.InlineKeyboardButton(text="🗳 Голосование", callback_data="cur_vote"))
     await message.answer("Выберите тип активных конкурсов:", reply_markup=builder.as_markup())
 
+# --- ИСПРАВЛЕННЫЙ СПИСОК КАНАЛОВ (Текущие конкурсы) ---
+
 @dp.callback_query(F.data.startswith("cur_"))
 async def list_active_channels(callback: types.CallbackQuery, state: FSMContext):
     c_type = callback.data.replace("cur_", "")
     op = await get_operator(callback.from_user.id)
     
     async with async_session() as session:
-        # Сложный запрос: Берем каналы, считаем посты > last_read_post_id
-        # Используем подзапрос для подсчета, чтобы не терять каналы с 0 новых постов
+        # ИЗМЕНЕНО: Теперь ищем паспорта со статусом 'active' И 'finished'
+        # Пока оператор вручную не нажмет кнопку "Остановить", канал будет в списке
         query = (
             select(
                 TargetChannel,
@@ -507,97 +519,107 @@ async def list_active_channels(callback: types.CallbackQuery, state: FSMContext)
             .where(
                 ContestPassport.group_tag == op.group_tag,
                 ContestPassport.type == c_type,
-                ContestPassport.status == "active"
+                # ПРАВКА ТУТ: Показываем всё, что не удалено окончательно
+                ContestPassport.status.in_(["active", "finished"]) 
             )
             .group_by(TargetChannel.id)
-            .order_by(text("new_count DESC")) # Сортировка: сначала те, где больше новых
+            .order_by(text("new_count DESC"))
         )
         
         result = await session.execute(query)
         channels_data = result.all()
 
     if not channels_data:
-        await callback.message.edit_text(f"📭 У группы {op.group_tag} нет активных конкурсов типа {c_type}.")
+        await callback.message.edit_text(f"📭 У группы {op.group_tag} сейчас нет активных или отслеживаемых конкурсов ({c_type}).")
         return
 
     builder = InlineKeyboardBuilder()
     for ch, new_count in channels_data:
-        # Кнопка всегда видна, даже если (+0)
         status_tag = f" (+{new_count})" if new_count > 0 else ""
         btn_text = f"{ch.username or ch.tg_id}{status_tag}"
         builder.row(types.InlineKeyboardButton(text=btn_text, callback_data=f"viewch_{ch.tg_id}_{c_type}"))
     
-    await callback.message.edit_text(f"📡 Активные каналы ({c_type}):", reply_markup=builder.as_markup())
+    await callback.message.edit_text(f"📡 Мониторинг каналов ({c_type}):", reply_markup=builder.as_markup())
+
+# --- ИСПРАВЛЕННЫЙ ПРОСМОТР ДЕТАЛЕЙ (viewch_) ---
+
 @dp.callback_query(F.data.startswith("viewch_"))
 async def view_contest_details(callback: types.CallbackQuery, state: FSMContext):
-    # 1. Разбор данных (viewch_ID_TYPE)
-    _, tg_id_str, c_type = callback.data.split("_")
-    tg_id = int(tg_id_str)
+    # 1. ПРАВИЛЬНЫЙ РАЗБОР: viewch_ID_TYPE
+    parts = callback.data.split("_")
+    
+    # ПРОВЕРКА: Если в списке меньше 3 элементов, значит данные битые
+    if len(parts) < 3:
+        await callback.answer("❌ Ошибка структуры данных.")
+        return
+        
+    try:
+        # Индекс 0 - 'viewch', Индекс 1 - ID канала, Индекс 2 - тип (vote/afk)
+        tg_id = int(parts[1]) 
+        c_type = parts[2]
+    except (ValueError, IndexError):
+        await callback.answer("❌ Ошибка извлечения ID канала.")
+        return
+
     op = await get_operator(callback.from_user.id)
-    
-    # Константы хранилищ
-    TARGET_GROUP = -1003723379200   # Группа для находок
-    MONITOR_STORAGE = -1003753624654 # Группа для отслеживаемых (ВСЁ подряд)
-    
+    if not op: return
+
     async with async_session() as session:
         # Получаем объект канала
         ch_query = select(TargetChannel).where(TargetChannel.tg_id == tg_id)
         channel = (await session.execute(ch_query)).scalar_one_or_none()
         
         if not channel:
-            await callback.answer("❌ Канал не найден.")
+            await callback.answer("❌ Канал не найден в базе.")
             return
 
-        # 2. Ищем новые посты для этого канала
-                # Ищем новые посты, но если пост продублирован (monitoring + keyword), 
-        # берем только версию monitoring для красивого отображения в ленте
-               # Теперь для ленты берем ТОЛЬКО мониторинговые посты этого канала
-                # Находим посты для ленты
+        # 2. Пересылка новых постов (Лента)
         posts_query = select(PotentialPost).where(
             PotentialPost.source_tg_id == tg_id,
             PotentialPost.source_msg_id > channel.last_read_post_id,
-            PotentialPost.post_type == "monitoring" # БЕРЕМ ТОЛЬКО ЗЕРКАЛО
+            PotentialPost.post_type == "monitoring"
         ).order_by(PotentialPost.source_msg_id.asc())
 
-
-        # Сортировка по типу заставит 'monitoring' быть приоритетнее при обработке ID
-
-        
         new_posts = (await session.execute(posts_query)).scalars().all()
 
-        # 3. Пересылка и пометка мониторинговых постов
         if new_posts:
-            await callback.message.answer(f"⬇️ <b>Новые сообщения в канале ({len(new_posts)} шт):</b>", parse_mode="HTML")
+            await callback.message.answer(f"⬇️ <b>Новые посты ({len(new_posts)} шт):</b>", parse_mode="HTML")
             max_id = channel.last_read_post_id
-            
             for p in new_posts:
                 try:
-                    source_chat = MONITOR_STORAGE if p.post_type == "monitoring" else TARGET_GROUP
-                    await bot.forward_message(callback.message.chat.id, source_chat, p.storage_msg_id)
-                    if p.source_msg_id > max_id:
+                    # Используем глобальную переменную MONITOR_STORAGE из начала файла
+                    await bot.forward_message(callback.message.chat.id, MONITOR_STORAGE, p.storage_msg_id)
+                    if p.source_msg_id > max_id: 
                         max_id = p.source_msg_id
                 except Exception as e:
-                    print(f"❌ Ошибка пересылки: {e}")
-                    if p.source_msg_id > max_id:
-                        max_id = p.source_msg_id
-
+                    print(f"Ошибка пересылки поста {p.id}: {e}")
+            
+            # Обновляем курсор прочитанного
             channel.last_read_post_id = max_id
             await session.commit()
-
         else:
-            await callback.message.answer("🧐 Новых постов пока нет.")
+            await callback.answer("🧐 Новых постов в ленте нет.")
 
-        # 4. Получаем данные всех активных паспортов для этого канала
+        # 3. ПОИСК ПАСПОРТОВ (фильтруем по типу и статусу)
+        # Важно: берем и active, и finished (чтобы видеть итоги)
         p_query = select(ContestPassport).join(PotentialPost, ContestPassport.post_id == PotentialPost.id).\
             where(PotentialPost.source_tg_id == tg_id, 
                   ContestPassport.type == c_type,
-                  ContestPassport.status == "active")
+                  ContestPassport.status.in_(["active", "finished"]))
+        
         passports = (await session.execute(p_query)).scalars().all()
 
-    # 5. Выводим резюме и кнопки управления
+    # 4. Вывод карточек управления
+    if not passports:
+        await callback.message.answer("⚠️ Все активные задачи в этом канале завершены.")
+        return
+
     for passp in passports:
+        status_icon = "🟢 В работе" if passp.status == "active" else "🏁 Завершен (Ожидание)"
         summary = (
             f"📝 <b>Паспорт конкурса #{passp.id}</b>\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"📊 Статус: <b>{status_icon}</b>\n"
             f"🔹 Тип: <code>{passp.type}</code>\n"
             f"🔹 Приз: <code>{passp.prize_type}</code>\n"
             f"🔹 Интенсивность: <code>{passp.intensity_level} ур.</code>"
@@ -606,14 +628,14 @@ async def view_contest_details(callback: types.CallbackQuery, state: FSMContext)
         builder = InlineKeyboardBuilder()
         if c_type == "afk":
             builder.row(types.InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"edit_{passp.id}"))
-            builder.add(types.InlineKeyboardButton(text="🛑 Остановить", callback_data=f"stop_{passp.id}"))
             builder.row(types.InlineKeyboardButton(text="👥 Добавить группы", callback_data=f"addgr_{passp.id}"))
-            builder.row(types.InlineKeyboardButton(text="📢 Отправить другим группам", callback_data=f"share_{passp.id}"))
+            builder.row(types.InlineKeyboardButton(text="📢 Разослать другим", callback_data=f"share_{passp.id}"))
         else: # vote
-            builder.row(types.InlineKeyboardButton(text="🗳 Голосование (Рапорт)", callback_data=f"v_rep_{passp.id}"))
+            builder.row(types.InlineKeyboardButton(text="🗳 Рапорт Голосования", callback_data=f"v_rep_{passp.id}"))
             builder.row(types.InlineKeyboardButton(text="⭐ Отправить звезды", callback_data=f"stars_{passp.id}"))
-            builder.add(types.InlineKeyboardButton(text="🛑 Остановить", callback_data=f"stop_{passp.id}"))
             builder.row(types.InlineKeyboardButton(text="👥 Добавить группы", callback_data=f"addgr_{passp.id}"))
+            
+        builder.row(types.InlineKeyboardButton(text="🛑 Остановить мониторинг", callback_data=f"stop_{passp.id}"))
         
         await callback.message.answer(summary, reply_markup=builder.as_markup(), parse_mode="HTML")
     
@@ -1616,6 +1638,7 @@ async def process_ls_reaction(callback: types.CallbackQuery):
         await session.commit()
     
     await callback.answer(f"Задача на реакцию {emoji} создана!")
+
 
 # --- ЗАПУСК ---
 

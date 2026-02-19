@@ -5,19 +5,21 @@ from telethon.sessions import StringSession
 from telethon.tl.functions.messages import SendReactionRequest
 from telethon.tl.types import MessageEntityMentionName, MessageEntityMention, ReactionEmoji
 from sqlalchemy import select, func, text, update  # <-- ДОБАВИЛИ update
-from datetime import datetime
+from datetime import datetime, timedelta
 from telethon import functions, types
 import re
 import ddddocr
 import io
 from PIL import Image, ImageOps, ImageEnhance
+import os
+from playwright.async_api import async_playwright
 
 # Импорты из обновленной базы
 from database.config import async_session
 from database.models import (
     Keyword, PotentialPost, WorkerAccount, 
     TargetChannel, ReaderAccount, ContestPassport, 
-    LuckEvent, OutgoingMessage, StarReport  # <-- ДОБАВИЛИ StarReport
+    LuckEvent, OutgoingMessage, StarReport, GroupChannelRelation  # <-- ДОБАВИЛИ StarReport
 )
 
 
@@ -637,83 +639,6 @@ async def worker_luck_raid_loop():
                 except Exception as e:
                     print(f"❌ [ДЕСАНТ] Ошибка: {e}")
 
-async def star_execution_loop():
-    """Фоновая задача: отправка подарков (Медведь, Роза и т.д.)"""
-    print(f"⭐ [ВОРКЕР {GROUP_TAG}] Модуль подарков запущен.")
-    
-    # Словарь соответствия: Название в боте -> Технический slug подарка в TG
-    # Внимание: Slug-и могут меняться Telegram-ом. 
-    GIFT_SLUGS = {
-        "🧸 Медведь": "bear",
-        "🌹 Роза": "rose",
-        "💐 Букет": "bouquet",
-        "🏆 Кубок": "cup"
-    }
-
-    while True:
-        await asyncio.sleep(30)
-        try:
-            async with async_session() as session:
-                me = await client.get_me()
-                
-                # Ищем одобренные рапорты
-                stmt = text("""
-                    SELECT id, target_user, method, star_count 
-                    FROM management.star_reports 
-                    WHERE status = 'approved' AND executor_id = :my_id
-                """)
-                res = await session.execute(stmt, {"my_id": me.id})
-                reports = res.all()
-
-                for r_id, target, gift_name, count in reports:
-                    print(f"💰 [ЗВЕЗДЫ] Начинаю процесс отправки '{gift_name}' для {target}...")
-                    
-                    try:
-                        # 1. Получаем ID получателя
-                        peer = await client.get_input_entity(target)
-                        
-                        from telethon import functions, types
-                        
-                        # 2. Получаем список подарков через универсальный запрос
-                        # Если GetStarsGiftsRequest не виден как атрибут, вызываем его через класс
-                        try:
-                            # Попытка вызвать через общий конструктор
-                            all_gifts = await client(functions.payments.GetStarsGiftsRequest())
-                        except AttributeError:
-                            # Если Telethon "не видит" имя, используем альтернативный путь
-                            from telethon.tl.functions.payments import GetStarsGiftsRequest as GSG
-                            all_gifts = await client(GSG())
-
-                        # Ищем подарок
-                        target_gift = all_gifts.gifts[0] # Берем первый (самый дешевый) по умолчанию
-                        for g in all_gifts.gifts:
-                            if "bear" in g.slug.lower() or "bear" in gift_name.lower():
-                                target_gift = g
-                                break
-
-                        # 3. ОТПРАВЛЯЕМ ФОРМУ ОПЛАТЫ (ЗВЕЗДНЫЙ ПОДАРК)
-                        await client(functions.payments.SendStarsFormRequest(
-                            purpose=types.InputStorePaymentStarsGift(
-                                user_id=peer,
-                                gift=target_gift
-                            )
-                        ))
-
-                        print(f"✅ [ЗВЕЗДЫ] Подарок {gift_name} успешно отправлен через StarsForm!")
-                        
-                        await session.execute(
-                            update(StarReport).where(StarReport.id == r_id).values(status="completed")
-                        )
-                        await session.commit()
-                        
-                    except Exception as e:
-                        print(f"❌ [ЗВЕЗДЫ] Ошибка: {e}")
-                        await session.execute(update(StarReport).where(StarReport.id == r_id).values(status="failed"))
-                        await session.commit()
-
-        except Exception as e:
-            print(f"⚠️ [ЗВЕЗДЫ] Ошибка цикла: {e}")
-
 # --- ЛОГИКА ВЫПОЛНЕНИЯ ЗАДАЧ ИЗ ПАСПОРТА (Пункт 1) ---
 
 async def passport_execution_loop():
@@ -749,14 +674,12 @@ async def passport_execution_loop():
 
 async def run_passport_strategy(passport):
     """
-    Рассчитывает 'эстафету': кто за кем и через сколько минут вступает в дело.
+    Рассчитывает 'эстафету' и ЗАВЕРШАЕТ паспорт после выполнения.
     """
-    # Карта интенсивностей из ТЗ (время в секундах между вступлением новых аккаунтов)
     intensity_map = {1: 1200, 2: 600, 3: 300, 4: 60}
     slot_duration = intensity_map.get(passport.intensity_level, 600)
 
     async with async_session() as session:
-        # Берем список всех живых воркеров нашей группы
         res = await session.execute(
             select(WorkerAccount).where(
                 WorkerAccount.group_tag == GROUP_TAG,
@@ -765,21 +688,43 @@ async def run_passport_strategy(passport):
         )
         workers = res.scalars().all()
 
-    if not workers: return
+    if not workers: 
+        # Если воркеров нет, выкидываем паспорт из кэша, чтобы попробовать позже
+        ACTIVE_TASKS_CACHE.discard(passport.id)
+        return
 
-    # Если это ГОЛОСОВАНИЕ - нам нужен только 1 лидер, указанный в паспорте
+    # Список задач (фьючерсов) для отслеживания
+    tasks = []
+
     if passport.type == "vote":
         target_id = passport.conditions.get("vote_details", {}).get("executor")
         lead = next((w for w in workers if str(w.tg_id) == str(target_id)), None)
         if lead:
-            await execute_single_worker_tasks(lead, passport, is_lead=True)
-        return
+            # Создаем задачу и добавляем в список
+            tasks.append(asyncio.create_task(execute_single_worker_tasks(lead, passport, is_lead=True)))
+    else:
+        # Для АФК создаем задачи для всех воркеров
+        for i, worker in enumerate(workers):
+            wait_for_slot = i * slot_duration
+            tasks.append(asyncio.create_task(delayed_worker_execution(worker, passport, wait_for_slot, slot_duration)))
 
-    # Если это АФК (массовое участие) - запускаем эстафету для всех по очереди
-    for i, worker in enumerate(workers):
-        # Очередь: первый сразу (0*600), второй через 10 мин (1*600) и т.д.
-        wait_for_slot = i * slot_duration
-        asyncio.create_task(delayed_worker_execution(worker, passport, wait_for_slot, slot_duration))
+    # --- НОВАЯ ЛОГИКА ЗАВЕРШЕНИЯ ---
+    # Ждем, пока ВСЕ запущенные задачи (воркеры) в этой эстафете закончат работу
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Когда все закончили — меняем статус в БД на finished
+        async with async_session() as session_fin:
+            await session_fin.execute(
+                update(ContestPassport)
+                .where(ContestPassport.id == passport.id)
+                .values(status="finished")
+            )
+            await session_fin.commit()
+        
+        print(f"🏁 [ПАСПОРТ] Все задачи по паспорту #{passport.id} ВЫПОЛНЕНЫ. Статус: finished.")
+        # Удаляем из локального кэша, чтобы освободить память
+        ACTIVE_TASKS_CACHE.discard(passport.id)
 
 async def delayed_worker_execution(worker, passport, initial_delay, slot_limit):
     """Ждет свою очередь в эстафете и запускает выполнение"""
@@ -867,18 +812,28 @@ async def execute_single_worker_tasks(worker, passport, is_lead=False):
             except Exception as e:
                 print(f"❌ [КНОПКА] Ошибка: {e}")
 
-        # Если ГОЛОСОВАНИЕ (лид-регистрация)
+                # Если ГОЛОСОВАНИЕ (лид-регистрация)
         if is_lead:
             details = conds.get("vote_details", {})
             place = details.get("reg_place", "")
             content = details.get("reg_data", "")
+            media_id = details.get("reg_media_id") # Получаем ID из хранилища
             
             target = place.replace("ЛС ", "").replace("@", "")
+            
+            # Подготовка объекта для отправки (текст или медиа из хранилища)
+            msg_to_send = content
+            if media_id:
+                # Берем медиа из мониторинга
+                storage_msg = await w_client.get_messages(MONITOR_STORAGE, ids=media_id)
+                msg_to_send = storage_msg # Весь объект сообщения (фото + текст)
+
             if "Комментарии" in place:
-                await w_client.send_message(target_chat, content, comment_to=target_msg)
+                await w_client.send_message(target_chat, msg_to_send, comment_to=target_msg)
             else:
-                await w_client.send_message(target, content)
-            print(f"✅ [ГОЛОС] Лид {worker.tg_id} подал заявку.")
+                await w_client.send_message(target, msg_to_send)
+            
+            print(f"✅ [ГОЛОС] Лид {worker.tg_id} отправил заявку (с медиа: {bool(media_id)}) в {place}")
 
     except Exception as e:
         print(f"❌ [ИСПОЛНИТЕЛЬ {worker.tg_id}] Критическая ошибка: {e}")
@@ -982,6 +937,119 @@ async def invite_handler_loop():
                         print(f"❌ [ИНВАЙТ] Ошибка вступления: {e}")
             
             await session.commit()
+# --- ЕДИНЫЙ И ИСПРАВЛЕННЫЙ МОДУЛЬ ПОДАРКОВ (Вставлять один раз!) ---
+
+# Кэш, чтобы не запускать один и тот же подарок дважды в параллель
+# --- ЕДИНЫЙ МОДУЛЬ ПОДАРКОВ (БЕЗ ДУБЛИКАТОВ) ---
+
+# Кэш для защиты от повторных запусков одного и того же рапорта
+ACTIVE_GIFTS_CACHE = set()
+
+async def send_gift_via_web(worker_phone, target_username, gift_type):
+    """
+    Отправка подарка через Playwright. 
+    Автоматически убирает '+' из номера для поиска папки сессии.
+    """
+    # Очищаем номер от плюса, чтобы путь совпал с папкой в Docker (session_9180...)
+    clean_phone = str(worker_phone).replace("+", "")
+    user_data_dir = f"/var/lib/browser_sessions/session_{clean_phone}"
+    
+    print(f"📂 [WEB] Использую сессию: {user_data_dir}")
+
+    async with async_playwright() as p:
+        context = None
+        try:
+            context = await p.chromium.launch_persistent_context(
+                user_data_dir,
+                headless=True,
+                slow_mo=random.randint(800, 1300),
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+            )
+            page = await context.new_page()
+            
+            # Заходим через версию /k/, она стабильнее подхватывает старые сессии
+            await page.goto("https://web.telegram.org", wait_until="networkidle", timeout=60000)
+            
+            # Ждем интерфейс (поиск)
+            search_box = page.get_by_role("textbox", name="Search")
+            await search_box.wait_for(state="visible", timeout=30000) 
+            
+            # Имитация ввода
+            await search_box.click()
+            for char in target_username:
+                await page.keyboard.type(char, delay=random.randint(100, 200))
+            
+            await asyncio.sleep(4)
+            await page.locator(".ListItem-button").first.click()
+            await asyncio.sleep(2)
+            
+            # Переход в профиль
+            await page.locator(".ChatInfo").first.click()
+            await asyncio.sleep(2)
+            
+            # Открытие меню подарков
+            await page.get_by_role("button", name="More actions").click()
+            await page.get_by_role("menuitem", name="Send a Gift").click()
+            await asyncio.sleep(5)
+            
+            # Очистка названия подарка от эмодзи
+            gift_name = gift_type.replace("🧸 ", "").replace("🌹 ", "").replace("💐 ", "").replace("🏆 ", "")
+            await page.get_by_text(gift_name, exact=False).first.click()
+            await asyncio.sleep(3)
+            
+            # Нажатие кнопки оплаты
+            send_btn = page.get_by_role("button", name=re.compile(r"Send a Gift for \d+"))
+            if await send_btn.is_visible():
+                await send_btn.click()
+                print(f"✅ [WEB] УСПЕХ! Подарок {gift_type} отправлен.")
+                await asyncio.sleep(5) 
+                return True
+            
+            return False
+        except Exception as e:
+            print(f"❌ [WEB-ERR] {worker_phone}: {e}")
+            if 'page' in locals():
+                await page.screenshot(path=f"/app/error_{clean_phone}.png")
+            return False
+        finally:
+            if context:
+                await context.close()
+
+async def star_execution_loop():
+    """Бесконечный цикл проверки рапортов на подарки"""
+    print(f"⭐ [ВОРКЕР {GROUP_TAG}] Модуль подарков (WEB) активен.")
+    while True:
+        await asyncio.sleep(60)
+        try:
+            async with async_session() as session:
+                me = await client.get_me()
+                query = select(StarReport).where(
+                    StarReport.status == 'approved',
+                    StarReport.executor_id == me.id
+                )
+                reports = (await session.execute(query)).scalars().all()
+
+                for report in reports:
+                    if report.id in ACTIVE_GIFTS_CACHE: continue
+                    
+                    ACTIVE_GIFTS_CACHE.add(report.id)
+                    print(f"💰 [WEB-PROCESS] Обработка рапорта #{report.id}...")
+                    
+                    success = await send_gift_via_web(str(me.phone), report.target_user, report.method)
+                    
+                    # Финальное обновление статуса
+                    async with async_session() as session_upd:
+                        new_status = "completed" if success else "error"
+                        await session_upd.execute(
+                            update(StarReport).where(StarReport.id == report.id).values(status=new_status)
+                        )
+                        await session_upd.commit()
+                    
+                    ACTIVE_GIFTS_CACHE.discard(report.id)
+        except Exception as e:
+            print(f"⚠️ [WEB-LOOP-ERR] {e}")
+
 
 # --- ЗАПУСК ---
 
@@ -1026,8 +1094,8 @@ async def main():
     asyncio.create_task(worker_luck_raid_loop())
     asyncio.create_task(worker_mention_task_loop())
     asyncio.create_task(vote_execution_loop())
-    asyncio.create_task(star_execution_loop())
     asyncio.create_task(passport_execution_loop()) 
+    asyncio.create_task(star_execution_loop())
 
     await client.run_until_disconnected()
 

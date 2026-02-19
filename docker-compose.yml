@@ -20,23 +20,41 @@ services:
     ports:
       - "6379:6379"
 
-  # ТВОЙ ВОРКЕР (Блок должен быть СДВИНУТ вправо, как и db/redis)
+  # ТВОЙ ВОРКЕР (Блок обновлен для браузера)
   worker_a1:
     build: 
       context: .
       dockerfile: ./function1/Dockerfile
     container_name: worker_a1
     restart: always
-    # УДАЛИ network_mode: "host"
-    # ДОБАВИ DNS для интернета:
     dns:
       - 8.8.8.8
       - 1.1.1.1
     depends_on:
       - db
+    volumes:
+      # --- ВОТ ЭТА СТРОКА: Прячем сессии браузера в скрытый том ---
+      - browser_data:/var/lib/browser_sessions 
     environment:
-      # ВЕРНИ 'db', чтобы воркер видел контейнер базы
       - DATABASE_URL=postgresql+asyncpg://admin:password123@db:5432/contest_monitor
+        # ТВОЙ БОТ (Интерфейс оператора)
+  service_bot:
+    build: 
+      context: .
+      dockerfile: ./function1/Dockerfile # Используем тот же докерфайл, там есть все либы
+    container_name: service_bot
+    restart: always
+    depends_on:
+      - db
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://admin:password123@db:5432/contest_monitor
+      - BOT_TOKEN=8410272638:AAEwO-OMhqMSj1GNKdsi5fnJwgPZCi6Qzco
+    # Команда запуска именно для бота:
+    command: python -u service_bot/main.py
 
+
+# --- СЕКЦИЯ ТОМОВ (В самом низу файла) ---
 volumes:
   postgres_data:
+  # --- ДОБАВЬ ЭТУ СТРОКУ ТУТ ---
+  browser_data: 
