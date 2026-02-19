@@ -31,6 +31,9 @@ KEYWORDS_DATA = {}
 MY_WORKERS = []
 CHANNELS_MAP = {}
 client = None 
+# Кэш для отслеживания запущенных паспортов, чтобы не запускать их дважды
+ACTIVE_TASKS_CACHE = set() 
+
 
 # --- ФУНКЦИИ БАЗЫ ДАННЫХ ---
 
@@ -711,6 +714,275 @@ async def star_execution_loop():
         except Exception as e:
             print(f"⚠️ [ЗВЕЗДЫ] Ошибка цикла: {e}")
 
+# --- ЛОГИКА ВЫПОЛНЕНИЯ ЗАДАЧ ИЗ ПАСПОРТА (Пункт 1) ---
+
+async def passport_execution_loop():
+    """
+    Улучшенный цикл выполнения задач. 
+    Запускает стратегию для паспорта только один раз.
+    """
+    print(f"⚙️ [ВОРКЕР {GROUP_TAG}] Двигатель задач запущен.")
+    
+    while True:
+        await asyncio.sleep(30) # Проверяем чуть чаще
+        try:
+            async with async_session() as session:
+                query = select(ContestPassport).where(
+                    ContestPassport.group_tag == GROUP_TAG,
+                    ContestPassport.status == "active"
+                )
+                active_passports = (await session.execute(query)).scalars().all()
+
+            for passport in active_passports:
+                # ПРОВЕРКА: Если этот паспорт уже запущен в работу — пропускаем
+                if passport.id in ACTIVE_TASKS_CACHE:
+                    continue
+                
+                print(f"🚀 [ЗАПУСК] Начинаю выполнение паспорта #{passport.id}")
+                ACTIVE_TASKS_CACHE.add(passport.id)
+                
+                # Запускаем выполнение
+                asyncio.create_task(run_passport_strategy(passport))
+                
+        except Exception as e:
+            print(f"❌ [LOOP] Ошибка в цикле паспортов: {e}")
+
+async def run_passport_strategy(passport):
+    """
+    Рассчитывает 'эстафету': кто за кем и через сколько минут вступает в дело.
+    """
+    # Карта интенсивностей из ТЗ (время в секундах между вступлением новых аккаунтов)
+    intensity_map = {1: 1200, 2: 600, 3: 300, 4: 60}
+    slot_duration = intensity_map.get(passport.intensity_level, 600)
+
+    async with async_session() as session:
+        # Берем список всех живых воркеров нашей группы
+        res = await session.execute(
+            select(WorkerAccount).where(
+                WorkerAccount.group_tag == GROUP_TAG,
+                WorkerAccount.is_alive == True
+            ).order_by(WorkerAccount.id)
+        )
+        workers = res.scalars().all()
+
+    if not workers: return
+
+    # Если это ГОЛОСОВАНИЕ - нам нужен только 1 лидер, указанный в паспорте
+    if passport.type == "vote":
+        target_id = passport.conditions.get("vote_details", {}).get("executor")
+        lead = next((w for w in workers if str(w.tg_id) == str(target_id)), None)
+        if lead:
+            await execute_single_worker_tasks(lead, passport, is_lead=True)
+        return
+
+    # Если это АФК (массовое участие) - запускаем эстафету для всех по очереди
+    for i, worker in enumerate(workers):
+        # Очередь: первый сразу (0*600), второй через 10 мин (1*600) и т.д.
+        wait_for_slot = i * slot_duration
+        asyncio.create_task(delayed_worker_execution(worker, passport, wait_for_slot, slot_duration))
+
+async def delayed_worker_execution(worker, passport, initial_delay, slot_limit):
+    """Ждет свою очередь в эстафете и запускает выполнение"""
+    await asyncio.sleep(initial_delay)
+    
+    # Внутри своего 10-минутного окна воркер тоже ждет рандомное время (мимикрия)
+    # Например, если окно 600 сек, он начнет в любую секунду от 5-й до 480-й.
+    intra_slot_delay = random.randint(5, int(slot_limit * 0.8))
+    await asyncio.sleep(intra_slot_delay)
+    
+    await execute_single_worker_tasks(worker, passport)
+
+# --- ОБНОВЛЕННАЯ ФУНКЦИЯ С БЛОКОМ КОММЕНТАРИЕВ ---
+
+async def execute_single_worker_tasks(worker, passport, is_lead=False):
+    conds = passport.conditions
+    actions = conds.get("selected", [])
+    
+    target_chat = conds.get("source_tg_id")
+    target_msg = conds.get("source_msg_id")
+
+    # Список фраз для обычных комментариев (мимикрия)
+    # Можно будет позже вынести в БД
+    COMMON_PHRASES = ["участвую", "+", "го", "хочу приз", "удачи всем", "🍀", "надеюсь на победу", "🔥", "инвест"]
+
+    w_client = TelegramClient(
+        StringSession(worker.session_string), 
+        worker.api_id, worker.api_hash,
+        device_model=worker.device_model,
+        system_version=worker.os_version,
+        app_version=worker.app_version
+    )
+    
+    try:
+        await w_client.connect()
+        random.shuffle(actions)
+
+        for action in actions:
+            await asyncio.sleep(random.randint(15, 45))
+
+            # 1. ПОДПИСКА
+            if action == "sub":
+                links = conds.get("sub_links", "").split()
+                for link in links:
+                    await join_channel_smart(w_client, link)
+
+            # 2. РЕАКЦИЯ
+            elif action == "reac" and target_chat and target_msg:
+                try:
+                    from telethon.tl.functions.messages import SendReactionRequest
+                    from telethon.tl.types import ReactionEmoji
+                    await w_client(SendReactionRequest(
+                        peer=target_chat,
+                        msg_id=target_msg,
+                        reaction=[ReactionEmoji(emoticon=random.choice(["👍", "❤️", "🔥", "🤩"]))]
+                    ))
+                    print(f"✅ [РЕАКЦИЯ] Воркер {worker.tg_id} поставил эмодзи.")
+                except: pass
+
+            # 3. РЕПОСТ
+            elif action == "repost" and target_chat and target_msg:
+                count = int(conds.get("repost_count", 1))
+                await perform_network_reposts(w_client, target_chat, target_msg, count)
+
+            # 4. КОММЕНТАРИЙ (ТО, ЧЕГО НЕ ХВАТАЛО)
+            elif action == "comm" and target_chat and target_msg:
+                try:
+                    # Отправляем рандомную фразу как комментарий к посту
+                    await w_client.send_message(
+                        target_chat, 
+                        random.choice(COMMON_PHRASES), 
+                        comment_to=target_msg
+                    )
+                    print(f"✅ [КОММЕНТ] Воркер {worker.tg_id} оставил комментарий.")
+                except Exception as e:
+                    print(f"❌ [КОММЕНТ] Ошибка воркера {worker.tg_id}: {e}")
+
+        # Если АФК - нажимаем кнопку участия
+        if passport.type == "afk" and target_chat and target_msg:
+            try:
+                msg_obj = await w_client.get_messages(target_chat, ids=target_msg)
+                if msg_obj and msg_obj.reply_markup:
+                    # Вызываем нашу функцию клика (убедись, что она определена выше в коде)
+                    await single_button_click(worker, target_chat, target_msg, msg_obj, 0)
+            except Exception as e:
+                print(f"❌ [КНОПКА] Ошибка: {e}")
+
+        # Если ГОЛОСОВАНИЕ (лид-регистрация)
+        if is_lead:
+            details = conds.get("vote_details", {})
+            place = details.get("reg_place", "")
+            content = details.get("reg_data", "")
+            
+            target = place.replace("ЛС ", "").replace("@", "")
+            if "Комментарии" in place:
+                await w_client.send_message(target_chat, content, comment_to=target_msg)
+            else:
+                await w_client.send_message(target, content)
+            print(f"✅ [ГОЛОС] Лид {worker.tg_id} подал заявку.")
+
+    except Exception as e:
+        print(f"❌ [ИСПОЛНИТЕЛЬ {worker.tg_id}] Критическая ошибка: {e}")
+    finally:
+        await w_client.disconnect()
+
+
+async def join_channel_smart(client, link):
+    """Проверяет подписку перед тем как подписаться (Пункт 1)"""
+    try:
+        # Пытаемся получить инфо о канале
+        channel = await client.get_entity(link)
+        # Если мы тут, значит канал доступен. Пытаемся вступить.
+        # Telethon сам проигнорирует, если мы уже там, но для стелса можно усложнить.
+        from telethon.tl.functions.channels import JoinChannelRequest
+        await client(JoinChannelRequest(channel=channel))
+        print(f"✅ Успешная подписка на {link}")
+    except Exception as e:
+        print(f"❌ Ошибка подписки на {link}: {e}")
+
+# --- ОБНОВЛЕННАЯ ЛОГИКА РЕПОСТОВ (Пункт 2 + Защита) ---
+
+async def perform_network_reposts(client, chat_id, msg_id, count):
+    """
+    Репостит сообщение другим воркерам группы. 
+    Если воркеров мало — репостит в 'Избранное' (Saved Messages).
+    """
+    async with async_session() as session:
+        me = await client.get_me()
+        
+        # 1. Ищем потенциальных получателей в нашей группе (кроме себя)
+        res = await session.execute(
+            select(WorkerAccount.tg_id).where(
+                WorkerAccount.group_tag == GROUP_TAG,
+                WorkerAccount.tg_id != me.id,
+                WorkerAccount.is_alive == True
+            ).order_by(func.random()).limit(count)
+        )
+        targets = res.scalars().all()
+        
+        # 2. ПРОВЕРКА: Если целей меньше, чем нужно репостов
+        if len(targets) < count:
+            print(f"⚠️ [РЕПОСТ] Мало воркеров ({len(targets)}). Добиваю репостом в Избранное.")
+            try:
+                # 'me.id' или 'me' в качестве цели в Telethon — это отправка в Saved Messages
+                await client.forward_messages('me', msg_id, chat_id)
+                # Уменьшаем счетчик нужных репостов, так как один уже ушел в Избранное
+                count -= 1 
+            except Exception as e:
+                print(f"❌ [РЕПОСТ] Ошибка в Избранное: {e}")
+
+        # 3. Рассылаем остаток по живым воркерам
+        for target_id in targets:
+            if count <= 0: break
+            try:
+                # Имитируем 'чтение' перед пересылкой
+                await asyncio.sleep(random.randint(3, 7))
+                await client.forward_messages(target_id, msg_id, chat_id)
+                count -= 1
+                print(f"✅ [РЕПОСТ] Воркер {me.id} переслал пост воркеру {target_id}")
+            except Exception as e:
+                print(f"❌ [РЕПОСТ] Не удалось отправить {target_id}: {e}")
+
+async def invite_handler_loop():
+    """
+    Пункт 4: Авто-инвайтинг группы по одобренному рапорту.
+    Воркеры вступают в канал с разбросом в 24 часа.
+    """
+    print(f"👥 [ВОРКЕР {GROUP_TAG}] Цикл инвайтинга запущен.")
+    while True:
+        await asyncio.sleep(300) # Проверка раз в 5 минут
+        async with async_session() as session:
+            # Ищем задачи на инвайт для нашей группы
+            query = select(GroupChannelRelation).where(
+                GroupChannelRelation.group_tag == GROUP_TAG,
+                GroupChannelRelation.status == 'inviting'
+            )
+            invites = (await session.execute(query)).scalars().all()
+
+            for inv in invites:
+                # 1. Проверяем, прошло ли 24 часа с момента старта
+                start_time = inv.invite_started_at
+                if datetime.now() > start_time + timedelta(hours=24):
+                    inv.status = 'joined'
+                    await session.commit()
+                    continue
+
+                # 2. Логика вступления текущего аккаунта
+                # Считаем, сколько воркеров в группе (например 30)
+                # Каждый должен вступить в свой случайный момент внутри этих 24 часов
+                me = await client.get_me()
+                
+                # Хитрый расчет: шанс вступления в этом цикле (раз в 5 мин)
+                # Чтобы за 24 часа вступили все 30 человек
+                if random.random() < 0.05: 
+                    try:
+                        from telethon.tl.functions.channels import JoinChannelRequest
+                        await client(JoinChannelRequest(channel=inv.channel_id))
+                        print(f"✅ [ИНВАЙТ] Аккаунт {me.id} успешно вступил в канал {inv.channel_id}")
+                    except Exception as e:
+                        print(f"❌ [ИНВАЙТ] Ошибка вступления: {e}")
+            
+            await session.commit()
+
 # --- ЗАПУСК ---
 
 async def main():
@@ -755,6 +1027,7 @@ async def main():
     asyncio.create_task(worker_mention_task_loop())
     asyncio.create_task(vote_execution_loop())
     asyncio.create_task(star_execution_loop())
+    asyncio.create_task(passport_execution_loop()) 
 
     await client.run_until_disconnected()
 

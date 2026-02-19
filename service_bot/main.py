@@ -345,51 +345,54 @@ async def process_intensity(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(ContestForm.confirming)
     await callback.message.edit_text(summary, reply_markup=builder.as_markup(), parse_mode="HTML")
 
-# --- ФИНАЛ: СОХРАНЕНИЕ ---
+# --- ФИНАЛ: СОХРАНЕНИЕ ПАСПОРТА (ПОЛНАЯ ФУНКЦИЯ) ---
 @dp.callback_query(ContestForm.confirming, F.data == "passport_confirm")
 async def save_passport(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     op = await get_operator(callback.from_user.id)
     
+    if not op:
+        await callback.answer("❌ Ошибка: оператор не найден.")
+        return
+
     async with async_session() as session:
-        # 1. Помечаем пост-триггер как отработанный
-        await session.execute(
-            update(PotentialPost)
-            .where(PotentialPost.id == int(data['current_post_id']))
-            .values(is_claimed=True, claimed_at=datetime.now())
+        # 1. Достаем оригинальные данные поста из PotentialPost
+        # Это нужно, чтобы передать воркеру точные ID канала и сообщения
+        post_id_int = int(data['current_post_id'])
+        post_raw_query = await session.execute(
+            select(PotentialPost).where(PotentialPost.id == post_id_int)
         )
+        post_raw = post_raw_query.scalar_one()
+
+        # 2. Помечаем пост-триггер как отработанный (claimed)
+        post_raw.is_claimed = True
+        post_raw.claimed_at = datetime.now()
         
-        # --- НОВЫЙ БЛОК: ШАГ 4 ---
-        # 2. Узнаем ID канала из этого поста, чтобы включить "тотальный мониторинг"
-        post_query = await session.execute(
-            select(PotentialPost.source_tg_id).where(PotentialPost.id == int(data['current_post_id']))
+        # 3. Переводим канал в режим активного мониторинга (зеркало)
+        await session.execute(
+            update(TargetChannel)
+            .where(TargetChannel.tg_id == post_raw.source_tg_id)
+            .values(status="active_monitor")
         )
-        source_channel_id = post_query.scalar()
 
-        if source_channel_id:
-            await session.execute(
-                update(TargetChannel)
-                .where(TargetChannel.tg_id == source_channel_id)
-                .values(status="active_monitor") # Теперь start_work.py начнет пересылать ВСЁ
-            )
-        # -------------------------
-
-        # 3. Собираем условия в JSON
+        # 4. Формируем расширенный JSON условий для Воркера
         conditions_data = {
             "selected": data.get("selected_conds", []),
             "sub_links": data.get("sub_links", ""),
             "repost_count": data.get("repost_count", "0"),
+            # ВАЖНО: Эти поля воркер будет искать в start_work.py
+            "source_tg_id": post_raw.source_tg_id,
+            "source_msg_id": post_raw.source_msg_id,
             "vote_details": {
-                "executor": data.get("vote_executor"),     # КТО (ID воркера)
-                "reg_data": data.get("vote_reg_data"),     # ДАННЫЕ (Ник/Текст)
-                "reg_place": data.get("vote_reg_place")    # КУДА (Место)
+                "executor": data.get("vote_executor"),     # ID лид-аккаунта
+                "reg_data": data.get("vote_reg_data"),     # Данные ника/текста
+                "reg_place": data.get("vote_reg_place")    # Куда писать (ЛС/Комменты)
             } if data['contest_type'] == 'vote' else {}
         }
 
-
-        # 4. Создаем запись паспорта
+        # 5. Создаем новую запись в таблице паспортов
         new_passport = ContestPassport(
-            post_id=int(data['current_post_id']),
+            post_id=post_id_int,
             group_tag=op.group_tag,
             type=data['contest_type'],
             prize_type=data['prize'],
@@ -402,8 +405,14 @@ async def save_passport(callback: types.CallbackQuery, state: FSMContext):
         await session.commit()
     
     await state.clear()
-    await callback.message.edit_text("🚀 <b>Паспорт успешно создан!</b>\nКанал переведен в режим активного мониторинга.", parse_mode="HTML")
+    await callback.message.edit_text(
+        "🚀 <b>Паспорт успешно создан!</b>\n"
+        "Канал переведен в режим активного мониторинга.\n"
+        "Исполнители начали подготовку к задачам.", 
+        parse_mode="HTML"
+    )
     await callback.answer()
+
 
 @dp.callback_query(F.data == "passport_cancel")
 async def cancel(callback: types.CallbackQuery, state: FSMContext):
