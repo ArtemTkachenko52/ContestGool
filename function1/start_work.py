@@ -947,14 +947,12 @@ ACTIVE_GIFTS_CACHE = set()
 
 async def send_gift_via_web(worker_phone, target_username, gift_type):
     """
-    Отправка подарка через Playwright. 
-    Автоматически убирает '+' из номера для поиска папки сессии.
+    ОТПРАВКА ПОДАРКА ЧЕРЕЗ TELEGRAM WEB /A/ (ПО КОДУ CODEGEN)
     """
-    # Очищаем номер от плюса, чтобы путь совпал с папкой в Docker (session_9180...)
     clean_phone = str(worker_phone).replace("+", "")
     user_data_dir = f"/var/lib/browser_sessions/session_{clean_phone}"
-    
-    print(f"📂 [WEB] Использую сессию: {user_data_dir}")
+
+    print(f"📂 [WEB] Запуск браузера /A/ для {clean_phone}...")
 
     async with async_playwright() as p:
         context = None
@@ -962,55 +960,78 @@ async def send_gift_via_web(worker_phone, target_username, gift_type):
             context = await p.chromium.launch_persistent_context(
                 user_data_dir,
                 headless=True,
-                slow_mo=random.randint(800, 1300),
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-                args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+                slow_mo=1200, # Немного медленнее для стабильности
+                args=['--no-sandbox', '--disable-setuid-sandbox']
             )
             page = await context.new_page()
-            
-            # Заходим через версию /k/, она стабильнее подхватывает старые сессии
-            await page.goto("https://web.telegram.org", wait_until="networkidle", timeout=60000)
-            
-            # Ждем интерфейс (поиск)
+
+            # 1. ЗАХОДИМ В /A/
+            await page.goto("https://web.telegram.org/a/", wait_until="networkidle", timeout=60000)
+            await asyncio.sleep(6)
+
+            # 2. ПОИСК ПО ТВОЕМУ МЕТОДУ
+            print(f"🔍 [WEB] Ищу {target_username}...")
             search_box = page.get_by_role("textbox", name="Search")
-            await search_box.wait_for(state="visible", timeout=30000) 
-            
-            # Имитация ввода
+            await search_box.wait_for(state="visible", timeout=15000)
             await search_box.click()
-            for char in target_username:
-                await page.keyboard.type(char, delay=random.randint(100, 200))
-            
+            await search_box.fill(target_username)
+            await search_box.press("Enter")
             await asyncio.sleep(4)
-            await page.locator(".ListItem-button").first.click()
+
+            # Выбор чата из результатов
+            # Используем твой селектор "Fedor Maslo last" (универсально через 'last')
+            await page.get_by_role("button").filter(has_text=re.compile(r"last", re.IGNORECASE)).first.click()
             await asyncio.sleep(2)
-            
-            # Переход в профиль
-            await page.locator(".ChatInfo").first.click()
-            await asyncio.sleep(2)
-            
-            # Открытие меню подарков
+
+            # 3. ОТКРЫТИЕ МЕНЮ
             await page.get_by_role("button", name="More actions").click()
             await page.get_by_role("menuitem", name="Send a Gift").click()
             await asyncio.sleep(5)
+
+            # 4. ВЫБОР ПОДАРКА (ПО ТВОИМ ИНДЕКСАМ)
+            # Мы сопоставим твой выбор с индексами из записи
+            # 🧸 Медведь (в записи был 5-й по счету ️)
+            # 🌹 Роза (️25, 2-й) | 💐 Букет (️50, 2-й) | 🏆 Кубок (️100, 1-й)
             
-            # Очистка названия подарка от эмодзи
-            gift_name = gift_type.replace("🧸 ", "").replace("🌹 ", "").replace("💐 ", "").replace("🏆 ", "")
-            await page.get_by_text(gift_name, exact=False).first.click()
+            print(f"🎁 [WEB] Выбираю подарок: {gift_type}")
+            
+            if "Медведь" in gift_type:
+                await page.get_by_role("button", name="️").nth(5).click()
+            elif "Роза" in gift_type:
+                await page.get_by_role("button", name="️25").nth(2).click()
+            elif "Букет" in gift_type:
+                await page.get_by_role("button", name="️50").nth(2).click()
+            elif "Кубок" in gift_type:
+                await page.get_by_role("button", name="️100").first.click()
+            else:
+                # Если не совпало, просто кликаем первый доступный
+                await page.get_by_role("button", name="️").first.click()
+
             await asyncio.sleep(3)
+
+            # 5. ФИНАЛЬНАЯ КНОПКА (ТВОЙ СЕЛЕКТОР)
+            # Ты нажал на "Send a Gift for ️"
+            send_btn = page.get_by_role("button", name=re.compile(r"Send a Gift for", re.IGNORECASE))
             
-            # Нажатие кнопки оплаты
-            send_btn = page.get_by_role("button", name=re.compile(r"Send a Gift for \d+"))
             if await send_btn.is_visible():
+                print("🔘 [WEB] Нажимаю финальную кнопку отправки...")
                 await send_btn.click()
-                print(f"✅ [WEB] УСПЕХ! Подарок {gift_type} отправлен.")
-                await asyncio.sleep(5) 
+                await asyncio.sleep(5)
+                
+                # Проверка: если кнопка всё еще видна — значит баланс 0 или ошибка
+                if await send_btn.is_visible():
+                    print("❌ [WEB] Подарок не ушел (Баланс звезд 0 или ошибка оплаты)")
+                    return False
+                
+                print(f"✅ [WEB] РАПОРТ ВЫПОЛНЕН.")
                 return True
             
             return False
+
         except Exception as e:
-            print(f"❌ [WEB-ERR] {worker_phone}: {e}")
+            print(f"❌ [WEB-ERR] Ошибка: {e}")
             if 'page' in locals():
-                await page.screenshot(path=f"/app/error_{clean_phone}.png")
+                await page.screenshot(path=f"/app/DEBUG_GIFT_{clean_phone}.png")
             return False
         finally:
             if context:

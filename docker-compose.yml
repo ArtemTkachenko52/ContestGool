@@ -33,8 +33,12 @@ services:
     depends_on:
       - db
     volumes:
-      # --- ВОТ ЭТА СТРОКА: Прячем сессии браузера в скрытый том ---
-      - browser_data:/var/lib/browser_sessions 
+      # Мы пробрасываем ГЛАВНУЮ папку внутрь. 
+      # Внутри докера она будет называться /var/lib/browser_sessions
+      - ./sessions_storage:/var/lib/browser_sessions
+
+
+
     environment:
       - DATABASE_URL=postgresql+asyncpg://admin:password123@db:5432/contest_monitor
         # ТВОЙ БОТ (Интерфейс оператора)
