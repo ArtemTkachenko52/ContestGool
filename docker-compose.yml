@@ -26,6 +26,7 @@ services:
       context: .
       dockerfile: ./function1/Dockerfile
     container_name: worker_a1
+    shm_size: '2gb'
     restart: always
     dns:
       - 8.8.8.8
@@ -36,11 +37,12 @@ services:
       # Мы пробрасываем ГЛАВНУЮ папку внутрь. 
       # Внутри докера она будет называться /var/lib/browser_sessions
       - ./sessions_storage:/var/lib/browser_sessions
-
-
-
+        # Запуск через Xvfb создает виртуальный экран 1280x720 в памяти
+    command: sh -c "Xvfb :99 -screen 0 1280x720x24 & DISPLAY=:99 python -u function1/start_work.py"
     environment:
       - DATABASE_URL=postgresql+asyncpg://admin:password123@db:5432/contest_monitor
+      - DISPLAY=:99
+
         # ТВОЙ БОТ (Интерфейс оператора)
   service_bot:
     build: 

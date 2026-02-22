@@ -4,20 +4,16 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from decouple import config
-from sqlalchemy import select, update, func, text  # <-- Добавь func сюда
+from sqlalchemy import select, update, func, text  
 from datetime import datetime
-
-# Импорты из твоего проекта
+# Импорты из проекта
 from database.config import async_session
 from database.models import (
     Operator, PotentialPost, ContestPassport, 
     TargetChannel, VotingReport, StarReport, 
-    GroupChannelRelation, OutgoingMessage, WorkerAccount  # <-- ДОБАВИЛИ ЭТО
+    GroupChannelRelation, OutgoingMessage, WorkerAccount
 )
-
-
 from service_bot.states import ContestForm
-
 # Настройки
 BOT_TOKEN = config('BOT_TOKEN')
 bot = Bot(token=BOT_TOKEN)
@@ -25,7 +21,6 @@ dp = Dispatcher()
 TARGET_GROUP = -1003723379200 
 MONITOR_STORAGE = -1003753624654
 # --- ФУНКЦИИ БАЗЫ ДАННЫХ ---
-
 async def get_operator(tg_id: int):
     """Проверка оператора в БД"""
     async with async_session() as session:
@@ -33,7 +28,6 @@ async def get_operator(tg_id: int):
             select(Operator).where(Operator.tg_id == tg_id)
         )
         return result.scalars().first()
-
 def get_conditions_kb(selected_conditions: list):
     builder = InlineKeyboardBuilder()
     options = {
@@ -53,7 +47,6 @@ def get_conditions_kb(selected_conditions: list):
         callback_data="cond_done"
     ))
     return builder.as_markup()
-
 def get_intensity_kb():
     builder = InlineKeyboardBuilder()
     levels = {
@@ -65,7 +58,6 @@ def get_intensity_kb():
     for k, v in levels.items():
         builder.row(types.InlineKeyboardButton(text=v, callback_data=f"int_{k}"))
     return builder.as_markup()
-
 async def get_next_post(group_tag: str):
     async with async_session() as session:
         query = select(PotentialPost).where(
@@ -73,22 +65,15 @@ async def get_next_post(group_tag: str):
             PotentialPost.is_claimed == False,
             PotentialPost.post_type != "monitoring" # СТРОГО ИГНОРИМ ЗЕРКАЛО
         ).order_by(PotentialPost.id.asc()).limit(1)
-        
         result = await session.execute(query)
         return result.scalars().first()
-
-
-
-
 # --- ОБРАБОТЧИКИ КОМАНД ---
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     op = await get_operator(message.from_user.id)
-    
     if not op:
         await message.answer("❌ Доступ запрещен. Вас нет в списке операторов.")
         return
-
     # Создаем кнопки
     kb = [
         [types.KeyboardButton(text="📥 Получить новый пост")],
@@ -99,7 +84,6 @@ async def cmd_start(message: types.Message):
         # ✅ Добавляем кнопку админки ТОЛЬКО для ранга 2
     if op.rank >= 2:
         kb.append([types.KeyboardButton(text="🛡 Админ-панель")])
-    
     keyboard = types.ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
     await message.answer(f"👋 Привет, {'Старший ' if op.rank >= 2 else ''}Оператор!", reply_markup=keyboard)
     keyboard = types.ReplyKeyboardMarkup(
@@ -107,37 +91,28 @@ async def cmd_start(message: types.Message):
         resize_keyboard=True,
         input_field_placeholder="Управление фермой..."
     )
-    
     await message.answer(
         f"👋 Привет, оператор группы <b>{op.group_tag}</b>!\n"
         f"Выберите раздел для работы:",
         reply_markup=keyboard,
         parse_mode="HTML"
     )
-
-
 # --- ВЫДАЧА ПОСТА ---
-
 @dp.message(F.text == "📥 Получить новый пост")
 async def send_new_post(message: types.Message):
     op = await get_operator(message.from_user.id)
     if not op: return
-
     post = await get_next_post(op.group_tag)
-    
     if not post:
         await message.answer("☕️ Пока новых постов нет. Отдыхайте!")
         return
-
     TARGET_GROUP = -1003723379200 
-    
     # Клавиатура выбора
     builder = InlineKeyboardBuilder()
     builder.row(
         types.InlineKeyboardButton(text="✅ Оформить паспорт", callback_data=f"setup_{post.id}"),
         types.InlineKeyboardButton(text="❌ Мусор", callback_data=f"trash_{post.id}")
     )
-
     try:
         # Пересылка самого поста
         await bot.forward_message(message.chat.id, TARGET_GROUP, post.storage_msg_id)
@@ -151,7 +126,6 @@ async def send_new_post(message: types.Message):
         )
     except Exception as e:
         await message.answer(f"❌ Ошибка пересылки: {e}")
-
 # --- FSM: ОФОРМЛЕНИЕ ПАСПОРТА ---
 # --- ШАГ 1: ТИП КОНКУРСА ---
 @dp.callback_query(F.data.startswith("setup_"))
@@ -159,26 +133,21 @@ async def start_setup(callback: types.CallbackQuery, state: FSMContext):
     post_id = int(callback.data.split("_")[1])
     await state.update_data(current_post_id=post_id)
     await state.set_state(ContestForm.choosing_type)
-    
     builder = InlineKeyboardBuilder()
     builder.row(types.InlineKeyboardButton(text="🕹 АФК участие", callback_data="type_afk"))
     builder.row(types.InlineKeyboardButton(text="🗳 Голосование", callback_data="type_vote"))
-    
     await callback.message.edit_text("📝 <b>Шаг 1: Тип конкурса</b>", reply_markup=builder.as_markup(), parse_mode="HTML")
-
 # --- ШАГ 2: ПРИЗ ---
 @dp.callback_query(ContestForm.choosing_type)
 async def process_type(callback: types.CallbackQuery, state: FSMContext):
     await state.update_data(contest_type=callback.data.replace("type_", ""))
     await state.set_state(ContestForm.choosing_prize)
-    
     builder = InlineKeyboardBuilder()
     prizes = ["Деньги 💵", "Звезды ⭐", "NFT 🖼", "Подарок 🎁", "Ценности 🎮", "Другое ⚙️"]
     for p in prizes:
         builder.add(types.InlineKeyboardButton(text=p, callback_data=f"prize_{p}"))
     builder.adjust(2)
     await callback.message.edit_text("📝 <b>Шаг 2: Приз</b>", reply_markup=builder.as_markup())
-
 # --- ШАГ 2.1: ОБРАБОТКА ПРИЗА ---
 @dp.callback_query(ContestForm.choosing_prize)
 async def process_prize(callback: types.CallbackQuery, state: FSMContext):
@@ -191,21 +160,16 @@ async def process_prize(callback: types.CallbackQuery, state: FSMContext):
         # Передаем callback.message (само сообщение с кнопками) и callback.from_user.id
         await proceed_from_prize(callback.message, state, callback.from_user.id)
     await callback.answer()
- 
-
 @dp.message(ContestForm.input_prize_custom)
 async def process_custom_prize(message: types.Message, state: FSMContext):
     await state.update_data(prize=message.text)
     await proceed_from_prize(message, state)
-
 async def proceed_from_prize(message: types.Message, state: FSMContext, user_id: int):
     data = await state.get_data()
     op = await get_operator(user_id)
-    
     if not op:
         await message.answer("❌ Ошибка: оператор не найден в БД.")
         return
-
     if data['contest_type'] == 'vote':
         async with async_session() as session:
             # Получаем воркеров этой группы
@@ -214,17 +178,14 @@ async def proceed_from_prize(message: types.Message, state: FSMContext, user_id:
             )
             # row[0] достает само число из кортежа БД
             workers = [row[0] for row in res.all()]
-
         if not workers:
             # Редактируем старое сообщение вместо отправки нового
             await message.edit_text(f"❌ В вашей группе ({op.group_tag}) нет исполнителей!")
             await state.clear()
             return
-
         builder = InlineKeyboardBuilder()
         for w_id in workers:
             builder.row(types.InlineKeyboardButton(text=f"🤖 Аккаунт {w_id}", callback_data=f"vexec_{w_id}"))
-        
         await state.set_state(ContestForm.vote_choose_executor)
         # РЕДАКТИРУЕМ сообщение
         await message.edit_text("👤 <b>Шаг 3: Кто участвует?</b>\nВыберите исполнителя для регистрации:", 
@@ -233,13 +194,11 @@ async def proceed_from_prize(message: types.Message, state: FSMContext, user_id:
         await state.set_state(ContestForm.filling_conditions)
         await message.edit_text("📝 <b>Шаг 3: Условия</b>", 
                                 reply_markup=get_conditions_kb([]), parse_mode="HTML")
-
 # --- ШАГ 4 (ГОЛОСОВАНИЕ): ДАННЫЕ ДЛЯ РЕГИСТРАЦИИ ---
 @dp.callback_query(ContestForm.vote_choose_executor, F.data.startswith("vexec_"))
 async def process_vote_executor(callback: types.CallbackQuery, state: FSMContext):
     executor_id = callback.data.replace("vexec_", "")
     await state.update_data(vote_executor=executor_id)
-    
     await state.set_state(ContestForm.input_vote_reg_data)
     await callback.message.edit_text(
         "📝 <b>Шаг 4: Данные для регистрации</b>\n"
@@ -247,12 +206,10 @@ async def process_vote_executor(callback: types.CallbackQuery, state: FSMContext
         parse_mode="HTML"
     )
     await callback.answer()
-
 @dp.message(ContestForm.input_vote_reg_data)
 async def process_vote_reg_data(message: types.Message, state: FSMContext):
     reg_text = message.text or message.caption or ""
     storage_id = None
-    
     # Если прислали фото/видео/документ - пересылаем в хранилище
     if message.photo or message.document or message.video:
         # Пересылаем в MONITOR_STORAGE (как в CRM)
@@ -260,24 +217,19 @@ async def process_vote_reg_data(message: types.Message, state: FSMContext):
         storage_id = fwd.message_id
         if not reg_text:
             reg_text = "[Медиа-заявка]"
-
     # Сохраняем и текст, и ID медиа
     await state.update_data(vote_reg_data=reg_text, vote_reg_media_id=storage_id)
-    
     builder = InlineKeyboardBuilder()
     builder.row(types.InlineKeyboardButton(text="💬 Комментарии", callback_data="vplace_comm"))
     builder.row(types.InlineKeyboardButton(text="👤 ЛС Организатора", callback_data="vplace_ls"))
-    
     await state.set_state(ContestForm.vote_choose_place)
     await message.answer("📍 <b>Шаг 5: Куда писать?</b>\nГде исполнитель должен оставить заявку?", 
                          reply_markup=builder.as_markup(), parse_mode="HTML")
-
 
 # --- ШАГ 5 (ГОЛОСОВАНИЕ): МЕСТО РЕГИСТРАЦИИ ---
 @dp.callback_query(ContestForm.vote_choose_place)
 async def process_vote_place(callback: types.CallbackQuery, state: FSMContext):
     place = callback.data.replace("vplace_", "")
-    
     if place == "ls":
         await state.set_state(ContestForm.input_vote_org_username)
         await callback.message.edit_text("⌨️ Введите <b>@username</b> организатора:")
@@ -285,14 +237,10 @@ async def process_vote_place(callback: types.CallbackQuery, state: FSMContext):
         await state.update_data(vote_reg_place="Комментарии под постом")
         await ask_intensity(callback.message, state)
     await callback.answer()
-
 @dp.message(ContestForm.input_vote_org_username)
 async def process_org_username(message: types.Message, state: FSMContext):
     await state.update_data(vote_reg_place=f"ЛС {message.text}")
     await ask_intensity(message, state)
-
-
-
 # --- ШАГ 3 (АФК): УСЛОВИЯ ---
 @dp.callback_query(ContestForm.filling_conditions)
 async def process_conditions(callback: types.CallbackQuery, state: FSMContext):
@@ -306,7 +254,6 @@ async def process_conditions(callback: types.CallbackQuery, state: FSMContext):
     else: selected.append(code)
     await state.update_data(selected_conds=selected)
     await callback.message.edit_reply_markup(reply_markup=get_conditions_kb(selected))
-
 async def check_afk_substeps(message, state: FSMContext):
     data = await state.get_data()
     conds = data.get("selected_conds", [])
@@ -318,7 +265,6 @@ async def check_afk_substeps(message, state: FSMContext):
         await message.answer("🔄 Введите количество чатов для репоста:")
     else:
         await ask_intensity(message, state)
-
 @dp.message(ContestForm.input_sub_links)
 async def sub_links(message: types.Message, state: FSMContext):
     await state.update_data(sub_links=message.text)
@@ -328,42 +274,33 @@ async def sub_links(message: types.Message, state: FSMContext):
         await message.answer("🔄 Введите количество чатов для репоста:")
     else:
         await ask_intensity(message, state)
-
 @dp.message(ContestForm.input_repost_count)
 async def repost_count(message: types.Message, state: FSMContext):
     await state.update_data(repost_count=message.text)
     await ask_intensity(message, state)
-
 # --- ШАГ 4: ИНТЕНСИВНОСТЬ ---
 async def ask_intensity(message, state: FSMContext):
     await state.set_state(ContestForm.setting_intensity)
     await message.answer("🚀 <b>Шаг 4: Интенсивность</b>", reply_markup=get_intensity_kb(), parse_mode="HTML")
-
 @dp.callback_query(ContestForm.setting_intensity)
 async def process_intensity(callback: types.CallbackQuery, state: FSMContext):
     level = callback.data.replace("int_", "")
     await state.update_data(intensity=level)
-    
     data = await state.get_data()
     summary = f"🏁 <b>Проверка паспорта</b>\nТип: {data['contest_type']}\nПриз: {data['prize']}\nИнтенсивность: {level} уровень"
-    
     builder = InlineKeyboardBuilder()
     builder.row(types.InlineKeyboardButton(text="✅ Запустить", callback_data="passport_confirm"))
     builder.row(types.InlineKeyboardButton(text="❌ Отмена", callback_data="passport_cancel"))
-    
     await state.set_state(ContestForm.confirming)
     await callback.message.edit_text(summary, reply_markup=builder.as_markup(), parse_mode="HTML")
-
 # --- ФИНАЛ: СОХРАНЕНИЕ ПАСПОРТА (ПОЛНАЯ ФУНКЦИЯ) ---
 @dp.callback_query(ContestForm.confirming, F.data == "passport_confirm")
 async def save_passport(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     op = await get_operator(callback.from_user.id)
-    
     if not op:
         await callback.answer("❌ Ошибка: оператор не найден.")
         return
-
     async with async_session() as session:
         # 1. Достаем оригинальные данные поста из PotentialPost
         # Это нужно, чтобы передать воркеру точные ID канала и сообщения
@@ -372,18 +309,15 @@ async def save_passport(callback: types.CallbackQuery, state: FSMContext):
             select(PotentialPost).where(PotentialPost.id == post_id_int)
         )
         post_raw = post_raw_query.scalar_one()
-
         # 2. Помечаем пост-триггер как отработанный (claimed)
         post_raw.is_claimed = True
         post_raw.claimed_at = datetime.now()
-        
         # 3. Переводим канал в режим активного мониторинга (зеркало)
         await session.execute(
             update(TargetChannel)
             .where(TargetChannel.tg_id == post_raw.source_tg_id)
             .values(status="active_monitor")
         )
-
         # 4. Формируем расширенный JSON условий для Воркера
         conditions_data = {
             "selected": data.get("selected_conds", []),
@@ -399,7 +333,6 @@ async def save_passport(callback: types.CallbackQuery, state: FSMContext):
                 "reg_place": data.get("vote_reg_place")    # Куда писать (ЛС/Комменты)
             } if data['contest_type'] == 'vote' else {}
         }
-
         # 5. Создаем новую запись в таблице паспортов
         new_passport = ContestPassport(
             post_id=post_id_int,
@@ -410,10 +343,8 @@ async def save_passport(callback: types.CallbackQuery, state: FSMContext):
             intensity_level=int(data['intensity']),
             status="active"
         )
-        
         session.add(new_passport)
         await session.commit()
-    
     await state.clear()
     await callback.message.edit_text(
         "🚀 <b>Паспорт успешно создан!</b>\n"
@@ -422,13 +353,10 @@ async def save_passport(callback: types.CallbackQuery, state: FSMContext):
         parse_mode="HTML"
     )
     await callback.answer()
-
-
 @dp.callback_query(F.data == "passport_cancel")
 async def cancel(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.edit_text("❌ Отменено.")
-
 @dp.callback_query(F.data.startswith("trash_"))
 async def trash(callback: types.CallbackQuery):
     post_id = int(callback.data.split("_")[1])
@@ -436,9 +364,7 @@ async def trash(callback: types.CallbackQuery):
         await session.execute(update(PotentialPost).where(PotentialPost.id == post_id).values(is_claimed=True))
         await session.commit()
     await callback.message.edit_text("🗑 В мусоре.")
-
 # --- ФУНКЦИОНАЛ: УЗНАТЬ ID РЕАКЦИИ ---
-
 @dp.message(F.text == "🔍 Узнать ID реакции")
 async def start_reaction_id(message: types.Message, state: FSMContext):
     await state.set_state(ContestForm.waiting_for_reaction)
@@ -448,7 +374,6 @@ async def start_reaction_id(message: types.Message, state: FSMContext):
         "<i>Для отмены просто напишите любое другое слово.</i>",
         parse_mode="HTML"
     )
-
 @dp.message(ContestForm.waiting_for_reaction)
 async def process_reaction_id(message: types.Message, state: FSMContext):
     # 1. Проверка на СЛОТЫ / КУБИКИ (🎰, 🎲, 🎯, 🏀)
@@ -462,7 +387,6 @@ async def process_reaction_id(message: types.Message, state: FSMContext):
         )
         await state.clear()
         return
-
     # 2. Проверка на КАСТОМНЫЕ ЭМОДЗИ (Premium)
     if message.entities:
         for entity in message.entities:
@@ -476,7 +400,6 @@ async def process_reaction_id(message: types.Message, state: FSMContext):
                 )
                 await state.clear()
                 return
-
     # 3. Проверка на ОБЫЧНЫЕ ЭМОДЗИ (Unicode)
     if message.text:
         # Просто берем первый символ, если прислали пачку
@@ -489,23 +412,18 @@ async def process_reaction_id(message: types.Message, state: FSMContext):
         )
         await state.clear()
         return
-
     await message.answer("❌ Не удалось распознать тип. Отправьте эмодзи, кубик или кастомный смайл.")
-
 @dp.message(F.text == "📋 Текущие конкурсы")
 async def show_contests_types(message: types.Message):
     builder = InlineKeyboardBuilder()
     builder.row(types.InlineKeyboardButton(text="🕹 АФК", callback_data="cur_afk"))
     builder.row(types.InlineKeyboardButton(text="🗳 Голосование", callback_data="cur_vote"))
     await message.answer("Выберите тип активных конкурсов:", reply_markup=builder.as_markup())
-
 # --- ИСПРАВЛЕННЫЙ СПИСОК КАНАЛОВ (Текущие конкурсы) ---
-
 @dp.callback_query(F.data.startswith("cur_"))
 async def list_active_channels(callback: types.CallbackQuery, state: FSMContext):
     c_type = callback.data.replace("cur_", "")
     op = await get_operator(callback.from_user.id)
-    
     async with async_session() as session:
         # ИЗМЕНЕНО: Теперь ищем паспорта со статусом 'active' И 'finished'
         # Пока оператор вручную не нажмет кнопку "Остановить", канал будет в списке
@@ -1048,52 +966,40 @@ async def process_report_decision(callback: types.CallbackQuery):
 async def start_inviting_groups(callback: types.CallbackQuery, state: FSMContext):
     passport_id = int(callback.data.split("_")[1])
     await state.update_data(current_passport_id=passport_id)
-    
     async with async_session() as session:
         # 1. Находим ID канала через паспорт
         res = await session.execute(
             select(PotentialPost.source_tg_id).join(ContestPassport).where(ContestPassport.id == passport_id)
         )
         tg_id = res.scalar()
-        
         # 2. Находим группы, которые УЖЕ имеют отношение к этому каналу (вступили или инвайтятся)
         res_rel = await session.execute(
             select(GroupChannelRelation.group_tag).where(GroupChannelRelation.channel_id == tg_id)
         )
         existing_groups = [row[0] for row in res_rel.all()]
-        
         # 3. Берем ВСЕ группы и убираем те, что уже есть
         res_all = await session.execute(text("SELECT DISTINCT group_tag FROM workers.workers"))
         all_groups = [row[0] for row in res_all.all()]
-        
         available_groups = [g for g in all_groups if g not in existing_groups]
-
     if not available_groups:
         await callback.answer("✅ Все доступные группы уже состоят в этом канале или в процессе инвайта.", show_alert=True)
         return
-
     builder = InlineKeyboardBuilder()
     for g in available_groups:
         builder.row(types.InlineKeyboardButton(text=f"➕ Инвайт: Группа {g}", callback_data=f"do_inv_{g}"))
-    
     await state.set_state(ContestForm.choosing_group_to_invite)
     await callback.message.answer("👥 <b>Выбор группы для инвайтинга</b>\nВыберите группу для вступления:", reply_markup=builder.as_markup(), parse_mode="HTML")
-
-
 @dp.callback_query(ContestForm.choosing_group_to_invite, F.data.startswith("do_inv_"))
 async def process_inviting(callback: types.CallbackQuery, state: FSMContext):
     group_tag = callback.data.replace("do_inv_", "")
     data = await state.get_data()
     passport_id = data['current_passport_id']
-    
     async with async_session() as session:
         # Получаем ID канала
         res = await session.execute(
     select(PotentialPost.source_tg_id).join(ContestPassport).where(ContestPassport.id == passport_id)
 )
-
-        tg_id = res.scalar()
-        
+        tg_id = res.scalar()       
         # СОЗДАЕМ ЗАПИСЬ (Заявку), которую увидит Админ
         new_rel = GroupChannelRelation(
             group_tag=group_tag,
@@ -1102,41 +1008,31 @@ async def process_inviting(callback: types.CallbackQuery, state: FSMContext):
         )
         session.add(new_rel)
         await session.commit()
-    
     await callback.message.edit_text(
         f"📨 <b>Заявка отправлена!</b>\nСтарший оператор должен подтвердить инвайтинг Группы {group_tag}.\n"
         f"После одобрения начнется процесс вступления (24 часа).", 
         parse_mode="HTML"
     )
     await state.clear()
-
-
-
 # --- 1. СТАРТ: УЗНАЕМ КТО ИСПОЛНИТЕЛЬ ИЗ ПАСПОРТА ---
 @dp.callback_query(F.data.startswith("stars_"))
 async def start_stars_report(callback: types.CallbackQuery, state: FSMContext):
     # Разбираем ID паспорта из кнопки (stars_ID)
     passport_id = int(callback.data.split("_")[1])
-    
     async with async_session() as session:
         # Достаем данные паспорта, чтобы найти Лид-исполнителя (executor)
         res = await session.execute(select(ContestPassport).where(ContestPassport.id == passport_id))
         passport = res.scalar_one_or_none()
-        
         if not passport:
             await callback.answer("❌ Паспорт не найден в базе.", show_alert=True)
             return
-
         # Ищем в JSON-поле conditions данные об исполнителе
         executor = passport.conditions.get("vote_details", {}).get("executor")
-        
         if not executor:
             await callback.answer("❌ В паспорте этого конкурса не указан исполнитель-участник!", show_alert=True)
             return
-
     # Сохраняем ID паспорта и ID исполнителя в память бота
     await state.update_data(star_passport_id=passport_id, star_executor=executor)
-    
     await state.set_state(ContestForm.star_target)
     await callback.message.answer(
         f"⭐ <b>Рапорт на Звезды</b>\n"
@@ -1145,35 +1041,28 @@ async def start_stars_report(callback: types.CallbackQuery, state: FSMContext):
         parse_mode="HTML"
     )
     await callback.answer()
-
 # --- 2. ВЫБОР ТИПА ПОДАРКА (КНОПКАМИ) ---
 @dp.message(ContestForm.star_target)
 async def star_target_proc(message: types.Message, state: FSMContext):
     await state.update_data(s_target=message.text)
-    
     builder = InlineKeyboardBuilder()
     # Список подарков для выбора
     gifts = ["🧸 Медведь", "🌹 Роза", "💐 Букет", "🏆 Кубок"]
     for gift in gifts:
         builder.row(types.InlineKeyboardButton(text=gift, callback_data=f"sgift_{gift}"))
-    
     await state.set_state(ContestForm.star_gift_type)
     await message.answer("🎁 <b>Выберите, какой подарок отправить:</b>", reply_markup=builder.as_markup(), parse_mode="HTML")
-
 # --- 3. ВЫБОР ПОДАРКА И АВТО-ПЕРЕХОД К ФИНАЛУ ---
 @dp.callback_query(ContestForm.star_gift_type)
 async def star_gift_proc(callback: types.CallbackQuery, state: FSMContext):
     gift_name = callback.data.replace("sgift_", "")
     # Сохраняем только тип подарка, сумму ставим 0 (она не будет видна)
     await state.update_data(s_gift=gift_name, s_amount=0) 
-    
     # Сразу вызываем показ финальной карточки
     await show_star_summary(callback.message, state)
     await callback.answer()
-
 async def show_star_summary(message: types.Message, state: FSMContext):
     data = await state.get_data()
-    
     summary = (
         f"🚨 <b>РАПОРТ НА ЗВЕЗДЫ (ПРОВЕРКА)</b>\n"
         f"━━━━━━━━━━━━━━\n"
@@ -1183,18 +1072,14 @@ async def show_star_summary(message: types.Message, state: FSMContext):
         f"━━━━━━━━━━━━━━\n"
         f"Отправить Старшему оператору на одобрение?"
     )
-    
     builder = InlineKeyboardBuilder()
     builder.row(
         types.InlineKeyboardButton(text="✅ Отправить", callback_data="star_final_confirm"),
         types.InlineKeyboardButton(text="❌ Отмена", callback_data="star_final_cancel")
     )
-    
     await state.set_state(ContestForm.star_confirm)
     # Редактируем сообщение, чтобы убрать кнопки выбора подарков
     await message.edit_text(summary, reply_markup=builder.as_markup(), parse_mode="HTML")
-
-
 # --- 5. ФИНАЛЬНОЕ СОХРАНЕНИЕ В БАЗУ ---
 @dp.callback_query(ContestForm.star_confirm, F.data == "star_final_confirm")
 async def save_star_report_final(callback: types.CallbackQuery, state: FSMContext):
@@ -1451,12 +1336,10 @@ async def show_worker_accounts(message: types.Message):
 
     await message.answer(f"📱 <b>Управление ЛС группы {op.group_tag}</b>\nВыберите аккаунт:", 
                          reply_markup=builder.as_markup(), parse_mode="HTML")
-
 # --- РАЗДЕЛ ЛС: СПИСОК ДИАЛОГОВ ВНУТРИ АККАУНТА ---
 @dp.callback_query(F.data.startswith("ls_acc_"))
 async def show_dialogs(callback: types.CallbackQuery):
-    worker_id = int(callback.data.split("_")[2]) # Берем ID из ls_acc_ID
-    
+    worker_id = int(callback.data.split("_")[2])
     async with async_session() as session:
         # Группируем сообщения по отправителям
         query = text("""
@@ -1468,11 +1351,9 @@ async def show_dialogs(callback: types.CallbackQuery):
         """)
         result = await session.execute(query, {"wid": worker_id})
         dialogs = result.all()
-
     if not dialogs:
         await callback.message.edit_text("📭 У этого аккаунта пока нет входящих сообщений.")
         return
-
     builder = InlineKeyboardBuilder()
     for sender_id, last_date, new_count in dialogs:
         status = f" 🔥 +{new_count}" if new_count > 0 else ""
@@ -1481,24 +1362,20 @@ async def show_dialogs(callback: types.CallbackQuery):
             callback_data=f"ls_view_{worker_id}_{sender_id}"
         ))
     builder.row(types.InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_accounts"))
-
     await callback.message.edit_text(f"📩 <b>Диалоги аккаунта {worker_id}:</b>", 
                                      reply_markup=builder.as_markup(), parse_mode="HTML")
-    
 @dp.callback_query(F.data == "back_to_accounts")
 async def back_to_accounts(callback: types.CallbackQuery):
     await show_worker_accounts(callback.message)
     await callback.answer()
-
 # --- РАЗДЕЛ ЛС: ПРОСМОТР ИСТОРИИ ЧАТА ---
-# --- 1. ВЫБОР ЮЗЕРА (ИСПРАВЛЕННЫЙ) ---
+# --- 1. ВЫБОР ЮЗЕРА ---
 @dp.callback_query(F.data.startswith("ls_view_"))
 async def view_chat_history(callback: types.CallbackQuery, state: FSMContext):
     # Разбираем: ls_view_{worker_id}_{sender_id}
     parts = callback.data.split("_")
     worker_id = int(parts[2])
     sender_id = int(parts[3])
-
     async with async_session() as session:
         from database.models import AccountMessage
         # Берем последние 5 сообщений (для теста, чтобы не спамить)
@@ -1506,9 +1383,7 @@ async def view_chat_history(callback: types.CallbackQuery, state: FSMContext):
             AccountMessage.worker_tg_id == worker_id,
             AccountMessage.sender_id == sender_id
         ).order_by(AccountMessage.created_at.desc()).limit(5)
-        
         msgs = (await session.execute(query)).scalars().all()
-        
         # Помечаем сообщения в БД как прочитанные
         await session.execute(
             update(AccountMessage).where(
@@ -1517,18 +1392,14 @@ async def view_chat_history(callback: types.CallbackQuery, state: FSMContext):
             ).values(is_read=True)
         )
         await session.commit()
-
     if not msgs:
         await callback.answer("История сообщений пуста.")
         return
-
     await callback.message.answer(f"📜 <b>История чата с {sender_id}</b> (через {worker_id}):", parse_mode="HTML")
-
-    # Выводим каждое сообщение отдельным постом с кнопками (как ты и хотел)
+    # Выводим каждое сообщение отдельным постом с кнопками
     for m in reversed(msgs):
         time_str = m.created_at.strftime("%H:%M")
         caption = f"🕒 <code>[{time_str}]</code>\n{m.text or ''}"
-        
         builder = InlineKeyboardBuilder()
         # Кнопка ОТВЕТА
         builder.row(types.InlineKeyboardButton(
@@ -1542,7 +1413,6 @@ async def view_chat_history(callback: types.CallbackQuery, state: FSMContext):
             for r in reacs
         ]
         builder.row(*reac_btns)
-
         # Если есть медиа — копируем из хранилища, если нет — текстом
         if m.storage_media_id:
             try:
@@ -1558,25 +1428,19 @@ async def view_chat_history(callback: types.CallbackQuery, state: FSMContext):
                 await callback.message.answer(f"🖼 [Медиа недоступно]\n{caption}", reply_markup=builder.as_markup())
         else:
             await callback.message.answer(caption, reply_markup=builder.as_markup(), parse_mode="HTML")
-    
     await callback.answer()
-
 # --- РАЗДЕЛ ЛС: НАЧАЛО ОТВЕТА (ИСПРАВЛЕННЫЙ) ---
 @dp.callback_query(F.data.startswith("ls_rep_"))
 async def start_ls_reply(callback: types.CallbackQuery, state: FSMContext):
-    print(f"DEBUG: Нажата кнопка ответить! Data: {callback.data}") # Увидишь это в консоли бота
-    
+    print(f"DEBUG: Нажата кнопка ответить! Data: {callback.data}") 
     # Разбираем данные: ls_rep_{worker_id}_{sender_id}_{msg_id}
     parts = callback.data.split("_")
-    
     try:
         worker_id = int(parts[2])
         sender_id = int(parts[3])
         msg_id = int(parts[4]) if len(parts) > 4 else None
-        
         await state.update_data(rep_worker=worker_id, rep_receiver=sender_id, rep_msg_id=msg_id)
         await state.set_state(ContestForm.waiting_for_ls_reply)
-        
         await callback.message.answer(
             f"✍️ <b>Введите ответ для {sender_id}:</b>\n"
             f"<i>Воркер {worker_id} ответит на конкретное сообщение.</i>", 
@@ -1586,22 +1450,16 @@ async def start_ls_reply(callback: types.CallbackQuery, state: FSMContext):
     except Exception as e:
         print(f"❌ Ошибка парсинга кнопки: {e}")
         await callback.answer("Ошибка данных кнопки", show_alert=True)
-
-
-
 # --- ЕДИНЫЙ ХЕНДЛЕР ОТВЕТА (ТЕКСТ + МЕДИА) ---
 @dp.message(ContestForm.waiting_for_ls_reply)
 async def process_ls_reply_universal(message: types.Message, state: FSMContext):
     data = await state.get_data()
     m_type = "text"
     s_msg_id = None
-
     if message.photo or message.voice or message.video or message.document:
         m_type = "media"
-        # Пересылаем файл в хранилище, чтобы воркер его увидел
         fwd = await message.forward(MONITOR_STORAGE)
         s_msg_id = fwd.message_id
-
     async with async_session() as session:
         from database.models import OutgoingMessage
         new_out = OutgoingMessage(
@@ -1609,22 +1467,17 @@ async def process_ls_reply_universal(message: types.Message, state: FSMContext):
             receiver_id=data['rep_receiver'],
             reply_to_msg_id=data.get('rep_msg_id'),
             task_type=m_type,
-            storage_msg_id=s_msg_id, # Сохраняем "ссылку" на файл
+            storage_msg_id=s_msg_id,
             text=message.text or message.caption or "",
             status="pending"
         )
         session.add(new_out)
         await session.commit()
-    
     await state.clear()
     await message.answer(f"✅ {m_type.capitalize()}-ответ в очереди.")
-
-
-
 @dp.callback_query(F.data.startswith("reac_"))
 async def process_ls_reaction(callback: types.CallbackQuery):
     _, w_id, s_id, m_id, emoji = callback.data.split("_")
-    
     async with async_session() as session:
         from database.models import OutgoingMessage
         new_reac = OutgoingMessage(
@@ -1636,15 +1489,10 @@ async def process_ls_reaction(callback: types.CallbackQuery):
         )
         session.add(new_reac)
         await session.commit()
-    
     await callback.answer(f"Задача на реакцию {emoji} создана!")
-
-
-# --- ЗАПУСК ---
-
+# --- ЗАПУСК --
 async def main():
     print("🚀 Бот-интерфейс запущен...")
     await dp.start_polling(bot)
-
 if __name__ == "__main__":
     asyncio.run(main())

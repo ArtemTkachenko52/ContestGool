@@ -1,7 +1,6 @@
 from sqlalchemy import Column, BigInteger, String, Integer, Boolean, DateTime, ForeignKey, JSON, Text
 from sqlalchemy.sql import func
 from database.base import Base
-
 # Общий класс для всех типов аккаунтов (Читатели и Исполнители)
 class BaseAccount:
     id = Column(Integer, primary_key=True)
@@ -13,13 +12,10 @@ class BaseAccount:
     group_tag = Column(String, index=True)
     proxy = Column(String) 
     device_model = Column(String)
-    # --- ДОБАВЬ ЭТИ ДВЕ СТРОКИ НИЖЕ ---
     os_version = Column(String)
     app_version = Column(String)
     # ----------------------------------
     system_lang = Column(String, default="ru-RU")
-
-
 # --- СХЕМА WATCHER (Мониторинг) ---
 class Keyword(Base):
     __tablename__ = "keywords"
@@ -27,7 +23,6 @@ class Keyword(Base):
     id = Column(Integer, primary_key=True)
     word = Column(String(100), unique=True)
     category = Column(String, default="general") # 'general' или 'fast'
-
 class TargetChannel(Base):
     __tablename__ = 'channels'
     __table_args__ = {"schema": "watcher"}
@@ -37,12 +32,9 @@ class TargetChannel(Base):
     group_tag = Column(String, index=True)
     status = Column(String, default="idle") # 'idle' или 'active_monitor'
     last_read_post_id = Column(Integer, default=0) # ID последнего просмотренного PotentialPost
-
-
 class ReaderAccount(Base, BaseAccount):
     __tablename__ = 'readers'
     __table_args__ = {"schema": "watcher"}
-
 class PotentialPost(Base):
     __tablename__ = 'potential_posts'
     __table_args__ = {"schema": "watcher"}
@@ -56,7 +48,6 @@ class PotentialPost(Base):
     is_claimed = Column(Boolean, default=False)
     published_at = Column(DateTime)
     claimed_at = Column(DateTime, nullable=True)
-
 # --- СХЕМА MANAGEMENT (Управление) ---
 class Operator(Base):
     __tablename__ = 'operators'
@@ -65,7 +56,6 @@ class Operator(Base):
     tg_id = Column(BigInteger, unique=True)
     group_tag = Column(String)
     rank = Column(Integer, default=1) # 1 - оператор, 2 - старший
-
 class ContestPassport(Base):
     __tablename__ = 'passports'
     __table_args__ = {"schema": "management"}
@@ -77,7 +67,6 @@ class ContestPassport(Base):
     conditions = Column(JSON) # Здесь лежат sub_links, repost_count, vote_details
     intensity_level = Column(Integer, default=1) # 1-4
     status = Column(String, default="active") # 'active', 'finished'
-
 class VotingReport(Base):
     __tablename__ = 'voting_reports'
     __table_args__ = {"schema": "management"}
@@ -92,9 +81,6 @@ class VotingReport(Base):
     intensity = Column(Integer)
     status = Column(String, default="pending") 
     created_by = Column(BigInteger)
-
-
-
 # --- СХЕМА WORKERS (Исполнители) ---
 class WorkerAccount(Base, BaseAccount):
     __tablename__ = 'workers'
@@ -102,7 +88,6 @@ class WorkerAccount(Base, BaseAccount):
     is_alive = Column(Boolean, default=True)
     last_action = Column(DateTime)
     last_sync_subscriptions = Column(DateTime, nullable=True)
-
 class AccountMessage(Base):
     __tablename__ = 'messages'
     __table_args__ = {"schema": "workers"}
@@ -114,9 +99,7 @@ class AccountMessage(Base):
     media_type = Column(String, default="text") # text, photo, voice, video, document
     is_read = Column(Boolean, default=False)
     created_at = Column(DateTime, server_default=func.now())
-        # ... старые поля ...
     storage_media_id = Column(BigInteger, nullable=True) # ID сообщения в группе-хранилище
-
 class AuditLog(Base):
     __tablename__ = 'audit_logs'
     __table_args__ = {"schema": "management"}
@@ -124,7 +107,6 @@ class AuditLog(Base):
     group_tag = Column(String, index=True)
     action = Column(Text)
     created_at = Column(DateTime, server_default=func.now())
-    
 class StarReport(Base):
     __tablename__ = 'star_reports'
     __table_args__ = {"schema": "management"}
@@ -155,7 +137,6 @@ class ReserveChannel(Base):
     source_group_tag = Column(String) # Кто нашел
     reason = Column(String) # Ключевое слово или 'button'
     created_at = Column(DateTime, server_default=func.now())
-
 class LuckEvent(Base):
     """Логирование триггеров удачи для тестов (Пункт 2)"""
     __tablename__ = 'luck_events'
@@ -165,7 +146,6 @@ class LuckEvent(Base):
     post_id = Column(Integer)
     emoji = Column(String)
     status = Column(String, default="detected") # detected / working / finished
-
 class MentionTask(Base):
     """Очередь задач на авто-комментарий при упоминании (Пункт 1)"""
     __tablename__ = 'mention_tasks'
@@ -176,7 +156,6 @@ class MentionTask(Base):
     post_id = Column(Integer)
     status = Column(String, default="pending")
     created_at = Column(DateTime, server_default=func.now())
-
 class OutgoingMessage(Base):
     __tablename__ = 'outgoing_messages'
     __table_args__ = {"schema": "workers"}
@@ -185,14 +164,12 @@ class OutgoingMessage(Base):
     receiver_id = Column(BigInteger)
     reply_to_msg_id = Column(Integer, nullable=True)
     text = Column(Text, nullable=True)
-    # НОВЫЕ ПОЛЯ
     task_type = Column(String, default="text") # text, reaction, media
     file_id = Column(String, nullable=True)     # Для фото/ГС от оператора
     reaction_data = Column(String, nullable=True) # "👍" или ID кастомного
     status = Column(String, default="pending")
     created_at = Column(DateTime, server_default=func.now())
     storage_msg_id = Column(BigInteger, nullable=True) # ID сообщения в хранилище
-
 class LuckRaid(Base):
     """Активные рейды десанта (Пункт 2 ТЗ)"""
     __tablename__ = 'luck_raids'

@@ -13,6 +13,7 @@ import io
 from PIL import Image, ImageOps, ImageEnhance
 import os
 from playwright.async_api import async_playwright
+from playwright_stealth import stealth_async
 
 # Импорты из обновленной базы
 from database.config import async_session
@@ -205,9 +206,12 @@ async def execute_button_click_raid(chat_id, post_id, msg_obj):
         
 
 async def single_button_click(worker, chat_id, post_id, msg_obj, delay):
-    """Логика: вступление + нажатие + бесплатное распознавание ddddocr (исправлено)"""
+    """
+    ЛОГИКА: Вступление + Нажатие + Определение Капчи (Браузер/Бот)
+    """
     await asyncio.sleep(delay)
-    
+
+    # Инициализация клиента воркера с его "железом"
     w_client = TelegramClient(
         StringSession(worker.session_string), 
         worker.api_id, worker.api_hash,
@@ -215,62 +219,80 @@ async def single_button_click(worker, chat_id, post_id, msg_obj, delay):
         system_version=worker.os_version,
         app_version=worker.app_version
     )
-    
+
     try:
         await w_client.connect()
-        
-        # 1. Анализируем структуру кнопок
+
+        # --- 1. ИЗВЛЕЧЕНИЕ КНОПКИ ---
         button = None
         if msg_obj.reply_markup and msg_obj.reply_markup.rows:
-            # Берем первую кнопку из первого ряда (индексы [0].buttons[0])
+            # Берем самую первую кнопку (обычно это "Участвовать" или "Проверить")
             button = msg_obj.reply_markup.rows[0].buttons[0]
-        
+
         if not button:
-            print(f"⚠️ [BUTTON] Кнопки в посте {post_id} не найдены.")
+            print(f"⚠️ [BUTTON] Кнопка в посте {post_id} не найдена.")
             return
 
+        # Получаем URL кнопки (если он есть)
         url = getattr(button, 'url', None)
+
+        # --- 2. ПРОВЕРКА НА КАПЧУ / MINI APP (БРАУЗЕР) ---
+        captcha_markers = ["verify", "captcha", "robot", "confirm", "startapp="]
         
+        if url and any(marker in url.lower() for marker in captcha_markers):
+            print(f"🔗 [КНОПКА] Ссылка {url} похожа на капчу. Передаю в браузер...")
+            
+            # Вызываем функцию веб-капчи
+            success = await solve_web_captcha(worker.phone, url)
+            
+            if success:
+                print(f"✅ [ВЕБ-УСПЕХ] Воркер {worker.tg_id} прошел проверку в браузере.")
+            else:
+                print(f"❌ [ВЕБ-ПРОВАЛ] Воркер {worker.tg_id} не смог пройти капчу.")
+            
+            # ВАЖНО: Выходим, так как задача либо решена в вебе, либо провалена
+            return
+
+        # --- 3. ЛОГИКА ТЕЛЕГРАМ-БОТОВ (START PARAM) ---
         if url and "t.me/" in url:
             bot_match = re.search(r"t.me/([\w_]+)\?start=([\w-]+)", url)
             if bot_match:
                 bot_username = bot_match.group(1)
                 start_param = bot_match.group(2)
-                
+
                 from telethon.tl.functions.messages import StartBotRequest
                 await w_client(StartBotRequest(bot=bot_username, peer=bot_username, start_param=start_param))
-                print(f"🤖 [DDDD] Воркер {worker.tg_id} зашел в @{bot_username}")
-
-                # Ожидаем капчу
+                print(f"🤖 [BOT] Воркер {worker.tg_id} запустил бота @{bot_username} с параметром.")
+                
+                # Ожидание примитивной текстовой капчи внутри бота (если она есть)
                 await asyncio.sleep(5) 
                 async for message in w_client.iter_messages(bot_username, limit=1):
                     if message.photo:
-                        print(f"🖼 [DDDD] Фото получено, распознаю...")
+                        print(f"🖼 [BOT] Фото капчи получено, распознаю...")
                         photo_bytes = await w_client.download_media(message.photo, file=bytes)
-                        
+                        import ddddocr
                         ocr = ddddocr.DdddOcr(show_ad=False)
                         captcha_text = ocr.classification(photo_bytes)
                         captcha_digits = "".join(filter(str.isdigit, captcha_text))
-                        
                         if captcha_digits:
-                            print(f"🔢 [DDDD] Распознано: {captcha_digits}. Отправляю...")
                             await w_client.send_message(bot_username, captcha_digits)
-                        else:
-                            print(f"❌ [DDDD] Не удалось выделить цифры в тексте: {captcha_text}")
-            
-            # Если это Mini App (Randomize)
-            elif "startapp=" in url:
-                # (Тут остается твоя логика Mini App из прошлых шагов)
-                pass 
-        else:
-            # Обычный клик (Callback)
+                            print(f"🔢 [BOT] Отправил код: {captcha_digits}")
+                return
+
+        # --- 4. ОБЫЧНЫЙ КЛИК (CALLBACK) ---
+        # Если это не ссылка, а внутренняя кнопка Telegram
+        try:
             await msg_obj.click(0)
-            print(f"✅ [BUTTON] Callback-кнопка нажата.")
-            
+            print(f"✅ [BUTTON] Воркер {worker.tg_id} нажал Callback-кнопку.")
+        except Exception as e:
+            print(f"⚠️ [BUTTON] Обычный клик не удался: {e}")
+
     except Exception as e:
-        print(f"❌ [BUTTON] Ошибка: {e}")
+        print(f"❌ [BUTTON-ERR] Ошибка воркера {worker.tg_id}: {e}")
     finally:
+        await asyncio.sleep(2) # Даем задачам "додышать"
         await w_client.disconnect()
+
 
 async def monitor_luck_emojis(chat_id, post_id):
     """Динамический анализ: запускает десант и останавливает его (Миротворец)"""
@@ -1071,6 +1093,88 @@ async def star_execution_loop():
         except Exception as e:
             print(f"⚠️ [WEB-LOOP-ERR] {e}")
 
+async def human_click(page, selector):
+    """Находит кнопку, наводит на неё и кликает в случайную точку внутри кнопки"""
+    element = page.locator(selector).first
+    box = await element.bounding_box()
+    if box:
+        # Генерируем случайную точку внутри кнопки (не строго в центре)
+        x = box['x'] + box['width'] * random.uniform(0.2, 0.8)
+        y = box['y'] + box['height'] * random.uniform(0.2, 0.8)
+        
+        # Двигаем мышь к этой точке (Playwright делает это плавно)
+        await page.mouse.move(x, y, steps=random.randint(5, 15))
+        await asyncio.sleep(random.uniform(0.5, 1.5))
+        await page.mouse.click(x, y)
+
+# --- ИСПРАВЛЕННЫЙ МОДУЛЬ ПРОХОЖДЕНИЯ ВЕБ-КАПЧИ ---
+async def solve_web_captcha(worker_phone, target_url):
+    """Исправленный модуль: ФИКС URL и пути скриншота"""
+    clean_phone = str(worker_phone).replace("+", "")
+    user_data_dir = f"/var/lib/browser_sessions/session_{clean_phone}"
+    
+    # Путь для команды docker cp (внутри контейнера)
+    screenshot_path = "/app/LAST_CAPTCHA_REPORT.png"
+    
+    async with async_playwright() as p:
+        try:
+            context = await p.chromium.launch_persistent_context(
+                user_data_dir,
+                headless=False, 
+                args=[
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-blink-features=AutomationControlled',
+                    '--use-gl=swiftshader',
+                    '--disable-gpu',
+                    '--disable-web-security'
+                ]
+            )
+            page = await context.new_page()
+            await stealth_async(page)
+            
+            # --- ИСПРАВЛЕННАЯ ЛОГИКА URL ---
+            import re
+            # Вырезаем имя бота
+            bot_match = re.search(r"t.me/([\w_]+)", target_url)
+            bot_name = bot_match.group(1) if bot_match else "Random1zeBot"
+            
+            # Вырезаем параметр старта (ищем после startapp= или startApp=)
+            start_match = re.search(r"start[aA]pp=([\w\-_]+)", target_url)
+            start_param = start_match.group(1) if start_match else ""
+
+            # СТРОГО ПРАВИЛЬНЫЙ ФОРМАТ URL для Telegram Web A
+            # Важно: после .org идет /a/ и правильное экранирование
+            direct_url = f"https://web.telegram.org{bot_name}%26startapp%3D{start_param}"
+            
+            print(f"🌐 [WEB] Переход по исправленному адресу: {direct_url}")
+            
+            # Переходим и ждем
+            await page.goto(direct_url, wait_until="load", timeout=60000)
+            await asyncio.sleep(15) 
+
+            # ДЕЛАЕМ СКРИНШОТ
+            await page.screenshot(path=screenshot_path)
+            print(f"📸 СКРИНШОТ СОЗДАН В /app/LAST_CAPTCHA_REPORT.png")
+
+            # Проверка кнопки Launch
+            launch_btn = page.locator("button:has-text('Launch'), button:has-text('Confirm'), .btn-primary").first
+            if await launch_btn.is_visible():
+                await launch_btn.click()
+                print("🚀 Кнопка Launch нажата")
+                await asyncio.sleep(8)
+                await page.screenshot(path=screenshot_path)
+
+            return True
+
+        except Exception as e:
+            print(f"❌ Ошибка Playwright: {e}")
+            return False
+        finally:
+            if 'context' in locals():
+                await context.close()
+
 
 # --- ЗАПУСК ---
 
@@ -1098,16 +1202,12 @@ async def main():
 
     
     await client.start()
-    
     # 3. Первичная загрузка данных
     KEYWORDS_DATA, MY_WORKERS, CHANNELS_MAP = await load_all_data()
     client.add_event_handler(incoming_private_handler, events.NewMessage(incoming=True, func=lambda e: e.is_private))
-
-    
     # 4. Регистрация обработчика и запуск фонового обновления
     client.add_event_handler(handler, events.NewMessage())
     asyncio.create_task(data_refresher())
-    
     print(f"🚀 Система онлайн. Слов: {len(KEYWORDS_DATA)}, Каналов: {len(CHANNELS_MAP)}")
         # Запускаем "руки" в фоновом режиме
     asyncio.create_task(worker_outgoing_loop())
@@ -1117,18 +1217,14 @@ async def main():
     asyncio.create_task(vote_execution_loop())
     asyncio.create_task(passport_execution_loop()) 
     asyncio.create_task(star_execution_loop())
-
     await client.run_until_disconnected()
-
 # --- ПУНКТ 3: ЗЕРКАЛО ЛС (ПРИЕМ СООБЩЕНИЙ) ---
 async def incoming_private_handler(event):
     sender = await event.get_sender()
     if sender.bot: return 
-
     msg_obj = event.message
     m_type = "text"
     s_media_id = None
-    
     # Если есть медиа — пересылаем в MONITOR_STORAGE
     if msg_obj.photo or msg_obj.voice or msg_obj.video or msg_obj.document:
         try:
@@ -1138,7 +1234,6 @@ async def incoming_private_handler(event):
             m_type = "photo" if msg_obj.photo else "media" # Упростим для примера
         except Exception as e:
             print(f"❌ Ошибка зеркала медиа: {e}")
-
     me = await client.get_me()
     async with async_session() as session_msg:
         from database.models import AccountMessage
@@ -1154,14 +1249,10 @@ async def incoming_private_handler(event):
         session_msg.add(new_msg)
         await session_msg.commit()
     print(f"📩 [ЛС] Сообщение (тип: {m_type}) сохранено.")
-
 async def vote_execution_loop():
-    print("🗳 [ВОРКЕР] Модуль голосований ВКЛЮЧЕН в очередь...") # ЭТОТ ПРИНТ ДОЛЖЕН БЫТЬ
+    print("🗳 [ВОРКЕР] Модуль голосований ВКЛЮЧЕН в очередь...")
     await asyncio.sleep(5) # Даем время на подключение основного клиента
     executed_reports = set()
-    # ... далее остальной код ...
-
-
     while True:
         await asyncio.sleep(20)
         try:
@@ -1173,49 +1264,33 @@ async def vote_execution_loop():
                     WHERE status = 'approved' 
                     AND target_groups\:\:jsonb @> :tag_json\:\:jsonb
                 """)
-            
-                # Параметр передаем как обычно
                 results = await session.execute(sql_query, {"tag_json": f'["{GROUP_TAG}"]'})
                 active_reports = results.all()
-
-
-
-
                 for r_id, msg_id, chat_id, v_type, opt_id, intensity, acc_limit in active_reports:
                     if r_id in executed_reports:
                         continue
-
                     # --- ЗАЩИТА: Проверяем, что вариант (opt_id) не пустой ---
                     if opt_id is None:
                         print(f"⚠️ [ГОЛОС] Пропуск рапорта #{r_id}: не указан вариант (option_id в БД пусто)")
                         executed_reports.add(r_id) # Чтобы не спамить ошибкой
                         continue
-                    
-                    target_emoji = str(opt_id).strip() # Теперь точно будет строка, даже если там число
-                    # -------------------------------------------------------
-
+                    target_emoji = str(opt_id).strip()
                     # Мимикрия (паузы)
                     # --- ИСПРАВЛЕННЫЕ ТАЙМИНГИ (ИНТЕНСИВНОСТЬ) ---
                     delay_map = {1: 600, 2: 300, 3: 120, 4: 30}
                     max_delay = delay_map.get(intensity, 60)
-                    
                     # Гарантируем, что нижняя граница (5с) всегда меньше верхней (max_delay)
                     lower_bound = 5
                     upper_bound = max(max_delay, lower_bound + 1)
-                    
                     wait_before = random.randint(lower_bound, upper_bound)
                     print(f"⏳ [ГОЛОС] Аккаунт {GROUP_TAG} 'читает' канал, подождет {wait_before}с...")
                     await asyncio.sleep(wait_before)
-
-
                     try:
                         await asyncio.sleep(random.uniform(1.5, 4.2))
-
                         if v_type == "poll":
                             from telethon.tl.functions.messages import SendVoteRequest
                             # Используем наш новый метод получения реального ID варианта из сообщения
                             msg_data = await client.get_messages(chat_id, ids=msg_id)
-                            
                             if msg_data and msg_data.poll:
                                 try:
                                     idx = int(target_emoji) - 1 # Оператор ввел 1 -> индекс 0
@@ -1235,11 +1310,9 @@ async def vote_execution_loop():
                                         print(f"❌ [ГОЛОС] Индекс {idx+1} вне диапазона опроса")
                                 except ValueError:
                                     print(f"❌ [ГОЛОС] Ошибка: вариант в опросе должен быть числом, а пришло: {target_emoji}")
-                        
                         else: # РЕАКЦИИ
                             from telethon.tl.functions.messages import SendReactionRequest
                             from telethon.tl.types import ReactionEmoji, ReactionCustomEmoji
-
                             if target_emoji.isdigit():
                                 reaction_obj = [ReactionCustomEmoji(document_id=int(target_emoji))]
                             else:
@@ -1252,15 +1325,10 @@ async def vote_execution_loop():
                             ))
                             executed_reports.add(r_id)
                             print(f"✅ [РЕАКЦИЯ] Поставлена в рапорте #{r_id}")
-
                     except Exception as e:
                         print(f"❌ [ГОЛОС] Ошибка выполнения рапорта #{r_id}: {e}")
-
-
         except Exception as e:
             print(f"⚠️ [ГОЛОС] Ошибка цикла: {e}")
-
-
 if __name__ == "__main__":
     try:
         asyncio.run(main())

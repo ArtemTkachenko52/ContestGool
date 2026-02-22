@@ -7,3 +7,4 @@ ddddocr
 playwright==1.41.0
 pytest-playwright
 aiogram==3.4.1
+playwright-stealth==1.0.6
