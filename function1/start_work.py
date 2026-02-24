@@ -242,8 +242,15 @@ async def single_button_click(worker, chat_id, post_id, msg_obj, delay):
         if url and any(marker in url.lower() for marker in captcha_markers):
             print(f"🔗 [КНОПКА] Ссылка {url} похожа на капчу. Передаю в браузер...")
             
-            # Вызываем функцию веб-капчи
-            success = await solve_web_captcha(worker.phone, url)
+            # Получаем юзернейм канала, чтобы браузер знал куда заходить
+            entity = await w_client.get_entity(chat_id)
+            channel_username = entity.username if hasattr(entity, 'username') else str(chat_id)
+
+            print(f"🔗 [КНОПКА] Капча обнаружена. Запуск браузера для @{channel_username}, пост {post_id}")
+            
+            # ПЕРЕДАЕМ 3 АРГУМЕНТА: телефон, юзернейм и ID поста
+            success = await solve_web_captcha(worker.phone, channel_username, post_id)
+
             
             if success:
                 print(f"✅ [ВЕБ-УСПЕХ] Воркер {worker.tg_id} прошел проверку в браузере.")
@@ -1107,74 +1114,113 @@ async def human_click(page, selector):
         await asyncio.sleep(random.uniform(0.5, 1.5))
         await page.mouse.click(x, y)
 
-# --- ИСПРАВЛЕННЫЙ МОДУЛЬ ПРОХОЖДЕНИЯ ВЕБ-КАПЧИ ---
-async def solve_web_captcha(worker_phone, target_url):
-    """Исправленный модуль: ФИКС URL и пути скриншота"""
+async def solve_web_captcha(worker_phone, target_channel_username, post_id):
+    """
+    Входные данные: телефон воркера, юзернейм канала и ID поста с кнопкой.
+    """
     clean_phone = str(worker_phone).replace("+", "")
+    # Путь к сессии браузера (совпадает с твоим docker-compose)
     user_data_dir = f"/var/lib/browser_sessions/session_{clean_phone}"
     
-    # Путь для команды docker cp (внутри контейнера)
-    screenshot_path = "/app/LAST_CAPTCHA_REPORT.png"
-    
     async with async_playwright() as p:
+        # Запускаем браузер с твоими флагами стелса
+        context = await p.chromium.launch_persistent_context(
+            user_data_dir,
+            headless=True, 
+            args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled']
+        )
+        page = await context.new_page()
+        await stealth_async(page)
+        
         try:
-            context = await p.chromium.launch_persistent_context(
-                user_data_dir,
-                headless=False, 
-                args=[
-                    '--no-sandbox',
-                    '--disable-setuid-sandbox',
-                    '--disable-dev-shm-usage',
-                    '--disable-blink-features=AutomationControlled',
-                    '--use-gl=swiftshader',
-                    '--disable-gpu',
-                    '--disable-web-security'
-                ]
-            )
-            page = await context.new_page()
-            await stealth_async(page)
-            
-            # --- ИСПРАВЛЕННАЯ ЛОГИКА URL ---
-            import re
-            # Вырезаем имя бота
-            bot_match = re.search(r"t.me/([\w_]+)", target_url)
-            bot_name = bot_match.group(1) if bot_match else "Random1zeBot"
-            
-            # Вырезаем параметр старта (ищем после startapp= или startApp=)
-            start_match = re.search(r"start[aA]pp=([\w\-_]+)", target_url)
-            start_param = start_match.group(1) if start_match else ""
+            # 1. Заходим в ТГ Веб
+            await page.goto("https://web.telegram.org", wait_until="networkidle", timeout=60000)
+            await asyncio.sleep(8) # Увеличили паузу для прогрузки интерфейса
+            await page.screenshot(path="/app/step1_web_opened.png")
 
-            # СТРОГО ПРАВИЛЬНЫЙ ФОРМАТ URL для Telegram Web A
-            # Важно: после .org идет /a/ и правильное экранирование
-            direct_url = f"https://web.telegram.org{bot_name}%26startapp%3D{start_param}"
+            # 2. Прямой переход в нужный канал
+            print(f"🌐 [WEB] Переход в канал @{target_channel_username}...")
+            await page.goto(f"https://web.telegram.org#?tgaddr=tg%3A%2F%2Fresolve%3Fdomain%3D{target_channel_username}")
+            await asyncio.sleep(6)
+            await page.screenshot(path="/app/step2_channel_opened.png")
+
+            # 3. Ищем кнопку
+            button = page.locator("button:has-text('Участвовать'), button:has-text('Принять участие'), button:has-text('Участвую')").last
             
-            print(f"🌐 [WEB] Переход по исправленному адресу: {direct_url}")
+            if await button.is_visible():
+                await button.click()
+                print("🔘 [WEB] Клик по кнопке в посте.")
+                await asyncio.sleep(3)
+                await page.screenshot(path="/app/step3_after_click.png")
+            else:
+                print("❌ [WEB] Кнопка не найдена на экране!")
+                return False
+
+            # 4. ПОДТВЕРЖДЕНИЕ ЗАПУСКА (МОДАЛКА ТЕЛЕГРАМА)
+            print("⏳ [WEB] Ожидание окна Launch...")
+            await asyncio.sleep(4)
             
-            # Переходим и ждем
-            await page.goto(direct_url, wait_until="load", timeout=60000)
-            await asyncio.sleep(15) 
+            confirm_selector = "button.popup-button.btn-primary, .modal-dialog button.btn-primary, button:has-text('Launch'), button:has-text('OK'), button:has-text('Открыть')"
+            confirm_btn = page.locator(confirm_selector).first
+            
+            # ИСПРАВЛЕНО: используем is_visible() вместо is_available()
+            if await confirm_btn.is_visible():
+                print("🚀 [WEB] Кнопка подтверждения видна. Нажимаю...")
+                
+                # Попытка 1: Обычный клик с задержкой
+                await confirm_btn.click(delay=500, timeout=5000)
+                
+                # Проверка: если кнопка всё еще видна через 2 секунды, жмем "силой"
+                await asyncio.sleep(2)
+                if await confirm_btn.is_visible():
+                    print("⚠️ [WEB] Кнопка не исчезла. Пробую клик по координатам...")
+                    box = await confirm_btn.bounding_box()
+                    if box:
+                        await page.mouse.click(box['x'] + box['width'] / 2, box['y'] + box['height'] / 2)
+                
+                print("✅ [WEB] Кнопка запуска обработана.")
+                await asyncio.sleep(15) # Ждем загрузку Mini App
+            else:
+                print("⚠️ [WEB] Модалка не найдена (is_visible=False), идем к Iframe.")
 
-            # ДЕЛАЕМ СКРИНШОТ
-            await page.screenshot(path=screenshot_path)
-            print(f"📸 СКРИНШОТ СОЗДАН В /app/LAST_CAPTCHA_REPORT.png")
+            await page.screenshot(path="/app/4.png")
 
-            # Проверка кнопки Launch
-            launch_btn = page.locator("button:has-text('Launch'), button:has-text('Confirm'), .btn-primary").first
-            if await launch_btn.is_visible():
-                await launch_btn.click()
-                print("🚀 Кнопка Launch нажата")
-                await asyncio.sleep(8)
-                await page.screenshot(path=screenshot_path)
 
-            return True
+            # 5. РАБОТА С ВНУТРЕННЕЙ КАПЧЕЙ (ВНУТРИ IFRAME)
+            if await page.locator("iframe").count() > 0:
+                print("🖼 [WEB] Iframe обнаружен. Захожу внутрь...")
+                # Берем фрейм, который реально содержит кнопку (иногда их два)
+                iframe = page.frame_locator("iframe").last 
+                
+                # Список всех возможных текстов на кнопках Random1ze и аналогов
+                # Добавляем "Участвовать", так как в Mini App кнопка может называться так же
+                v_text = re.compile(r"(Verify|Подтвердить|робот|Проверить|Участвовать|Join|Зайти)", re.IGNORECASE)
+                verify_btn = iframe.locator("button, .btn, div[role='button']").filter(has_text=v_text).first
+                
+                try:
+                    # Ждем появления любого кликабельного элемента внутри
+                    await verify_btn.wait_for(state="visible", timeout=15000)
+                    # Скроллим к ней на всякий случай
+                    await verify_btn.scroll_into_view_if_needed()
+                    await verify_btn.click(timeout=5000)
+                    print("✅ [WEB] Финальная кнопка в Mini App НАЖАТА!")
+                    await asyncio.sleep(5)
+                    await page.screenshot(path="/app/5.png")
+                    return True
+                except Exception as e:
+                    print(f"❌ [WEB] Ошибка внутри Iframe: {e}")
+                    await page.screenshot(path="/app/5.png")
+            else:
+                print("❌ [WEB] Iframe не загрузился.")
+                await page.screenshot(path="/app/5.png")
+
 
         except Exception as e:
-            print(f"❌ Ошибка Playwright: {e}")
+            print(f"❌ [WEB-ERR] Ошибка Playwright: {e}")
+            await page.screenshot(path=f"/app/error_{clean_phone}.png")
             return False
         finally:
-            if 'context' in locals():
-                await context.close()
-
+            await context.close()
 
 # --- ЗАПУСК ---
 
