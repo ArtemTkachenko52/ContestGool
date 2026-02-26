@@ -1224,7 +1224,6 @@ async def solve_web_captcha(worker_phone, target_channel_username, post_id):
             await page.screenshot(path="/app/step6_final_check.png")
             return True
 
-
         except Exception as e:
             print(f"❌ [WEB-ERR] Ошибка Playwright: {e}")
             try:

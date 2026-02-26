@@ -14,7 +14,6 @@ RUN apt-get update && apt-get install -y \
     libgbm1 \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-
 WORKDIR /app
 
 # 2. Python зависимости
