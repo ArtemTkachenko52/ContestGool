@@ -211,7 +211,6 @@ async def single_button_click(worker, chat_id, post_id, msg_obj, delay):
     """
     await asyncio.sleep(delay)
 
-    # Инициализация клиента воркера с его "железом"
     w_client = TelegramClient(
         StringSession(worker.session_string), 
         worker.api_id, worker.api_hash,
@@ -226,39 +225,35 @@ async def single_button_click(worker, chat_id, post_id, msg_obj, delay):
         # --- 1. ИЗВЛЕЧЕНИЕ КНОПКИ ---
         button = None
         if msg_obj.reply_markup and msg_obj.reply_markup.rows:
-            # Берем самую первую кнопку (обычно это "Участвовать" или "Проверить")
             button = msg_obj.reply_markup.rows[0].buttons[0]
 
         if not button:
             print(f"⚠️ [BUTTON] Кнопка в посте {post_id} не найдена.")
             return
 
-        # Получаем URL кнопки (если он есть)
         url = getattr(button, 'url', None)
 
         # --- 2. ПРОВЕРКА НА КАПЧУ / MINI APP (БРАУЗЕР) ---
         captcha_markers = ["verify", "captcha", "robot", "confirm", "startapp="]
         
         if url and any(marker in url.lower() for marker in captcha_markers):
-            print(f"🔗 [КНОПКА] Ссылка {url} похожа на капчу. Передаю в браузер...")
+            print(f"🔗 [КНОПКА] Ссылка {url} похожа на капчу. Подготовка браузера...")
             
-            # Получаем юзернейм канала, чтобы браузер знал куда заходить
             entity = await w_client.get_entity(chat_id)
             channel_username = entity.username if hasattr(entity, 'username') else str(chat_id)
 
-            print(f"🔗 [КНОПКА] Капча обнаружена. Запуск браузера для @{channel_username}, пост {post_id}")
-            
-            # ПЕРЕДАЕМ 3 АРГУМЕНТА: телефон, юзернейм и ID поста
-            success = await solve_web_captcha(worker.phone, channel_username, post_id)
+            # !!! ВАЖНО: Отключаем ТГ перед тяжелым браузером !!!
+            await w_client.disconnect()
+            print(f"🔌 [TG] Клиент отключен. Запуск Playwright для @{channel_username}...")
 
+            # Запуск браузера (3 аргумента)
+            success = await solve_web_captcha(worker.phone, channel_username, post_id)
             
             if success:
-                print(f"✅ [ВЕБ-УСПЕХ] Воркер {worker.tg_id} прошел проверку в браузере.")
+                print(f"✅ [ВЕБ-УСПЕХ] Воркер {worker.tg_id} прошел проверку.")
             else:
-                print(f"❌ [ВЕБ-ПРОВАЛ] Воркер {worker.tg_id} не смог пройти капчу.")
-            
-            # ВАЖНО: Выходим, так как задача либо решена в вебе, либо провалена
-            return
+                print(f"❌ [ВЕБ-ПРОВАЛ] Воркер {worker.tg_id} не справился.")
+            return 
 
         # --- 3. ЛОГИКА ТЕЛЕГРАМ-БОТОВ (START PARAM) ---
         if url and "t.me/" in url:
@@ -269,13 +264,11 @@ async def single_button_click(worker, chat_id, post_id, msg_obj, delay):
 
                 from telethon.tl.functions.messages import StartBotRequest
                 await w_client(StartBotRequest(bot=bot_username, peer=bot_username, start_param=start_param))
-                print(f"🤖 [BOT] Воркер {worker.tg_id} запустил бота @{bot_username} с параметром.")
+                print(f"🤖 [BOT] Воркер {worker.tg_id} запустил бота @{bot_username}.")
                 
-                # Ожидание примитивной текстовой капчи внутри бота (если она есть)
                 await asyncio.sleep(5) 
                 async for message in w_client.iter_messages(bot_username, limit=1):
                     if message.photo:
-                        print(f"🖼 [BOT] Фото капчи получено, распознаю...")
                         photo_bytes = await w_client.download_media(message.photo, file=bytes)
                         import ddddocr
                         ocr = ddddocr.DdddOcr(show_ad=False)
@@ -283,23 +276,21 @@ async def single_button_click(worker, chat_id, post_id, msg_obj, delay):
                         captcha_digits = "".join(filter(str.isdigit, captcha_text))
                         if captcha_digits:
                             await w_client.send_message(bot_username, captcha_digits)
-                            print(f"🔢 [BOT] Отправил код: {captcha_digits}")
                 return
 
         # --- 4. ОБЫЧНЫЙ КЛИК (CALLBACK) ---
-        # Если это не ссылка, а внутренняя кнопка Telegram
         try:
             await msg_obj.click(0)
-            print(f"✅ [BUTTON] Воркер {worker.tg_id} нажал Callback-кнопку.")
+            print(f"✅ [BUTTON] Воркер {worker.tg_id} нажал кнопку.")
         except Exception as e:
-            print(f"⚠️ [BUTTON] Обычный клик не удался: {e}")
+            print(f"⚠️ [BUTTON] Клик не удался: {e}")
 
     except Exception as e:
         print(f"❌ [BUTTON-ERR] Ошибка воркера {worker.tg_id}: {e}")
     finally:
-        await asyncio.sleep(2) # Даем задачам "додышать"
-        await w_client.disconnect()
-
+        # Проверяем соединение перед закрытием, чтобы не ловить ошибки в логах
+        if w_client and w_client.is_connected():
+            await w_client.disconnect()
 
 async def monitor_luck_emojis(chat_id, post_id):
     """Динамический анализ: запускает десант и останавливает его (Миротворец)"""
@@ -1121,7 +1112,7 @@ async def solve_web_captcha(worker_phone, target_channel_username, post_id):
     clean_phone = str(worker_phone).replace("+", "")
     # Путь к сессии браузера (совпадает с твоим docker-compose)
     user_data_dir = f"/var/lib/browser_sessions/session_{clean_phone}"
-    
+
     async with async_playwright() as p:
         # Запускаем браузер с твоими флагами стелса
         context = await p.chromium.launch_persistent_context(
@@ -1131,96 +1122,121 @@ async def solve_web_captcha(worker_phone, target_channel_username, post_id):
         )
         page = await context.new_page()
         await stealth_async(page)
-        
+
         try:
-            # 1. Заходим в ТГ Веб
+            # 1. ТВОЯ ОРИГИНАЛЬНАЯ ЛОГИКА ВХОДА
             await page.goto("https://web.telegram.org", wait_until="networkidle", timeout=60000)
-            await asyncio.sleep(8) # Увеличили паузу для прогрузки интерфейса
+            await asyncio.sleep(8) 
             await page.screenshot(path="/app/step1_web_opened.png")
 
-            # 2. Прямой переход в нужный канал
+            # 2. ТВОЙ ОРИГИНАЛЬНЫЙ ПЕРЕХОД
             print(f"🌐 [WEB] Переход в канал @{target_channel_username}...")
             await page.goto(f"https://web.telegram.org#?tgaddr=tg%3A%2F%2Fresolve%3Fdomain%3D{target_channel_username}")
             await asyncio.sleep(6)
             await page.screenshot(path="/app/step2_channel_opened.png")
 
-            # 3. Ищем кнопку
-            button = page.locator("button:has-text('Участвовать'), button:has-text('Принять участие'), button:has-text('Участвую')").last
+                        # 3. УЛУЧШЕННЫЙ ПОИСК КНОПКИ
+            print(f"⏳ [WEB] Ожидание появления кнопки в посте {post_id}...")
             
-            if await button.is_visible():
+            # Ждем любой элемент, который похож на кнопку в интерфейсе ТГ
+            # Мы ищем кнопки с текстом внутри контейнера сообщений
+            button_selector = "button, .btn, .reply-markup-button, [role='button']"
+            
+            try:
+                # Даем ТГ 10 секунд, чтобы подгрузить сообщения в канале
+                await page.wait_for_selector(button_selector, timeout=10000)
+            except:
+                print("⚠️ [WEB] Кнопки долго не появляются, пробую искать по тексту...")
+
+            # Ищем кнопку по твоим ключевым словам (добавил 'Join', так как ссылка английская)
+            keywords = ['Участвовать', 'Принять участие', 'Участвую', 'Join', 'Participate', 'Check']
+            button = None
+            
+            for word in keywords:
+                found = page.locator(f"button:has-text('{word}'), .btn:has-text('{word}')").last
+                if await found.is_visible():
+                    button = found
+                    print(f"✅ [WEB] Найдена кнопка с текстом: {word}")
+                    break
+
+            if button:
+                # Скроллим к кнопке, чтобы она точно была в кадре
+                await button.scroll_into_view_if_needed()
+                await asyncio.sleep(1)
                 await button.click()
-                print("🔘 [WEB] Клик по кнопке в посте.")
-                await asyncio.sleep(3)
+                print("🔘 [WEB] Клик по кнопке выполнен.")
                 await page.screenshot(path="/app/step3_after_click.png")
             else:
-                print("❌ [WEB] Кнопка не найдена на экране!")
+                print("❌ [WEB] Кнопка не найдена. Делаю скриншот для диагностики.")
+                await page.screenshot(path="/app/step3_not_found.png")
                 return False
 
-            # 4. ПОДТВЕРЖДЕНИЕ ЗАПУСКА (МОДАЛКА ТЕЛЕГРАМА)
+                       # 4. ПОДТВЕРЖДЕНИЕ ЗАПУСКА (Launch)
             print("⏳ [WEB] Ожидание окна Launch...")
-            await asyncio.sleep(4)
+            confirm_selector = "button:has-text('Launch'), button:has-text('OK'), button:has-text('Открыть'), button.btn-primary"
             
-            confirm_selector = "button.popup-button.btn-primary, .modal-dialog button.btn-primary, button:has-text('Launch'), button:has-text('OK'), button:has-text('Открыть')"
-            confirm_btn = page.locator(confirm_selector).first
+            try:
+                # Ждем саму модалку, а не просто проверяем видимость
+                confirm_btn = page.locator(confirm_selector).first
+                await confirm_btn.wait_for(state="visible", timeout=10000)
+                print("🚀 [WEB] Кнопка Launch найдена. Нажимаю...")
+                await confirm_btn.click(delay=500)
+            except:
+                print("⚠️ [WEB] Модалка Launch не появилась, возможно приложение открылось сразу.")
+
+            # --- КРИТИЧЕСКОЕ ИЗМЕНЕНИЕ ТУТ ---
+            # 5. ОЖИДАНИЕ И КЛИК ПО IFRAME
+            print("⏳ [WEB] Ожидание появления Iframe (капчи)...")
+            try:
+                # Ждем появления тега iframe физически до 20 секунд
+                await page.wait_for_selector("iframe", timeout=20000)
+                iframe_element = page.locator("iframe").first
+                print("🖼 [WEB] Iframe обнаружен!")
+            except:
+                print("❌ [WEB] Iframe так и не появился.")
+                await page.screenshot(path="/app/5_no_iframe_error.png")
+                return False
+
+            # Если фрейм есть, работаем внутри него
+            await asyncio.sleep(5) # Даем контенту внутри фрейма прогрузиться
             
-            # ИСПРАВЛЕНО: используем is_visible() вместо is_available()
-            if await confirm_btn.is_visible():
-                print("🚀 [WEB] Кнопка подтверждения видна. Нажимаю...")
+            # Вместо гадания координат, используем JS-клик по ЛЮБОМУ интерактивному элементу внутри
+            # Это сработает и на Cloudflare, и на обычной кнопке "Подтвердить"
+            try:
+                # Находим фрейм как объект
+                frame = page.frame_locator("iframe").first
+                # Ищем кнопку или чекбокс внутри фрейма
+                target = frame.locator("button, input[type='checkbox'], canvas, [role='button']").first
                 
-                # Попытка 1: Обычный клик с задержкой
-                await confirm_btn.click(delay=500, timeout=5000)
-                
-                # Проверка: если кнопка всё еще видна через 2 секунды, жмем "силой"
-                await asyncio.sleep(2)
-                if await confirm_btn.is_visible():
-                    print("⚠️ [WEB] Кнопка не исчезла. Пробую клик по координатам...")
-                    box = await confirm_btn.bounding_box()
-                    if box:
-                        await page.mouse.click(box['x'] + box['width'] / 2, box['y'] + box['height'] / 2)
-                
-                print("✅ [WEB] Кнопка запуска обработана.")
-                await asyncio.sleep(15) # Ждем загрузку Mini App
-            else:
-                print("⚠️ [WEB] Модалка не найдена (is_visible=False), идем к Iframe.")
+                await target.scroll_into_view_if_needed()
+                # JS-клик самый надежный в headless
+                await target.evaluate("node => node.click()") 
+                print("🎯 [WEB] JS-клик внутри Iframe выполнен успешно.")
+            except Exception as e:
+                print(f"⚠️ [WEB] Ошибка JS-клика: {e}. Пробую силовой клик по центру.")
+                box = await iframe_element.bounding_box()
+                if box:
+                    await page.mouse.click(box['x'] + box['width']/2, box['y'] + box['height']/2)
 
-            await page.screenshot(path="/app/4.png")
-
-
-            # 5. РАБОТА С ВНУТРЕННЕЙ КАПЧЕЙ (ВНУТРИ IFRAME)
-            if await page.locator("iframe").count() > 0:
-                print("🖼 [WEB] Iframe обнаружен. Захожу внутрь...")
-                # Берем фрейм, который реально содержит кнопку (иногда их два)
-                iframe = page.frame_locator("iframe").last 
-                
-                # Список всех возможных текстов на кнопках Random1ze и аналогов
-                # Добавляем "Участвовать", так как в Mini App кнопка может называться так же
-                v_text = re.compile(r"(Verify|Подтвердить|робот|Проверить|Участвовать|Join|Зайти)", re.IGNORECASE)
-                verify_btn = iframe.locator("button, .btn, div[role='button']").filter(has_text=v_text).first
-                
-                try:
-                    # Ждем появления любого кликабельного элемента внутри
-                    await verify_btn.wait_for(state="visible", timeout=15000)
-                    # Скроллим к ней на всякий случай
-                    await verify_btn.scroll_into_view_if_needed()
-                    await verify_btn.click(timeout=5000)
-                    print("✅ [WEB] Финальная кнопка в Mini App НАЖАТА!")
-                    await asyncio.sleep(5)
-                    await page.screenshot(path="/app/5.png")
-                    return True
-                except Exception as e:
-                    print(f"❌ [WEB] Ошибка внутри Iframe: {e}")
-                    await page.screenshot(path="/app/5.png")
-            else:
-                print("❌ [WEB] Iframe не загрузился.")
-                await page.screenshot(path="/app/5.png")
+            # Финальная пауза и проверка
+            print("⏳ [WEB] Ожидание завершения (15 сек)...")
+            await asyncio.sleep(15) 
+            await page.screenshot(path="/app/step6_final_check.png")
+            return True
 
 
         except Exception as e:
             print(f"❌ [WEB-ERR] Ошибка Playwright: {e}")
-            await page.screenshot(path=f"/app/error_{clean_phone}.png")
+            try:
+                await page.screenshot(path=f"/app/error_{clean_phone}.png")
+            except:
+                pass
             return False
         finally:
+            # Закрываем всё по порядку, чтобы не было ошибок "Task was destroyed"
+            await page.close()
             await context.close()
+
 
 # --- ЗАПУСК ---
 

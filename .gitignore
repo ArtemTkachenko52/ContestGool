@@ -1,0 +1,4 @@
+sessions_storage/
+*.png
+__pycache__/
+.env
