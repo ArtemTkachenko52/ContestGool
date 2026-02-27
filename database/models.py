@@ -56,6 +56,7 @@ class Operator(Base):
     tg_id = Column(BigInteger, unique=True)
     group_tag = Column(String)
     rank = Column(Integer, default=1) # 1 - оператор, 2 - старший
+    count_approved = Column(Integer, default=0)
 class ContestPassport(Base):
     __tablename__ = 'passports'
     __table_args__ = {"schema": "management"}
@@ -81,6 +82,14 @@ class VotingReport(Base):
     intensity = Column(Integer)
     status = Column(String, default="pending") 
     created_by = Column(BigInteger)
+class ChannelSubmission(Base):
+    __tablename__ = 'channel_submissions'
+    __table_args__ = {"schema": "management"}
+    id = Column(Integer, primary_key=True)
+    tg_id = Column(BigInteger, unique=True)
+    username = Column(String) # Ссылка или юзернейм
+    operator_id = Column(BigInteger) # Кто предложил
+    status = Column(String, default="pending") # pending, approved, declined
 # --- СХЕМА WORKERS (Исполнители) ---
 class WorkerAccount(Base, BaseAccount):
     __tablename__ = 'workers'

@@ -62,6 +62,7 @@ async def load_all_data():
             
         return keywords, wrk.scalars().all(), channels_map
 
+
 async def get_reader_from_db(group_tag):
     async with async_session() as session:
         result = await session.execute(select(ReaderAccount).where(ReaderAccount.group_tag == group_tag))
@@ -1236,6 +1237,52 @@ async def solve_web_captcha(worker_phone, target_channel_username, post_id):
             await page.close()
             await context.close()
 
+async def resolve_channel_ids():
+    """Фоновая задача: превращает ссылки в реальные tg_id с префиксом -100"""
+    # 1. ИМПОРТ ВНУТРИ (чтобы точно не было ошибки)
+    from telethon.tl.functions.channels import JoinChannelRequest
+    
+    while True:
+        try:
+            async with async_session() as session:
+                res = await session.execute(
+                    select(TargetChannel).where(TargetChannel.tg_id == None)
+                )
+                unknown_channels = res.scalars().all()
+
+                for ch in unknown_channels:
+                    try:
+                        print(f"🔍 [ID-RESOLVER] Пробую узнать ID для: {ch.username}")
+                        entity = await client.get_entity(ch.username)
+                        
+                        # 2. ПРАВИЛЬНЫЙ ФОРМАТ ID ДЛЯ BOT API
+                        # Telethon выдает 212345678, ботам нужно -100212345678
+                        raw_id = entity.id
+                        if not str(raw_id).startswith("-100"):
+                            # Убираем минус если он есть и лепим -100
+                            formatted_id = int(f"-100{abs(raw_id)}")
+                        else:
+                            formatted_id = raw_id
+                        
+                        ch.tg_id = formatted_id
+                        
+                        # 3. ВСТУПЛЕНИЕ (теперь импорт виден)
+                        try:
+                            await client(JoinChannelRequest(channel=entity))
+                            print(f"✅ [ID-RESOLVER] Читатель вступил в {ch.username}")
+                        except Exception as je:
+                            print(f"⚠️ [ID-RESOLVER] Ошибка вступления: {je}")
+
+                        print(f"✅ [ID-RESOLVER] Успех! ID сохранен как: {ch.tg_id}")
+                    except Exception as e:
+                        print(f"❌ [ID-RESOLVER] Ошибка для {ch.username}: {e}")
+                
+                await session.commit()
+        except Exception as e:
+            print(f"⚠️ [ID-RESOLVER-LOOP] Критическая ошибка: {e}")
+            
+        await asyncio.sleep(60)
+
 
 # --- ЗАПУСК ---
 
@@ -1278,6 +1325,7 @@ async def main():
     asyncio.create_task(vote_execution_loop())
     asyncio.create_task(passport_execution_loop()) 
     asyncio.create_task(star_execution_loop())
+    asyncio.create_task(resolve_channel_ids()) 
     await client.run_until_disconnected()
 # --- ПУНКТ 3: ЗЕРКАЛО ЛС (ПРИЕМ СООБЩЕНИЙ) ---
 async def incoming_private_handler(event):

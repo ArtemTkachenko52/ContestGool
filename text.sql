@@ -72,3 +72,37 @@ CREATE TABLE IF NOT EXISTS management.star_reports (
 
 -- Добавляем колонку в отношения групп и каналов для инвайтинга
 ALTER TABLE management.group_channel_relations ADD COLUMN IF NOT EXISTS invite_started_at TIMESTAMP;
+
+
+
+-- 1. Создаем таблицу для заявок на новые каналы в схеме management
+CREATE TABLE IF NOT EXISTS management.channel_submissions (
+    id SERIAL PRIMARY KEY,
+    tg_id BIGINT UNIQUE,
+    username VARCHAR,
+    operator_id BIGINT,
+    status VARCHAR DEFAULT 'pending'
+);
+
+-- 2. Добавляем колонку счетчика в таблицу операторов, если её там еще нет
+-- (DO блок нужен, чтобы не вылетела ошибка, если колонка уже существует)
+DO $$ 
+BEGIN 
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                   WHERE table_schema='management' 
+                   AND table_name='operators' 
+                   AND column_name='count_approved') THEN
+        ALTER TABLE management.operators ADD COLUMN count_approved INTEGER DEFAULT 0;
+    END IF;
+END $$;
+
+-- 3. На всякий случай проверяем существование таблицы TargetChannel в watcher
+-- Если ты ее уже создавал через init_db, этот шаг просто подтвердит структуру
+CREATE TABLE IF NOT EXISTS watcher.channels (
+    id SERIAL PRIMARY KEY,
+    tg_id BIGINT UNIQUE,
+    username VARCHAR,
+    group_tag VARCHAR,
+    status VARCHAR DEFAULT 'idle',
+    last_read_post_id INTEGER DEFAULT 0
+);

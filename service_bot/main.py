@@ -11,9 +11,9 @@ from database.config import async_session
 from database.models import (
     Operator, PotentialPost, ContestPassport, 
     TargetChannel, VotingReport, StarReport, 
-    GroupChannelRelation, OutgoingMessage, WorkerAccount
+    GroupChannelRelation, OutgoingMessage, WorkerAccount,  ChannelSubmission
 )
-from service_bot.states import ContestForm
+from service_bot.states import ContestForm, ScalerForm
 # Настройки
 BOT_TOKEN = config('BOT_TOKEN')
 bot = Bot(token=BOT_TOKEN)
@@ -77,6 +77,7 @@ async def cmd_start(message: types.Message):
     # Создаем кнопки
     kb = [
         [types.KeyboardButton(text="📥 Получить новый пост")],
+        [types.KeyboardButton(text="➕ Добавить новый ТГК")],
         [types.KeyboardButton(text="📋 Текущие конкурсы")],  # <--- КНОПКА ТУТ
         [types.KeyboardButton(text="📬 ЛС исполнителей")],
         [types.KeyboardButton(text="🔍 Узнать ID реакции"), types.KeyboardButton(text="📊 Статистика")]
@@ -97,6 +98,40 @@ async def cmd_start(message: types.Message):
         reply_markup=keyboard,
         parse_mode="HTML"
     )
+    # --- МАСШТАБИРОВАНИЕ: ПРИЕМ ССЫЛКИ ---
+@dp.message(F.text == "➕ Добавить новый ТГК")
+async def start_add_channel(message: types.Message, state: FSMContext):
+    await state.set_state(ScalerForm.waiting_for_link)
+    await message.answer("🔗 Отправьте <b>ссылку</b> на канал или его <b>@username</b>:", parse_mode="HTML")
+
+@dp.message(ScalerForm.waiting_for_link)
+async def process_channel_link(message: types.Message, state: FSMContext):
+    link = message.text.strip()
+    # Чистим ссылку до юзернейма для проверки дублей
+    clean_username = link.replace("https://t.me", "").replace("@", "")
+    
+    async with async_session() as session:
+        # Проверяем, нет ли уже такого канала в рабочих или в заявках
+        q_check = text("SELECT id FROM watcher.channels WHERE username LIKE :u OR username LIKE :u2")
+        exists = await session.execute(q_check, {"u": f"%{clean_username}%", "u2": f"%{link}%"})
+        
+        if exists.scalar():
+            await message.answer("❌ Этот канал уже есть в работе!")
+            await state.clear()
+            return
+
+        # Создаем заявку для Старшего
+        new_sub = ChannelSubmission(
+            username=link,
+            operator_id=message.from_user.id,
+            status="pending"
+        )
+        session.add(new_sub)
+        await session.commit()
+    
+    await message.answer("✅ <b>Заявка отправлена!</b>\nСтарший оператор проверит её.")
+    await state.clear()
+
 # --- ВЫДАЧА ПОСТА ---
 @dp.message(F.text == "📥 Получить новый пост")
 async def send_new_post(message: types.Message):
@@ -852,6 +887,7 @@ async def admin_panel(message: types.Message):
     builder = InlineKeyboardBuilder()
     builder.row(types.InlineKeyboardButton(text="🗳 Рапорты Голосования", callback_data="adm_list_vote"))
     builder.row(types.InlineKeyboardButton(text="⭐ Рапорты на Звезды", callback_data="adm_list_stars"))
+    builder.row(types.InlineKeyboardButton(text="🔎 Проверка новых ТГК", callback_data="adm_list_new_tgc"))
     builder.row(types.InlineKeyboardButton(text="👥 Заявки на Инвайт", callback_data="adm_list_invite"))
     
     await message.answer(
@@ -1490,6 +1526,55 @@ async def process_ls_reaction(callback: types.CallbackQuery):
         session.add(new_reac)
         await session.commit()
     await callback.answer(f"Задача на реакцию {emoji} создана!")
+@dp.callback_query(F.data == "adm_list_new_tgc")
+async def view_new_channels(callback: types.CallbackQuery):
+    async with async_session() as session:
+        subs = (await session.execute(select(ChannelSubmission).where(ChannelSubmission.status == "pending"))).scalars().all()
+    
+    if not subs:
+        await callback.message.edit_text("📭 Нет новых заявок на ТГК.")
+        return
+
+    for s in subs:
+        builder = InlineKeyboardBuilder()
+        builder.row(
+            types.InlineKeyboardButton(text="✅ Одобрить", callback_data=f"tgc_ok_{s.id}"),
+            types.InlineKeyboardButton(text="❌ Отклонить", callback_data=f"tgc_no_{s.id}")
+        )
+        await callback.message.answer(f"🔎 <b>Заявка на канал:</b>\n🔗 {s.username}", 
+                                     reply_markup=builder.as_markup(), parse_mode="HTML")
+
+@dp.callback_query(F.data.startswith("tgc_"))
+async def decision_channel(callback: types.CallbackQuery):
+    _, decision, sub_id = callback.data.split("_")
+    
+    async with async_session() as session:
+        sub = await session.get(ChannelSubmission, int(sub_id))
+        if not sub: return
+
+        if decision == "ok":
+            # Балансировка: ищем группу, где меньше всего каналов
+            # Используем схему watcher для таблицы channels
+            group_query = text("SELECT group_tag, COUNT(*) as cnt FROM watcher.channels GROUP BY group_tag ORDER BY cnt ASC LIMIT 1")
+            res_group = await session.execute(group_query)
+            best_group = res_group.first()
+            target_group = best_group[0] if best_group else "A1"
+
+            # Добавляем канал в работу
+            new_channel = TargetChannel(username=sub.username, group_tag=target_group, status="idle")
+            session.add(new_channel)
+            
+            # Начисляем бонус оператору
+            await session.execute(update(Operator).where(Operator.tg_id == sub.operator_id).values(count_approved=Operator.count_approved + 1))
+            sub.status = "approved"
+            res_text = f"✅ Одобрено! Канал ушел в группу <b>{target_group}</b>"
+        else:
+            sub.status = "declined"
+            res_text = "❌ Заявка отклонена."
+        
+        await session.commit()
+    await callback.message.edit_text(res_text, parse_mode="HTML")
+
 # --- ЗАПУСК --
 async def main():
     print("🚀 Бот-интерфейс запущен...")

@@ -45,3 +45,5 @@ class ContestForm(StatesGroup):
 
     sharing_to_groups = State() # Выбор групп для пересылки конкурса
     waiting_for_ls_reply = State()
+class ScalerForm(StatesGroup):
+    waiting_for_link = State()
