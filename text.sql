@@ -106,3 +106,6 @@ CREATE TABLE IF NOT EXISTS watcher.channels (
     status VARCHAR DEFAULT 'idle',
     last_read_post_id INTEGER DEFAULT 0
 );
+
+ALTER TABLE workers.workers ADD COLUMN is_configured BOOLEAN DEFAULT FALSE;
+ALTER TABLE workers.workers ADD COLUMN used_asset_id VARCHAR UNIQUE; -- Чтобы не повторять авы/ники

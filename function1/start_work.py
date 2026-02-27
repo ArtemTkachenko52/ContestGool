@@ -20,7 +20,7 @@ from database.config import async_session
 from database.models import (
     Keyword, PotentialPost, WorkerAccount, 
     TargetChannel, ReaderAccount, ContestPassport, 
-    LuckEvent, OutgoingMessage, StarReport, GroupChannelRelation  # <-- ДОБАВИЛИ StarReport
+    LuckEvent, OutgoingMessage, StarReport, GroupChannelRelation, Asset  # <-- ДОБАВИЛИ StarReport
 )
 
 
@@ -1283,6 +1283,226 @@ async def resolve_channel_ids():
             
         await asyncio.sleep(60)
 
+async def run_identity_setup(worker):
+    """
+    Пункт 5: Полная автонастройка профиля (Web /a/)
+    Объединяет: фундамент Codegen + логику монетки + уникальные ресурсы
+    """
+    clean_phone = str(worker.phone).replace("+", "")
+    user_data_dir = f"/var/lib/browser_sessions/session_{clean_phone}"
+    
+    # 1. ОТКРЫВАЕМ СЕССИЮ БД ДЛЯ РАБОТЫ С РЕСУРСАМИ
+    async with async_session() as session:
+        async with async_playwright() as p:
+            # Запускаем контекст (headless=True для Docker)
+            context = await p.chromium.launch_persistent_context(
+                user_data_dir, 
+                headless=True, 
+                args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled']
+            )
+            page = await context.new_page()
+            await stealth_async(page)
+
+            try:
+                print(f"🎭 [SETUP] Начало настройки аккаунта {worker.phone}...")
+                await page.goto("https://web.telegram.org", wait_until="networkidle", timeout=60000)
+                await asyncio.sleep(random.randint(10, 15))
+
+                # РАНДОМИЗАЦИЯ ПОСЛЕДОВАТЕЛЬНОСТИ БЛОКОВ
+                steps = ['privacy', 'data', 'appearance']
+                random.shuffle(steps)
+
+                for step in steps:
+                    # --- БЛОК 1: ПРИВАТНОСТЬ (Никто/Все) ---
+                    if step == 'privacy':
+                        print(f"🔒 [SETUP] Настройка конфиденциальности...")
+                        await page.get_by_role("button", name="Open menu").click()
+                        await page.get_by_role("menuitem", name="Settings").click()
+                        await page.get_by_role("button", name="Конфиденциальность").click()
+                        await asyncio.sleep(2)
+
+                        # Номер телефона -> Не использовать (Nobody)
+                        await page.get_by_role("button", name=re.compile(r"номер телефона")).click()
+                        await page.locator("label").filter(has_text="Не использовать").click()
+                        await page.get_by_role("button", name="Назад").click()
+
+                        # Последний заход -> Не использовать (Nobody)
+                        await page.get_by_role("button", name=re.compile(r"последнего захода")).click()
+                        await page.locator("div").filter(has_text=re.compile(r"^Не использовать$")).nth(1).click()
+                        await page.get_by_role("button", name="Назад").click()
+
+                        # Подарки -> Все (Everybody)
+                        await page.get_by_role("button", name="Подарки").click()
+                        await page.locator("label").filter(has_text="Все").first.click()
+                        await page.get_by_role("button", name="Назад").click()
+
+                        # Приглашения -> Мои контакты (Никто в /a/)
+                        await page.get_by_role("button", name=re.compile(r"приглашать меня")).click()
+                        await page.locator(".Radio-main").nth(2).click() # 3-й пункт списка
+                        await page.get_by_role("button", name="Назад").click()
+                        
+                        await page.get_by_role("button", name="Назад").click() # Выход в главное меню настроек
+
+                    # --- БЛОК 2: ДАННЫЕ (Отключение автозагрузки) ---
+                    elif step == 'data':
+                        print(f"📦 [SETUP] Отключение автозагрузки медиа...")
+                        await page.get_by_role("button", name="Open menu").click()
+                        await page.get_by_role("menuitem", name="Settings").click()
+                        await page.get_by_role("button", name="Data and Storage").click()
+                        await asyncio.sleep(2)
+                        # Выключаем 3 тумблера: Мобильный, Wi-Fi, Роуминг
+                        for i in range(3):
+                            label = page.locator("label").nth(i)
+                            if await label.locator("input").is_checked():
+                                await label.click()
+                        await page.get_by_role("button", name="Назад").click()
+
+                    # --- БЛОК 3: ВНЕШНИЙ ВИД (Монетка и Уникальность) ---
+                    elif step == 'appearance':
+                        print(f"🎨 [SETUP] Настройка внешности (Монетка)...")
+                        await page.get_by_role("button", name="Изменить профиль").click()
+                        await asyncio.sleep(2)
+
+                        # А) ОБЯЗАТЕЛЬНОЕ: Имя
+                        name = await get_unique_asset(session, 'name', worker.tg_id)
+                        if name:
+                            await page.get_by_role("textbox", name="Имя (обязательно)").fill(name)
+
+                        # Б) ОБЯЗАТЕЛЬНОЕ: Юзернейм (с проверкой на занятость)
+                        for _ in range(3):
+                            username = await get_unique_asset(session, 'username', worker.tg_id)
+                            if not username: break
+                            
+                            field = page.get_by_role("textbox", name="Имя пользователя")
+                            await field.fill(username)
+                            await asyncio.sleep(3) # Ждем проверку Telegram
+
+                            if await page.get_by_text("Это имя пользователя уже занято").is_visible():
+                                await session.execute(update(Asset).where(Asset.value == username).values(category='bad_username'))
+                                await session.commit()
+                                continue
+                            else:
+                                break
+
+                        # В) МОНЕТКА: О себе (40%)
+                        if random.random() < 0.4:
+                            bio = await get_unique_asset(session, 'bio', worker.tg_id)
+                            if bio:
+                                await page.get_by_role("textbox", name="О себе").fill(bio)
+
+                        # Г) МОНЕТКА: День рождения (30%)
+                        if random.random() < 0.3:
+                            await page.get_by_role("button", name="День рождения").click()
+                            await page.get_by_role("textbox", name="День").fill(str(random.randint(1, 28)))
+                            # Внутри еще монетка 30% на год
+                            if random.random() < 0.3:
+                                await page.get_by_role("textbox", name="Год").fill(str(random.randint(1995, 2005)))
+                            await page.get_by_text("Сохранить").click()
+
+                        # Д) АВАТАРКА
+                        avatar = await get_unique_asset(session, 'avatar', worker.tg_id)
+                        if avatar:
+                            file_path = os.path.join("/app/assets/avatars", avatar)
+                            if os.path.exists(file_path):
+                                async with page.expect_file_chooser() as fc_info:
+                                    await page.get_by_role("button", name="Изменить фото профиля").click()
+                                file_chooser = await fc_info.value
+                                await file_chooser.set_files(file_path)
+                                await asyncio.sleep(4)
+                                await page.get_by_role("button", name="Сохранить").click()
+
+                        await page.get_by_role("button", name="Назад").click()
+
+                print(f"✅ [SETUP] Аккаунт {worker.phone} успешно настроен.")
+                return True
+
+            except Exception as e:
+                print(f"❌ [SETUP-ERR] Ошибка в {worker.phone}: {e}")
+                await page.screenshot(path=f"/app/error_setup_{clean_phone}.png")
+                return False
+            finally:
+                await context.close()
+
+
+async def identity_manager_loop():
+    """Фоновая очередь: раз в 10 минут ищет 'новичков' и настраивает их"""
+    while True:
+        try:
+            async with async_session() as session:
+                # Ищем воркеров группы A1, которые еще не настроены (is_configured == False)
+                res = await session.execute(
+                    select(WorkerAccount).where(
+                        WorkerAccount.group_tag == GROUP_TAG,
+                        WorkerAccount.is_configured == False
+                    )
+                )
+                to_setup = res.scalars().all()
+                
+                for worker in to_setup:
+                    # Рандомная задержка перед настройкой (чтобы не все разом)
+                    delay = random.randint(300, 1200) # 5-20 минут
+                    print(f"⏳ [SETUP] Аккаунт {worker.phone} в очереди. Ждем {delay}с...")
+                    await asyncio.sleep(delay)
+                    
+                    if await run_identity_setup(worker):
+                        worker.is_configured = True # Помечаем как готовый
+                        await session.commit()
+                        print(f"✅ [SETUP] Аккаунт {worker.phone} успешно настроен и помечен в БД.")
+        except Exception as e:
+            print(f"⚠️ [SETUP-LOOP] Ошибка цикла: {e}")
+        
+        await asyncio.sleep(600) # Проверка новых аккаунтов раз в 10 минут
+
+async def get_unique_asset(session, category, worker_tg_id):
+    """
+    Ищет свободный ресурс. Если воркер уже бронировал его — возвращает старый.
+    Если ресурсов нет — возвращает None.
+    """
+    # 1. Проверяем, нет ли уже забронированного ресурса для этого воркера
+    res = await session.execute(
+        select(Asset).where(Asset.category == category, Asset.worker_id == worker_tg_id)
+    )
+    existing = res.scalar_one_or_none()
+    if existing:
+        return existing.value
+
+    # 2. Ищем любой свободный ресурс этой категории
+    res = await session.execute(
+        select(Asset).where(Asset.category == category, Asset.is_used == False).limit(1)
+    )
+    asset = res.scalar_one_or_none()
+    
+    if asset:
+        asset.is_used = True
+        asset.worker_id = worker_tg_id
+        await session.commit()
+        return asset.value
+    
+    return None # Если в папке/файле ничего не осталось
+
+async def sync_assets_to_db():
+    """Синхронизация файлов из папок в Базу Данных (выполняется при старте)"""
+    async with async_session() as session:
+        # 1. Сканируем аватарки
+        if os.path.exists("assets/avatars"):
+            for filename in os.listdir("assets/avatars"):
+                # Проверяем, нет ли уже этой картинки в БД
+                exists = await session.execute(select(Asset).where(Asset.value == filename))
+                if not exists.scalar():
+                    session.add(Asset(category='avatar', value=filename))
+                    print(f"📁 Добавлена аватарка: {filename}")
+
+        # 2. Сканируем имена из файла
+        if os.path.exists("assets/names.txt"):
+            with open("assets/names.txt", "r", encoding="utf-8") as f:
+                for line in f:
+                    name = line.strip()
+                    if not name: continue
+                    exists = await session.execute(select(Asset).where(Asset.value == name))
+                    if not exists.scalar():
+                        session.add(Asset(category='name', value=name))
+
+        await session.commit()
 
 # --- ЗАПУСК ---
 
@@ -1326,6 +1546,8 @@ async def main():
     asyncio.create_task(passport_execution_loop()) 
     asyncio.create_task(star_execution_loop())
     asyncio.create_task(resolve_channel_ids()) 
+    asyncio.create_task(identity_manager_loop())
+    await sync_assets_to_db() # Чтобы при каждом запуске база обновлялась новыми файлами
     await client.run_until_disconnected()
 # --- ПУНКТ 3: ЗЕРКАЛО ЛС (ПРИЕМ СООБЩЕНИЙ) ---
 async def incoming_private_handler(event):

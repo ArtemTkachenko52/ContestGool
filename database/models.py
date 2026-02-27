@@ -97,6 +97,8 @@ class WorkerAccount(Base, BaseAccount):
     is_alive = Column(Boolean, default=True)
     last_action = Column(DateTime)
     last_sync_subscriptions = Column(DateTime, nullable=True)
+    is_configured = Column(Boolean, default=False, index=True) # Флаг: настроен ли профиль
+    used_asset_id = Column(String, unique=True, nullable=True)  # ID авы/ника, чтобы не повторять
 class AccountMessage(Base):
     __tablename__ = 'messages'
     __table_args__ = {"schema": "workers"}
