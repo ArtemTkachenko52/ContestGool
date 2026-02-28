@@ -191,4 +191,12 @@ class LuckRaid(Base):
     emoji = Column(String)
     status = Column(String, default="active") # active / finished
     created_at = Column(DateTime, server_default=func.now())
+class Asset(Base):
+    __tablename__ = 'assets'
+    __table_args__ = {"schema": "workers"}
+    id = Column(Integer, primary_key=True)
+    category = Column(String)     # 'avatar', 'name', 'username', 'bio'
+    value = Column(String)        # путь к файлу или текст
+    worker_id = Column(BigInteger, unique=True, nullable=True) 
+    is_used = Column(Boolean, default=False)
 
