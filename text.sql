@@ -106,3 +106,18 @@ CREATE TABLE IF NOT EXISTS watcher.channels (
     status VARCHAR DEFAULT 'idle',
     last_read_post_id INTEGER DEFAULT 0
 );
+
+
+
+-- Добавляем колонки в схему workers, таблицу workers
+ALTER TABLE workers.workers ADD COLUMN IF NOT EXISTS stars_balance INTEGER DEFAULT 0;
+ALTER TABLE workers.workers ADD COLUMN IF NOT EXISTS is_financial_ready BOOLEAN DEFAULT FALSE;
+ALTER TABLE workers.workers ADD COLUMN IF NOT EXISTS last_balance_check TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW();
+
+-- Переименовываем колонку для новой логики "окон"
+ALTER TABLE workers.workers RENAME COLUMN last_balance_check TO last_check_window_end;
+
+-- Сбрасываем значения, чтобы старые данные не мешали новой логике
+UPDATE workers.workers SET last_check_window_end = NULL;
+
+ALTER TABLE workers.workers ADD COLUMN IF NOT EXISTS last_inventory_check_window_end TIMESTAMP WITHOUT TIME ZONE;

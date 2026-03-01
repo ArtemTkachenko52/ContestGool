@@ -97,6 +97,11 @@ class WorkerAccount(Base, BaseAccount):
     is_alive = Column(Boolean, default=True)
     last_action = Column(DateTime)
     last_sync_subscriptions = Column(DateTime, nullable=True)
+    stars_balance = Column(Integer, default=0)
+    is_financial_ready = Column(Boolean, default=False)
+    last_check_window_end = Column(DateTime, nullable=True)
+    last_inventory_check_window_end = Column(DateTime, nullable=True)
+
 class AccountMessage(Base):
     __tablename__ = 'messages'
     __table_args__ = {"schema": "workers"}
@@ -189,4 +194,3 @@ class LuckRaid(Base):
     emoji = Column(String)
     status = Column(String, default="active") # active / finished
     created_at = Column(DateTime, server_default=func.now())
-

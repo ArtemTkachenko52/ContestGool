@@ -13,8 +13,8 @@ import io
 from PIL import Image, ImageOps, ImageEnhance
 import os
 from playwright.async_api import async_playwright
+from telethon.tl import functions
 from playwright_stealth import stealth_async
-
 # Импорты из обновленной базы
 from database.config import async_session
 from database.models import (
@@ -22,13 +22,10 @@ from database.models import (
     TargetChannel, ReaderAccount, ContestPassport, 
     LuckEvent, OutgoingMessage, StarReport, GroupChannelRelation  # <-- ДОБАВИЛИ StarReport
 )
-
-
 # Настройки группы (тарелки)
 GROUP_TAG = 'A1' 
 TARGET_GROUP = -1003723379200 
 MONITOR_STORAGE = -1003753624654
-
 # Глобальные кэши данных
 KEYWORDS_DATA = {}
 MY_WORKERS = []
@@ -36,38 +33,28 @@ CHANNELS_MAP = {}
 client = None 
 # Кэш для отслеживания запущенных паспортов, чтобы не запускать их дважды
 ACTIVE_TASKS_CACHE = set() 
-
-
 # --- ФУНКЦИИ БАЗЫ ДАННЫХ ---
-
 async def load_all_data():
     """Загружает всё необходимое из БД для работы мониторинга"""
     async with async_session() as session:
         # 1. Ключевые слова
         kw_query = await session.execute(select(Keyword))
         keywords = {row.word.lower(): row.category for row in kw_query.scalars().all()}
-        
         # 2. Список воркеров группы
         wrk = await session.execute(select(WorkerAccount.tg_id).where(WorkerAccount.group_tag == GROUP_TAG))
-        
         # 3. Каналы для мониторинга
         chn_query = await session.execute(select(TargetChannel).where(TargetChannel.group_tag == GROUP_TAG))
         db_channels = chn_query.scalars().all()
-        
         channels_map = {}
         for c in db_channels:
             # Приоритизируем ID, так как Username может меняться
             key = c.tg_id if c.tg_id else c.username.lower().replace('@', '')
             channels_map[key] = c.status
-            
         return keywords, wrk.scalars().all(), channels_map
-
-
 async def get_reader_from_db(group_tag):
     async with async_session() as session:
         result = await session.execute(select(ReaderAccount).where(ReaderAccount.group_tag == group_tag))
         return result.scalars().first()
-
 async def save_potential_post(storage_id, source_chat_id, source_msg_id, keyword, p_type, pub_date):
     """Сохраняет найденный пост-кандидат на конкурс"""
     async with async_session() as session:
@@ -83,16 +70,13 @@ async def save_potential_post(storage_id, source_chat_id, source_msg_id, keyword
         )
         session.add(new_post)
         await session.commit()
-
 async def check_and_save_reserve(msg, source_id):
     """Улучшенная логика: достаем ссылку даже если её нет в тексте (Пункт 5)"""
     text_content = (msg.message or "").lower()
     has_button = msg.reply_markup is not None
-    
     # 1. Сначала ищем ссылку в тексте через регулярку
     invite_links = re.findall(r"t.me/(?:\+|joinchat/|[\w_]+)", text_content)
     final_link = invite_links[0] if invite_links else None
-
     # 2. Если в тексте пусто, но это публичный канал — вытягиваем юзернейм из метаданных
     if not final_link and msg.fwd_from and msg.fwd_from.from_id:
         try:
@@ -102,7 +86,6 @@ async def check_and_save_reserve(msg, source_id):
                 final_link = f"https://t.me{entity.username}"
         except Exception:
             pass # Если приватный или ошибка доступа — оставляем None
-
     hit = None
     for word in KEYWORDS_DATA.keys():
         if word in text_content:
@@ -110,7 +93,6 @@ async def check_and_save_reserve(msg, source_id):
             break
     if not hit and has_button:
         hit = "кнопка"
-
     if hit:
         async with async_session() as session:
             from database.models import TargetChannel, ReserveChannel
@@ -118,7 +100,6 @@ async def check_and_save_reserve(msg, source_id):
             if not exists.scalar():
                 exists_res = await session.execute(select(ReserveChannel).where(ReserveChannel.tg_id == source_id))
                 res_obj = exists_res.scalar()
-                
                 if not res_obj:
                     new_res = ReserveChannel(
                         tg_id=source_id, 
@@ -129,10 +110,8 @@ async def check_and_save_reserve(msg, source_id):
                     session.add(new_res)
                     await session.commit()
                     print(f"📡 [РЕЗЕРВ] Сохранен ID: {source_id} | Ссылка: {final_link} | Повод: {hit}")
-
 # --- ПУНКТ 1: СПИСОК ФРАЗ ДЛЯ БЫСТРОГО КОММЕНТА ---
 FAST_PHRASES = ["+", ".", "!", "участвую", "тут", "готов", "я", "участвую!", "админ красава"]
-
 async def execute_fast_comment(chat_id, post_id):
     """
     Выбирает 1 случайного воркера из БД и отправляет быстрый комментарий.
@@ -147,11 +126,9 @@ async def execute_fast_comment(chat_id, post_id):
             ).order_by(func.random()).limit(1)
         )
         worker = res.scalar()
-
         if not worker:
             print(f"⚠️ [FAST] Нет живых воркеров в группе {GROUP_TAG} для быстрого ответа.")
             return
-
         # 2. Создаем временное соединение от лица воркера
         # Используем StringSession и данные железа из БД для мимикрии
         w_client = TelegramClient(
@@ -162,7 +139,6 @@ async def execute_fast_comment(chat_id, post_id):
             system_version=worker.os_version,
             app_version=worker.app_version
         )
-        
         try:
             await w_client.connect()
             # 3. Отправляем сообщение именно как комментарий к посту (comment_to)
@@ -175,15 +151,13 @@ async def execute_fast_comment(chat_id, post_id):
         except Exception as e:
             print(f"❌ [FAST] Ошибка при отправке от воркера {worker.tg_id}: {e}")
         finally:
-            await w_client.disconnect()
-            
+            await w_client.disconnect()   
 async def execute_button_click_raid(chat_id, post_id, msg_obj):
     """
     Пункт 2: Нажатие кнопки 5-10 воркерами с рандомной задержкой до 60с.
     """
     # 1. Выбираем случайное количество участников (от 5 до 10)
     count = random.randint(5, 10)
-    
     async with async_session() as session:
         # 2. Берем случайных живых воркеров именно нашей группы
         res = await session.execute(
@@ -193,25 +167,19 @@ async def execute_button_click_raid(chat_id, post_id, msg_obj):
             ).order_by(func.random()).limit(count)
         )
         workers = res.scalars().all()
-
     if not workers:
         print(f"⚠️ [BUTTON] Нет доступных воркеров для нажатия кнопки в посте {post_id}")
         return
-
     print(f"🔘 [BUTTON] Запуск рейда на кнопку для поста {post_id}. Участников: {len(workers)}")
-
     # 3. Для каждого воркера запускаем задачу с индивидуальной задержкой (имитация реальных людей)
     for worker in workers:
         delay = random.randint(5, 55) # Разброс в течение минуты
         asyncio.create_task(single_button_click(worker, chat_id, post_id, msg_obj, delay))
-        
-
 async def single_button_click(worker, chat_id, post_id, msg_obj, delay):
     """
     ЛОГИКА: Вступление + Нажатие + Определение Капчи (Браузер/Бот)
     """
     await asyncio.sleep(delay)
-
     w_client = TelegramClient(
         StringSession(worker.session_string), 
         worker.api_id, worker.api_hash,
@@ -219,54 +187,41 @@ async def single_button_click(worker, chat_id, post_id, msg_obj, delay):
         system_version=worker.os_version,
         app_version=worker.app_version
     )
-
     try:
         await w_client.connect()
-
         # --- 1. ИЗВЛЕЧЕНИЕ КНОПКИ ---
         button = None
         if msg_obj.reply_markup and msg_obj.reply_markup.rows:
             button = msg_obj.reply_markup.rows[0].buttons[0]
-
         if not button:
             print(f"⚠️ [BUTTON] Кнопка в посте {post_id} не найдена.")
             return
-
         url = getattr(button, 'url', None)
-
         # --- 2. ПРОВЕРКА НА КАПЧУ / MINI APP (БРАУЗЕР) ---
         captcha_markers = ["verify", "captcha", "robot", "confirm", "startapp="]
-        
         if url and any(marker in url.lower() for marker in captcha_markers):
             print(f"🔗 [КНОПКА] Ссылка {url} похожа на капчу. Подготовка браузера...")
-            
             entity = await w_client.get_entity(chat_id)
             channel_username = entity.username if hasattr(entity, 'username') else str(chat_id)
-
             # !!! ВАЖНО: Отключаем ТГ перед тяжелым браузером !!!
             await w_client.disconnect()
             print(f"🔌 [TG] Клиент отключен. Запуск Playwright для @{channel_username}...")
-
             # Запуск браузера (3 аргумента)
             success = await solve_web_captcha(worker.phone, channel_username, post_id)
-            
             if success:
                 print(f"✅ [ВЕБ-УСПЕХ] Воркер {worker.tg_id} прошел проверку.")
             else:
                 print(f"❌ [ВЕБ-ПРОВАЛ] Воркер {worker.tg_id} не справился.")
             return 
-
         # --- 3. ЛОГИКА ТЕЛЕГРАМ-БОТОВ (START PARAM) ---
         if url and "t.me/" in url:
             bot_match = re.search(r"t.me/([\w_]+)\?start=([\w-]+)", url)
             if bot_match:
                 bot_username = bot_match.group(1)
                 start_param = bot_match.group(2)
-
                 from telethon.tl.functions.messages import StartBotRequest
                 await w_client(StartBotRequest(bot=bot_username, peer=bot_username, start_param=start_param))
                 print(f"🤖 [BOT] Воркер {worker.tg_id} запустил бота @{bot_username}.")
-                
                 await asyncio.sleep(5) 
                 async for message in w_client.iter_messages(bot_username, limit=1):
                     if message.photo:
@@ -278,68 +233,55 @@ async def single_button_click(worker, chat_id, post_id, msg_obj, delay):
                         if captcha_digits:
                             await w_client.send_message(bot_username, captcha_digits)
                 return
-
         # --- 4. ОБЫЧНЫЙ КЛИК (CALLBACK) ---
         try:
             await msg_obj.click(0)
             print(f"✅ [BUTTON] Воркер {worker.tg_id} нажал кнопку.")
         except Exception as e:
             print(f"⚠️ [BUTTON] Клик не удался: {e}")
-
     except Exception as e:
         print(f"❌ [BUTTON-ERR] Ошибка воркера {worker.tg_id}: {e}")
     finally:
         # Проверяем соединение перед закрытием, чтобы не ловить ошибки в логах
         if w_client and w_client.is_connected():
             await w_client.disconnect()
-
 async def monitor_luck_emojis(chat_id, post_id):
     """Динамический анализ: запускает десант и останавливает его (Миротворец)"""
     from database.models import LuckRaid
     from sqlalchemy import update
-    
     print(f"📊 [УДАЧА] Начало мониторинга поста {post_id}. Окно: 5 минут.")
     LUCK_TEXT_EMOJIS = ['🎰', '🏀', '🎯', '🎲', '🎳', '⚽️']
-    
     start_time = datetime.now()
     timeout = 300 
     raid_activated = False # Флаг, чтобы не создавать рейд повторно в одном цикле
-
     while (datetime.now() - start_time).total_seconds() < timeout:
         await asyncio.sleep(20) 
-        
         unique_users = set()
         emoji_stats = {}
-        
         try:
             async for msg in client.iter_messages(chat_id, reply_to=post_id, limit=100):
                 hit_emoji = None
-                
                 # 1. Проверка на Dice (анимированные)
                 if msg.media and hasattr(msg.media, 'emoticon'):
                     if msg.media.emoticon in LUCK_TEXT_EMOJIS:
                         hit_emoji = msg.media.emoticon
-                
                 # 2. Проверка на Текст
                 if not hit_emoji and msg.message:
                     for emo in LUCK_TEXT_EMOJIS:
                         if emo in msg.message:
                             hit_emoji = emo
                             break
-
                 if hit_emoji and msg.sender_id:
                     # Игнорируем наших воркеров при подсчете активности людей
                     if msg.sender_id not in MY_WORKERS:
                         unique_users.add(msg.sender_id)
                         emoji_stats[hit_emoji] = emoji_stats.get(hit_emoji, 0) + 1
-
             # --- ЛОГИКА ЗАПУСКА ---
             if not raid_activated:
                 # Твои тестовые условия: 1 юзер и 3 эмодзи
                 if len(unique_users) >= 1 and sum(emoji_stats.values()) >= 3:
                     top_emoji = max(emoji_stats, key=emoji_stats.get)
                     print(f"🔥 [УДАЧА] ТРИГГЕР ПРОБИТ! Начинаю десант {top_emoji}...")
-                    
                     async with async_session() as session_start:
                         new_raid = LuckRaid(
                             channel_id=chat_id,
@@ -350,7 +292,6 @@ async def monitor_luck_emojis(chat_id, post_id):
                         session_start.add(new_raid)
                         await session_start.commit()
                     raid_activated = True
-
             # --- ЛОГИКА ОСТАНОВКИ (МИРОТВОРЕЦ) ---
             else:
                 # Если рейд идет, но живые люди прислали меньше 2 эмодзи за последние 20 сек
@@ -365,11 +306,9 @@ async def monitor_luck_emojis(chat_id, post_id):
                         await session_stop.commit()
                     print(f"🏳️ [УДАЧА] Активность людей спала. Рейд для поста {post_id} ОСТАНОВЛЕН.")
                     return # Полностью выходим из мониторинга поста
-
         except Exception as e:
             print(f"⚠️ [УДАЧА] Ошибка мониторинга: {e}")
             break
-
     # Если вышли по таймауту (5 мин), на всякий случай закрываем рейд
     async with async_session() as session_final:
         await session_final.execute(
@@ -377,7 +316,6 @@ async def monitor_luck_emojis(chat_id, post_id):
         )
         await session_final.commit()
     print(f"💤 [УДАЧА] Время мониторинга истекло для поста {post_id}.")
-
 # --- ОБРАБОТЧИК СООБЩЕНИЙ ---
 async def handler(event):
     global KEYWORDS_DATA, MY_WORKERS, CHANNELS_MAP, client
@@ -692,14 +630,154 @@ async def passport_execution_loop():
                 
         except Exception as e:
             print(f"❌ [LOOP] Ошибка в цикле паспортов: {e}")
-
+async def process_gifts_inventory(worker_phone):
+    """
+    Пункт 2: Вход в подарки, продажа обычных подарков.
+    """
+    clean_phone = str(worker_phone).replace("+", "")
+    user_data_dir = f"/var/lib/browser_sessions/session_{clean_phone}"
+    async with async_playwright() as p:
+        context = await p.chromium.launch_persistent_context(
+            user_data_dir, headless=True, args=['--no-sandbox', '--disable-setuid-sandbox']
+        )
+        page = await context.new_page()
+        await stealth_async(page)
+        try:
+            # 1. Переход сразу в раздел подарков (через прямой URL для экономии времени)
+            await page.goto("https://web.telegram.org")
+            await asyncio.sleep(7) 
+            while True:
+                # 2. Ищем первый доступный подарок в сетке
+                gift = page.locator(".interactive-gift").first
+                if await gift.is_visible(timeout=5000):
+                    print(f"🎁 [ИНВЕНТАРЬ] Обнаружен подарок у {clean_phone}. Открываю...")
+                    await gift.click()
+                    await asyncio.sleep(3)
+                    # 3. Пытаемся найти кнопку продажи (Convert to ... Stars)
+                    # Используем регулярку, так как число звезд всегда разное
+                    convert_btn = page.get_by_text(re.compile(r"Convert to \d+ Stars", re.IGNORECASE))
+                    if await convert_btn.is_visible(timeout=3000):
+                        await convert_btn.click()
+                        print(f"💰 [ИНВЕНТАРЬ] Нажал 'Convert'. Ожидание подтверждения...")
+                        await asyncio.sleep(2)
+                        confirm_btn = page.get_by_role("button", name="Confirm")
+                        if await confirm_btn.is_visible():
+                            await confirm_btn.click()
+                            print(f"✅ [ИНВЕНТАРЬ] Подарок продан.")
+                            await asyncio.sleep(4)
+                            # Закрываем финальное окно (Close)
+                            close_btn = page.get_by_role("button", name="Close")
+                            if await close_btn.is_visible(): await close_btn.click()
+                        else:
+                            print("⚠️ [ИНВЕНТАРЬ] Кнопка Confirm не появилась.")
+                            await page.keyboard.press("Escape")
+                    else:
+                        # Если кнопки продажи нет — это NFT (обработаем позже) или ошибка
+                        print("ℹ️ [ИНВЕНТАРЬ] Кнопка продажи не найдена. Пропускаю объект.")
+                        await page.keyboard.press("Escape")
+                        break # Пока выходим, чтобы не зациклиться на одном NFT
+                    await asyncio.sleep(2)
+                else:
+                    print(f"📭 [ИНВЕНТАРЬ] Подарков больше нет.")
+                    break
+        except Exception as e:
+            print(f"❌ [ИНВЕНТАРЬ-ERR] Ошибка Playwright {clean_phone}: {e}")
+        finally:
+            await context.close()
+async def check_stars_balance_api():
+    """
+    Пункт 1: Проверка баланса звезд в рамках 12-часовых окон (00-12 и 12-24).
+    """
+    print(f"💰 [ЭКОНОМИКА] Модуль контроля баланса (ОКНА) запущен для {GROUP_TAG}.")
+    while True:
+        now = datetime.now()
+        # 1. ОПРЕДЕЛЯЕМ ГРАНИЦУ ТЕКУЩЕГО ОКНА
+        # Если сейчас меньше 12:00, окно закончится в 12:00 сегодня.
+        # Если больше 12:00, окно закончится в 00:00 следующего дня.
+        if now.hour < 12:
+            current_window_end = now.replace(hour=12, minute=0, second=0, microsecond=0)
+        else:
+            current_window_end = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        async with async_session() as session:
+            me = await client.get_me()
+            res = await session.execute(
+                select(WorkerAccount).where(WorkerAccount.tg_id == me.id)
+            )
+            worker = res.scalar_one_or_none()
+            if not worker: 
+                await asyncio.sleep(60)
+                continue
+            # 2. ПРОВЕРЯЕМ: Отработано ли текущее окно?
+            # Если в базе записан конец текущего окна, значит в этом промежутке мы уже проверялись.
+            if worker.last_check_window_end == current_window_end:
+                # Ждем до начала следующего окна + небольшой запас (10-30 сек)
+                wait_until_next = (current_window_end - now).total_seconds() + random.randint(10, 30)
+                print(f"💤 [БАЛАНС] {me.id} уже проверялся в этом окне. Сон до {current_window_end}")
+                await asyncio.sleep(wait_until_next)
+                continue
+            # 3. ВЫБИРАЕМ РАНДОМНЫЙ МОМЕНТ В ОСТАВШЕМСЯ ВРЕМЕНИ ОКНА
+            # Считаем сколько секунд осталось до конца окна
+            seconds_remaining = (current_window_end - now).total_seconds()
+            # Выбираем случайное время ожидания ОТ ТЕКУЩЕГО МОМЕНТА до конца окна
+            random_wait = random.uniform(0, seconds_remaining)
+            print(f"⏳ [БАЛАНС] {me.id} выставил проверку через {int(random_wait/60)} мин (внутри окна до {current_window_end})")
+            await asyncio.sleep(random_wait)
+            # 4. ВЫПОЛНЯЕМ ПРОВЕРКУ
+            try:
+                # Теперь вызываем через functions.payments
+                result = await client(functions.payments.GetStarTransactionsRequest(offset='', limit=1))
+                current_balance = result.balance
+                is_ready = current_balance >= 40
+                # Записываем, что окно, заканчивающееся в current_window_end, ВЫПОЛНЕНО
+                await session.execute(
+                    update(WorkerAccount)
+                    .where(WorkerAccount.tg_id == me.id)
+                    .values(
+                        stars_balance=current_balance,
+                        is_financial_ready=is_ready,
+                        last_check_window_end=current_window_end # Помечаем окно как закрытое
+                    )
+                )
+                await session.commit()
+                print(f"✅ [БАЛАНС] {me.id}: {current_balance} ⭐. Окно до {current_window_end} закрыто.")
+            except Exception as e:
+                print(f"❌ [БАЛАНС-ERR] {me.id}: {e}")
+                await asyncio.sleep(300) # При ошибке спим 5 минут и пробуем снова
+async def check_inventory_loop():
+    """Фоновый цикл для проверки подарков раз в 12 часов (по окнам)"""
+    print(f"📦 [ЭКОНОМИКА] Модуль инвентаризации запущен для {GROUP_TAG}.")
+    while True:
+        now = datetime.now()
+        if now.hour < 12:
+            current_window_end = now.replace(hour=12, minute=0, second=0, microsecond=0)
+        else:
+            current_window_end = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        async with async_session() as session:
+            me = await client.get_me()
+            res = await session.execute(select(WorkerAccount).where(WorkerAccount.tg_id == me.id))
+            worker = res.scalar_one_or_none()
+            if not worker or worker.last_inventory_check_window_end == current_window_end:
+                await asyncio.sleep(600) # Проверка раз в 10 мин
+                continue
+            seconds_remaining = (current_window_end - now).total_seconds()
+            random_wait = random.uniform(0, seconds_remaining)
+            print(f"⏳ [ИНВЕНТАРЬ] {me.id} проверит подарки через {int(random_wait/60)} мин.")
+            await asyncio.sleep(random_wait)
+            try:
+                await process_gifts_inventory(me.phone)
+                await session.execute(
+                    update(WorkerAccount).where(WorkerAccount.tg_id == me.id)
+                    .values(last_inventory_check_window_end=current_window_end)
+                )
+                await session.commit()
+            except Exception as e:
+                print(f"❌ [ИНВЕНТАРЬ-LOOP-ERR] {e}")
 async def run_passport_strategy(passport):
     """
     Рассчитывает 'эстафету' и ЗАВЕРШАЕТ паспорт после выполнения.
     """
     intensity_map = {1: 1200, 2: 600, 3: 300, 4: 60}
     slot_duration = intensity_map.get(passport.intensity_level, 600)
-
     async with async_session() as session:
         res = await session.execute(
             select(WorkerAccount).where(
@@ -708,15 +786,12 @@ async def run_passport_strategy(passport):
             ).order_by(WorkerAccount.id)
         )
         workers = res.scalars().all()
-
     if not workers: 
         # Если воркеров нет, выкидываем паспорт из кэша, чтобы попробовать позже
         ACTIVE_TASKS_CACHE.discard(passport.id)
         return
-
     # Список задач (фьючерсов) для отслеживания
     tasks = []
-
     if passport.type == "vote":
         target_id = passport.conditions.get("vote_details", {}).get("executor")
         lead = next((w for w in workers if str(w.tg_id) == str(target_id)), None)
@@ -728,12 +803,10 @@ async def run_passport_strategy(passport):
         for i, worker in enumerate(workers):
             wait_for_slot = i * slot_duration
             tasks.append(asyncio.create_task(delayed_worker_execution(worker, passport, wait_for_slot, slot_duration)))
-
     # --- НОВАЯ ЛОГИКА ЗАВЕРШЕНИЯ ---
     # Ждем, пока ВСЕ запущенные задачи (воркеры) в этой эстафете закончат работу
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
-        
         # Когда все закончили — меняем статус в БД на finished
         async with async_session() as session_fin:
             await session_fin.execute(
@@ -742,35 +815,26 @@ async def run_passport_strategy(passport):
                 .values(status="finished")
             )
             await session_fin.commit()
-        
         print(f"🏁 [ПАСПОРТ] Все задачи по паспорту #{passport.id} ВЫПОЛНЕНЫ. Статус: finished.")
         # Удаляем из локального кэша, чтобы освободить память
         ACTIVE_TASKS_CACHE.discard(passport.id)
-
 async def delayed_worker_execution(worker, passport, initial_delay, slot_limit):
     """Ждет свою очередь в эстафете и запускает выполнение"""
     await asyncio.sleep(initial_delay)
-    
     # Внутри своего 10-минутного окна воркер тоже ждет рандомное время (мимикрия)
     # Например, если окно 600 сек, он начнет в любую секунду от 5-й до 480-й.
     intra_slot_delay = random.randint(5, int(slot_limit * 0.8))
     await asyncio.sleep(intra_slot_delay)
-    
     await execute_single_worker_tasks(worker, passport)
-
 # --- ОБНОВЛЕННАЯ ФУНКЦИЯ С БЛОКОМ КОММЕНТАРИЕВ ---
-
 async def execute_single_worker_tasks(worker, passport, is_lead=False):
     conds = passport.conditions
     actions = conds.get("selected", [])
-    
     target_chat = conds.get("source_tg_id")
     target_msg = conds.get("source_msg_id")
-
     # Список фраз для обычных комментариев (мимикрия)
     # Можно будет позже вынести в БД
     COMMON_PHRASES = ["участвую", "+", "го", "хочу приз", "удачи всем", "🍀", "надеюсь на победу", "🔥", "инвест"]
-
     w_client = TelegramClient(
         StringSession(worker.session_string), 
         worker.api_id, worker.api_hash,
@@ -778,20 +842,16 @@ async def execute_single_worker_tasks(worker, passport, is_lead=False):
         system_version=worker.os_version,
         app_version=worker.app_version
     )
-    
     try:
         await w_client.connect()
         random.shuffle(actions)
-
         for action in actions:
             await asyncio.sleep(random.randint(15, 45))
-
             # 1. ПОДПИСКА
             if action == "sub":
                 links = conds.get("sub_links", "").split()
                 for link in links:
                     await join_channel_smart(w_client, link)
-
             # 2. РЕАКЦИЯ
             elif action == "reac" and target_chat and target_msg:
                 try:
@@ -804,12 +864,10 @@ async def execute_single_worker_tasks(worker, passport, is_lead=False):
                     ))
                     print(f"✅ [РЕАКЦИЯ] Воркер {worker.tg_id} поставил эмодзи.")
                 except: pass
-
             # 3. РЕПОСТ
             elif action == "repost" and target_chat and target_msg:
                 count = int(conds.get("repost_count", 1))
                 await perform_network_reposts(w_client, target_chat, target_msg, count)
-
             # 4. КОММЕНТАРИЙ (ТО, ЧЕГО НЕ ХВАТАЛО)
             elif action == "comm" and target_chat and target_msg:
                 try:
@@ -822,7 +880,6 @@ async def execute_single_worker_tasks(worker, passport, is_lead=False):
                     print(f"✅ [КОММЕНТ] Воркер {worker.tg_id} оставил комментарий.")
                 except Exception as e:
                     print(f"❌ [КОММЕНТ] Ошибка воркера {worker.tg_id}: {e}")
-
         # Если АФК - нажимаем кнопку участия
         if passport.type == "afk" and target_chat and target_msg:
             try:
@@ -832,36 +889,28 @@ async def execute_single_worker_tasks(worker, passport, is_lead=False):
                     await single_button_click(worker, target_chat, target_msg, msg_obj, 0)
             except Exception as e:
                 print(f"❌ [КНОПКА] Ошибка: {e}")
-
                 # Если ГОЛОСОВАНИЕ (лид-регистрация)
         if is_lead:
             details = conds.get("vote_details", {})
             place = details.get("reg_place", "")
             content = details.get("reg_data", "")
             media_id = details.get("reg_media_id") # Получаем ID из хранилища
-            
             target = place.replace("ЛС ", "").replace("@", "")
-            
             # Подготовка объекта для отправки (текст или медиа из хранилища)
             msg_to_send = content
             if media_id:
                 # Берем медиа из мониторинга
                 storage_msg = await w_client.get_messages(MONITOR_STORAGE, ids=media_id)
                 msg_to_send = storage_msg # Весь объект сообщения (фото + текст)
-
             if "Комментарии" in place:
                 await w_client.send_message(target_chat, msg_to_send, comment_to=target_msg)
             else:
                 await w_client.send_message(target, msg_to_send)
-            
             print(f"✅ [ГОЛОС] Лид {worker.tg_id} отправил заявку (с медиа: {bool(media_id)}) в {place}")
-
     except Exception as e:
         print(f"❌ [ИСПОЛНИТЕЛЬ {worker.tg_id}] Критическая ошибка: {e}")
     finally:
         await w_client.disconnect()
-
-
 async def join_channel_smart(client, link):
     """Проверяет подписку перед тем как подписаться (Пункт 1)"""
     try:
@@ -1091,31 +1140,23 @@ async def star_execution_loop():
                     ACTIVE_GIFTS_CACHE.discard(report.id)
         except Exception as e:
             print(f"⚠️ [WEB-LOOP-ERR] {e}")
-
 async def human_click(page, selector):
     """Находит кнопку, наводит на неё и кликает в случайную точку внутри кнопки"""
     element = page.locator(selector).first
     box = await element.bounding_box()
     if box:
-        # Генерируем случайную точку внутри кнопки (не строго в центре)
         x = box['x'] + box['width'] * random.uniform(0.2, 0.8)
         y = box['y'] + box['height'] * random.uniform(0.2, 0.8)
-        
-        # Двигаем мышь к этой точке (Playwright делает это плавно)
         await page.mouse.move(x, y, steps=random.randint(5, 15))
         await asyncio.sleep(random.uniform(0.5, 1.5))
         await page.mouse.click(x, y)
-
 async def solve_web_captcha(worker_phone, target_channel_username, post_id):
     """
     Входные данные: телефон воркера, юзернейм канала и ID поста с кнопкой.
     """
     clean_phone = str(worker_phone).replace("+", "")
-    # Путь к сессии браузера (совпадает с твоим docker-compose)
     user_data_dir = f"/var/lib/browser_sessions/session_{clean_phone}"
-
     async with async_playwright() as p:
-        # Запускаем браузер с твоими флагами стелса
         context = await p.chromium.launch_persistent_context(
             user_data_dir,
             headless=True, 
@@ -1123,45 +1164,32 @@ async def solve_web_captcha(worker_phone, target_channel_username, post_id):
         )
         page = await context.new_page()
         await stealth_async(page)
-
         try:
             # 1. ТВОЯ ОРИГИНАЛЬНАЯ ЛОГИКА ВХОДА
             await page.goto("https://web.telegram.org", wait_until="networkidle", timeout=60000)
             await asyncio.sleep(8) 
             await page.screenshot(path="/app/step1_web_opened.png")
-
             # 2. ТВОЙ ОРИГИНАЛЬНЫЙ ПЕРЕХОД
             print(f"🌐 [WEB] Переход в канал @{target_channel_username}...")
             await page.goto(f"https://web.telegram.org#?tgaddr=tg%3A%2F%2Fresolve%3Fdomain%3D{target_channel_username}")
             await asyncio.sleep(6)
             await page.screenshot(path="/app/step2_channel_opened.png")
-
                         # 3. УЛУЧШЕННЫЙ ПОИСК КНОПКИ
             print(f"⏳ [WEB] Ожидание появления кнопки в посте {post_id}...")
-            
-            # Ждем любой элемент, который похож на кнопку в интерфейсе ТГ
-            # Мы ищем кнопки с текстом внутри контейнера сообщений
             button_selector = "button, .btn, .reply-markup-button, [role='button']"
-            
             try:
-                # Даем ТГ 10 секунд, чтобы подгрузить сообщения в канале
                 await page.wait_for_selector(button_selector, timeout=10000)
             except:
                 print("⚠️ [WEB] Кнопки долго не появляются, пробую искать по тексту...")
-
-            # Ищем кнопку по твоим ключевым словам (добавил 'Join', так как ссылка английская)
             keywords = ['Участвовать', 'Принять участие', 'Участвую', 'Join', 'Participate', 'Check']
             button = None
-            
             for word in keywords:
                 found = page.locator(f"button:has-text('{word}'), .btn:has-text('{word}')").last
                 if await found.is_visible():
                     button = found
                     print(f"✅ [WEB] Найдена кнопка с текстом: {word}")
                     break
-
             if button:
-                # Скроллим к кнопке, чтобы она точно была в кадре
                 await button.scroll_into_view_if_needed()
                 await asyncio.sleep(1)
                 await button.click()
@@ -1171,25 +1199,19 @@ async def solve_web_captcha(worker_phone, target_channel_username, post_id):
                 print("❌ [WEB] Кнопка не найдена. Делаю скриншот для диагностики.")
                 await page.screenshot(path="/app/step3_not_found.png")
                 return False
-
                        # 4. ПОДТВЕРЖДЕНИЕ ЗАПУСКА (Launch)
             print("⏳ [WEB] Ожидание окна Launch...")
             confirm_selector = "button:has-text('Launch'), button:has-text('OK'), button:has-text('Открыть'), button.btn-primary"
-            
             try:
-                # Ждем саму модалку, а не просто проверяем видимость
                 confirm_btn = page.locator(confirm_selector).first
                 await confirm_btn.wait_for(state="visible", timeout=10000)
                 print("🚀 [WEB] Кнопка Launch найдена. Нажимаю...")
                 await confirm_btn.click(delay=500)
             except:
                 print("⚠️ [WEB] Модалка Launch не появилась, возможно приложение открылось сразу.")
-
-            # --- КРИТИЧЕСКОЕ ИЗМЕНЕНИЕ ТУТ ---
             # 5. ОЖИДАНИЕ И КЛИК ПО IFRAME
             print("⏳ [WEB] Ожидание появления Iframe (капчи)...")
             try:
-                # Ждем появления тега iframe физически до 20 секунд
                 await page.wait_for_selector("iframe", timeout=20000)
                 iframe_element = page.locator("iframe").first
                 print("🖼 [WEB] Iframe обнаружен!")
@@ -1197,20 +1219,11 @@ async def solve_web_captcha(worker_phone, target_channel_username, post_id):
                 print("❌ [WEB] Iframe так и не появился.")
                 await page.screenshot(path="/app/5_no_iframe_error.png")
                 return False
-
-            # Если фрейм есть, работаем внутри него
-            await asyncio.sleep(5) # Даем контенту внутри фрейма прогрузиться
-            
-            # Вместо гадания координат, используем JS-клик по ЛЮБОМУ интерактивному элементу внутри
-            # Это сработает и на Cloudflare, и на обычной кнопке "Подтвердить"
+            await asyncio.sleep(5)
             try:
-                # Находим фрейм как объект
                 frame = page.frame_locator("iframe").first
-                # Ищем кнопку или чекбокс внутри фрейма
                 target = frame.locator("button, input[type='checkbox'], canvas, [role='button']").first
-                
                 await target.scroll_into_view_if_needed()
-                # JS-клик самый надежный в headless
                 await target.evaluate("node => node.click()") 
                 print("🎯 [WEB] JS-клик внутри Iframe выполнен успешно.")
             except Exception as e:
@@ -1218,13 +1231,10 @@ async def solve_web_captcha(worker_phone, target_channel_username, post_id):
                 box = await iframe_element.bounding_box()
                 if box:
                     await page.mouse.click(box['x'] + box['width']/2, box['y'] + box['height']/2)
-
-            # Финальная пауза и проверка
             print("⏳ [WEB] Ожидание завершения (15 сек)...")
             await asyncio.sleep(15) 
             await page.screenshot(path="/app/step6_final_check.png")
             return True
-
         except Exception as e:
             print(f"❌ [WEB-ERR] Ошибка Playwright: {e}")
             try:
@@ -1233,10 +1243,8 @@ async def solve_web_captcha(worker_phone, target_channel_username, post_id):
                 pass
             return False
         finally:
-            # Закрываем всё по порядку, чтобы не было ошибок "Task was destroyed"
             await page.close()
             await context.close()
-
 async def resolve_channel_ids():
     """Фоновая задача: превращает ссылки в реальные tg_id с префиксом -100"""
     # 1. ИМПОРТ ВНУТРИ (чтобы точно не было ошибки)
@@ -1325,7 +1333,9 @@ async def main():
     asyncio.create_task(vote_execution_loop())
     asyncio.create_task(passport_execution_loop()) 
     asyncio.create_task(star_execution_loop())
-    asyncio.create_task(resolve_channel_ids()) 
+    asyncio.create_task(resolve_channel_ids())
+    asyncio.create_task(check_stars_balance_api()) 
+    asyncio.create_task(check_inventory_loop())
     await client.run_until_disconnected()
 # --- ПУНКТ 3: ЗЕРКАЛО ЛС (ПРИЕМ СООБЩЕНИЙ) ---
 async def incoming_private_handler(event):
