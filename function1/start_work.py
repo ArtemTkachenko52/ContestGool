@@ -11,10 +11,12 @@ import re
 import ddddocr
 import io
 from PIL import Image, ImageOps, ImageEnhance
+from telethon import events
+from telethon.tl.types import MessageActionGiftStars
 import os
 from playwright.async_api import async_playwright
 from playwright_stealth import stealth_async
-
+from telethon.tl.functions.payments import GetStarsStatusRequest
 # Импорты из обновленной базы
 from database.config import async_session
 from database.models import (
@@ -22,13 +24,10 @@ from database.models import (
     TargetChannel, ReaderAccount, ContestPassport, 
     LuckEvent, OutgoingMessage, StarReport, GroupChannelRelation, Asset  # <-- ДОБАВИЛИ StarReport
 )
-
-
 # Настройки группы (тарелки)
 GROUP_TAG = 'A1' 
 TARGET_GROUP = -1003723379200 
 MONITOR_STORAGE = -1003753624654
-
 # Глобальные кэши данных
 KEYWORDS_DATA = {}
 MY_WORKERS = []
@@ -36,38 +35,28 @@ CHANNELS_MAP = {}
 client = None 
 # Кэш для отслеживания запущенных паспортов, чтобы не запускать их дважды
 ACTIVE_TASKS_CACHE = set() 
-
-
 # --- ФУНКЦИИ БАЗЫ ДАННЫХ ---
-
 async def load_all_data():
     """Загружает всё необходимое из БД для работы мониторинга"""
     async with async_session() as session:
         # 1. Ключевые слова
         kw_query = await session.execute(select(Keyword))
         keywords = {row.word.lower(): row.category for row in kw_query.scalars().all()}
-        
         # 2. Список воркеров группы
         wrk = await session.execute(select(WorkerAccount.tg_id).where(WorkerAccount.group_tag == GROUP_TAG))
-        
         # 3. Каналы для мониторинга
         chn_query = await session.execute(select(TargetChannel).where(TargetChannel.group_tag == GROUP_TAG))
         db_channels = chn_query.scalars().all()
-        
         channels_map = {}
         for c in db_channels:
             # Приоритизируем ID, так как Username может меняться
             key = c.tg_id if c.tg_id else c.username.lower().replace('@', '')
             channels_map[key] = c.status
-            
         return keywords, wrk.scalars().all(), channels_map
-
-
 async def get_reader_from_db(group_tag):
     async with async_session() as session:
         result = await session.execute(select(ReaderAccount).where(ReaderAccount.group_tag == group_tag))
         return result.scalars().first()
-
 async def save_potential_post(storage_id, source_chat_id, source_msg_id, keyword, p_type, pub_date):
     """Сохраняет найденный пост-кандидат на конкурс"""
     async with async_session() as session:
@@ -83,16 +72,13 @@ async def save_potential_post(storage_id, source_chat_id, source_msg_id, keyword
         )
         session.add(new_post)
         await session.commit()
-
 async def check_and_save_reserve(msg, source_id):
     """Улучшенная логика: достаем ссылку даже если её нет в тексте (Пункт 5)"""
     text_content = (msg.message or "").lower()
     has_button = msg.reply_markup is not None
-    
     # 1. Сначала ищем ссылку в тексте через регулярку
     invite_links = re.findall(r"t.me/(?:\+|joinchat/|[\w_]+)", text_content)
     final_link = invite_links[0] if invite_links else None
-
     # 2. Если в тексте пусто, но это публичный канал — вытягиваем юзернейм из метаданных
     if not final_link and msg.fwd_from and msg.fwd_from.from_id:
         try:
@@ -102,7 +88,6 @@ async def check_and_save_reserve(msg, source_id):
                 final_link = f"https://t.me{entity.username}"
         except Exception:
             pass # Если приватный или ошибка доступа — оставляем None
-
     hit = None
     for word in KEYWORDS_DATA.keys():
         if word in text_content:
@@ -110,7 +95,6 @@ async def check_and_save_reserve(msg, source_id):
             break
     if not hit and has_button:
         hit = "кнопка"
-
     if hit:
         async with async_session() as session:
             from database.models import TargetChannel, ReserveChannel
@@ -118,7 +102,6 @@ async def check_and_save_reserve(msg, source_id):
             if not exists.scalar():
                 exists_res = await session.execute(select(ReserveChannel).where(ReserveChannel.tg_id == source_id))
                 res_obj = exists_res.scalar()
-                
                 if not res_obj:
                     new_res = ReserveChannel(
                         tg_id=source_id, 
@@ -129,10 +112,8 @@ async def check_and_save_reserve(msg, source_id):
                     session.add(new_res)
                     await session.commit()
                     print(f"📡 [РЕЗЕРВ] Сохранен ID: {source_id} | Ссылка: {final_link} | Повод: {hit}")
-
 # --- ПУНКТ 1: СПИСОК ФРАЗ ДЛЯ БЫСТРОГО КОММЕНТА ---
 FAST_PHRASES = ["+", ".", "!", "участвую", "тут", "готов", "я", "участвую!", "админ красава"]
-
 async def execute_fast_comment(chat_id, post_id):
     """
     Выбирает 1 случайного воркера из БД и отправляет быстрый комментарий.
@@ -147,11 +128,9 @@ async def execute_fast_comment(chat_id, post_id):
             ).order_by(func.random()).limit(1)
         )
         worker = res.scalar()
-
         if not worker:
             print(f"⚠️ [FAST] Нет живых воркеров в группе {GROUP_TAG} для быстрого ответа.")
             return
-
         # 2. Создаем временное соединение от лица воркера
         # Используем StringSession и данные железа из БД для мимикрии
         w_client = TelegramClient(
@@ -162,7 +141,6 @@ async def execute_fast_comment(chat_id, post_id):
             system_version=worker.os_version,
             app_version=worker.app_version
         )
-        
         try:
             await w_client.connect()
             # 3. Отправляем сообщение именно как комментарий к посту (comment_to)
@@ -175,15 +153,13 @@ async def execute_fast_comment(chat_id, post_id):
         except Exception as e:
             print(f"❌ [FAST] Ошибка при отправке от воркера {worker.tg_id}: {e}")
         finally:
-            await w_client.disconnect()
-            
+            await w_client.disconnect()   
 async def execute_button_click_raid(chat_id, post_id, msg_obj):
     """
     Пункт 2: Нажатие кнопки 5-10 воркерами с рандомной задержкой до 60с.
     """
     # 1. Выбираем случайное количество участников (от 5 до 10)
     count = random.randint(5, 10)
-    
     async with async_session() as session:
         # 2. Берем случайных живых воркеров именно нашей группы
         res = await session.execute(
@@ -193,25 +169,19 @@ async def execute_button_click_raid(chat_id, post_id, msg_obj):
             ).order_by(func.random()).limit(count)
         )
         workers = res.scalars().all()
-
     if not workers:
         print(f"⚠️ [BUTTON] Нет доступных воркеров для нажатия кнопки в посте {post_id}")
         return
-
     print(f"🔘 [BUTTON] Запуск рейда на кнопку для поста {post_id}. Участников: {len(workers)}")
-
     # 3. Для каждого воркера запускаем задачу с индивидуальной задержкой (имитация реальных людей)
     for worker in workers:
         delay = random.randint(5, 55) # Разброс в течение минуты
         asyncio.create_task(single_button_click(worker, chat_id, post_id, msg_obj, delay))
-        
-
 async def single_button_click(worker, chat_id, post_id, msg_obj, delay):
     """
     ЛОГИКА: Вступление + Нажатие + Определение Капчи (Браузер/Бот)
     """
     await asyncio.sleep(delay)
-
     w_client = TelegramClient(
         StringSession(worker.session_string), 
         worker.api_id, worker.api_hash,
@@ -219,54 +189,41 @@ async def single_button_click(worker, chat_id, post_id, msg_obj, delay):
         system_version=worker.os_version,
         app_version=worker.app_version
     )
-
     try:
         await w_client.connect()
-
         # --- 1. ИЗВЛЕЧЕНИЕ КНОПКИ ---
         button = None
         if msg_obj.reply_markup and msg_obj.reply_markup.rows:
             button = msg_obj.reply_markup.rows[0].buttons[0]
-
         if not button:
             print(f"⚠️ [BUTTON] Кнопка в посте {post_id} не найдена.")
             return
-
         url = getattr(button, 'url', None)
-
         # --- 2. ПРОВЕРКА НА КАПЧУ / MINI APP (БРАУЗЕР) ---
         captcha_markers = ["verify", "captcha", "robot", "confirm", "startapp="]
-        
         if url and any(marker in url.lower() for marker in captcha_markers):
             print(f"🔗 [КНОПКА] Ссылка {url} похожа на капчу. Подготовка браузера...")
-            
             entity = await w_client.get_entity(chat_id)
             channel_username = entity.username if hasattr(entity, 'username') else str(chat_id)
-
             # !!! ВАЖНО: Отключаем ТГ перед тяжелым браузером !!!
             await w_client.disconnect()
             print(f"🔌 [TG] Клиент отключен. Запуск Playwright для @{channel_username}...")
-
             # Запуск браузера (3 аргумента)
             success = await solve_web_captcha(worker.phone, channel_username, post_id)
-            
             if success:
                 print(f"✅ [ВЕБ-УСПЕХ] Воркер {worker.tg_id} прошел проверку.")
             else:
                 print(f"❌ [ВЕБ-ПРОВАЛ] Воркер {worker.tg_id} не справился.")
             return 
-
         # --- 3. ЛОГИКА ТЕЛЕГРАМ-БОТОВ (START PARAM) ---
         if url and "t.me/" in url:
             bot_match = re.search(r"t.me/([\w_]+)\?start=([\w-]+)", url)
             if bot_match:
                 bot_username = bot_match.group(1)
                 start_param = bot_match.group(2)
-
                 from telethon.tl.functions.messages import StartBotRequest
                 await w_client(StartBotRequest(bot=bot_username, peer=bot_username, start_param=start_param))
                 print(f"🤖 [BOT] Воркер {worker.tg_id} запустил бота @{bot_username}.")
-                
                 await asyncio.sleep(5) 
                 async for message in w_client.iter_messages(bot_username, limit=1):
                     if message.photo:
@@ -278,68 +235,55 @@ async def single_button_click(worker, chat_id, post_id, msg_obj, delay):
                         if captcha_digits:
                             await w_client.send_message(bot_username, captcha_digits)
                 return
-
         # --- 4. ОБЫЧНЫЙ КЛИК (CALLBACK) ---
         try:
             await msg_obj.click(0)
             print(f"✅ [BUTTON] Воркер {worker.tg_id} нажал кнопку.")
         except Exception as e:
             print(f"⚠️ [BUTTON] Клик не удался: {e}")
-
     except Exception as e:
         print(f"❌ [BUTTON-ERR] Ошибка воркера {worker.tg_id}: {e}")
     finally:
         # Проверяем соединение перед закрытием, чтобы не ловить ошибки в логах
         if w_client and w_client.is_connected():
             await w_client.disconnect()
-
 async def monitor_luck_emojis(chat_id, post_id):
     """Динамический анализ: запускает десант и останавливает его (Миротворец)"""
     from database.models import LuckRaid
     from sqlalchemy import update
-    
     print(f"📊 [УДАЧА] Начало мониторинга поста {post_id}. Окно: 5 минут.")
     LUCK_TEXT_EMOJIS = ['🎰', '🏀', '🎯', '🎲', '🎳', '⚽️']
-    
     start_time = datetime.now()
     timeout = 300 
     raid_activated = False # Флаг, чтобы не создавать рейд повторно в одном цикле
-
     while (datetime.now() - start_time).total_seconds() < timeout:
         await asyncio.sleep(20) 
-        
         unique_users = set()
         emoji_stats = {}
-        
         try:
             async for msg in client.iter_messages(chat_id, reply_to=post_id, limit=100):
                 hit_emoji = None
-                
                 # 1. Проверка на Dice (анимированные)
                 if msg.media and hasattr(msg.media, 'emoticon'):
                     if msg.media.emoticon in LUCK_TEXT_EMOJIS:
                         hit_emoji = msg.media.emoticon
-                
                 # 2. Проверка на Текст
                 if not hit_emoji and msg.message:
                     for emo in LUCK_TEXT_EMOJIS:
                         if emo in msg.message:
                             hit_emoji = emo
                             break
-
                 if hit_emoji and msg.sender_id:
                     # Игнорируем наших воркеров при подсчете активности людей
                     if msg.sender_id not in MY_WORKERS:
                         unique_users.add(msg.sender_id)
                         emoji_stats[hit_emoji] = emoji_stats.get(hit_emoji, 0) + 1
-
             # --- ЛОГИКА ЗАПУСКА ---
             if not raid_activated:
                 # Твои тестовые условия: 1 юзер и 3 эмодзи
                 if len(unique_users) >= 1 and sum(emoji_stats.values()) >= 3:
                     top_emoji = max(emoji_stats, key=emoji_stats.get)
                     print(f"🔥 [УДАЧА] ТРИГГЕР ПРОБИТ! Начинаю десант {top_emoji}...")
-                    
                     async with async_session() as session_start:
                         new_raid = LuckRaid(
                             channel_id=chat_id,
@@ -350,7 +294,6 @@ async def monitor_luck_emojis(chat_id, post_id):
                         session_start.add(new_raid)
                         await session_start.commit()
                     raid_activated = True
-
             # --- ЛОГИКА ОСТАНОВКИ (МИРОТВОРЕЦ) ---
             else:
                 # Если рейд идет, но живые люди прислали меньше 2 эмодзи за последние 20 сек
@@ -365,11 +308,9 @@ async def monitor_luck_emojis(chat_id, post_id):
                         await session_stop.commit()
                     print(f"🏳️ [УДАЧА] Активность людей спала. Рейд для поста {post_id} ОСТАНОВЛЕН.")
                     return # Полностью выходим из мониторинга поста
-
         except Exception as e:
             print(f"⚠️ [УДАЧА] Ошибка мониторинга: {e}")
             break
-
     # Если вышли по таймауту (5 мин), на всякий случай закрываем рейд
     async with async_session() as session_final:
         await session_final.execute(
@@ -377,24 +318,20 @@ async def monitor_luck_emojis(chat_id, post_id):
         )
         await session_final.commit()
     print(f"💤 [УДАЧА] Время мониторинга истекло для поста {post_id}.")
-
 # --- ОБРАБОТЧИК СООБЩЕНИЙ ---
 async def handler(event):
     global KEYWORDS_DATA, MY_WORKERS, CHANNELS_MAP, client
     msg = event.message 
     current_chat_id = event.chat_id
     pub_date = msg.date.replace(tzinfo=None)
-
     # --- ПУНКТ 5: РЕЗЕРВНЫЕ КАНАЛЫ (РЕПОСТЫ) ---
     if msg.fwd_from:
         if hasattr(msg.fwd_from.from_id, 'channel_id'):
             asyncio.create_task(check_and_save_reserve(msg, msg.fwd_from.from_id.channel_id))
         return # Репосты не мониторим как основные посты
-
     # --- ПРОВЕРКА КАНАЛА ---
     if current_chat_id not in CHANNELS_MAP:
         return
-
         # --- ПУНКТ 1: ПОИСК УПОМИНАНИЯ ---
     if msg.entities:
         for ent in msg.entities:
@@ -407,10 +344,8 @@ async def handler(event):
                     user_entity = await client.get_entity(mention_text)
                     target_id = user_entity.id
                 except: continue
-
             if target_id and target_id in MY_WORKERS:
                 print(f"🎯 [МЕНШЕН] Наш воркер {target_id} упомянут в посте {msg.id}!")
-                
                 # --- ЗАПИСЬ В БАЗУ ДАННЫХ ---
                 from database.models import MentionTask
                 async with async_session() as session_ment:
@@ -424,16 +359,12 @@ async def handler(event):
                     await session_ment.commit()
                 print(f"💾 [БАЗА] Задача на ответ для воркера {target_id} создана в mention_tasks.")
                 # ----------------------------
-
                 if not (msg.replies and msg.replies.replies is not None):
                     print(f"⚠️ [ВНИМАНИЕ] Комментарии закрыты! Оператор, воркер не сможет ответить.")
-
     # --- ПУНКТ 2: ЗАПУСК МОНИТОРИНГА УДАЧИ ---
     asyncio.create_task(monitor_luck_emojis(current_chat_id, msg.id))
-
     # --- ТВОЯ ЛОГИКА (Блок 1 и 2) ---
     text = (msg.message or "").lower()
-
     # --- БЛОК 1: ЗЕРКАЛО (Для ленты в Текущих) ---
     if CHANNELS_MAP[current_chat_id] == "active_monitor":
         try:
@@ -448,11 +379,9 @@ async def handler(event):
             )
         except Exception as e:
             print(f"❌ Ошибка зеркала: {e}")
-
         # --- БЛОК 2: ФИЛЬТР (Для кнопки "Получить новый пост") ---
     hit_keyword = None
     post_type = "keyword"
-
     for word, category in KEYWORDS_DATA.items():
         if word in text:
             hit_keyword = word
@@ -465,12 +394,9 @@ async def handler(event):
                 post_type = "keyword"
             # ---------------------------
             break
-
-
     if not hit_keyword and msg.reply_markup:
         hit_keyword = "AUTO: BUTTON_DETECTED"
         post_type = "button"
-
     if hit_keyword:
         try:
             fwd_t = await msg.forward_to(TARGET_GROUP)
@@ -482,21 +408,16 @@ async def handler(event):
                 p_type=post_type,
                 pub_date=pub_date
             )
-            
             # --- РЕАЛИЗАЦИЯ ПУНКТА 2 (КНОПКИ) ---
             # Если в посте есть кнопки и это НЕ просто зеркало мониторинга
             if msg.reply_markup and post_type != "monitoring":
                 # Запускаем фоновую задачу рейда
                 asyncio.create_task(execute_button_click_raid(current_chat_id, msg.id, msg))
             # ------------------------------------
-
             print(f"🔥 Найдена цель: {hit_keyword}")
         except Exception as e:
             print(f"❌ Ошибка сохранения цели: {e}")
-
-
 # --- ЦИКЛ ОБНОВЛЕНИЯ ДАННЫХ ---
-
 async def data_refresher():
     """Фоновая задача для частого обновления данных из БД"""
     global KEYWORDS_DATA, MY_WORKERS, CHANNELS_MAP
@@ -508,10 +429,8 @@ async def data_refresher():
             # print("🔄 Данные синхронизированы") 
         except Exception as e:
             print(f"⚠️ Ошибка обновления данных: {e}")
-        
         # Ставим 10-15 секунд вместо 300 (5 минут)
         await asyncio.sleep(5) 
-
 # --- ПУНКТ 3: РУКИ (ОТПРАВКА ИСХОДЯЩИХ) ---
 async def worker_outgoing_loop():
     while True:
@@ -523,14 +442,11 @@ async def worker_outgoing_loop():
                 OutgoingMessage.worker_tg_id == me.id, 
                 OutgoingMessage.status == "pending"
             ))).scalars().all()
-
             for task in tasks:
                 try:
                     receiver = await client.get_input_entity(task.receiver_id)
-                    
                     # ПУНКТ 1: ПОМЕТКА ПРОЧИТАННЫМ (Всегда при ответе)
                     await client.send_read_acknowledge(receiver)
-
                     # ПУНКТ 3: РЕАКЦИИ
                     if task.task_type == "reaction":
                         await client(SendReactionRequest(
@@ -539,69 +455,56 @@ async def worker_outgoing_loop():
                             reaction=[ReactionEmoji(emoticon=task.reaction_data)]
                         ))
                         print(f"✅ [РЕАКЦИЯ] Поставил {task.reaction_data}")
-
                     # ПУНКТ 2: ТЕКСТ И МЕДИА
                     elif task.task_type == "text":
                         async with client.action(receiver, 'typing'):
                             await asyncio.sleep(random.randint(3, 7))
                             await client.send_message(receiver, task.text, reply_to=task.reply_to_msg_id)
-                    
                                         # ПУНКТ 2: ТЕКСТ
                     elif task.task_type == "text":
                         if not task.text: raise Exception("Пустое текстовое сообщение")
                         async with client.action(receiver, 'typing'):
                             await asyncio.sleep(random.randint(3, 7))
                             await client.send_message(receiver, task.text, reply_to=task.reply_to_msg_id)
-                    
                     # ПУНКТ 4: МЕДИА (ФОТО/ГС/ВИДЕО)
                     elif task.task_type == "media":
                         print(f"🖼 [РУКИ] Пересылка медиа из хранилища для {task.receiver_id}...")
-                        
                         # Копируем сообщение из хранилища напрямую пользователю
                         # send_message с объектом сообщения — это самый чистый способ
                         storage_msg = await client.get_messages(MONITOR_STORAGE, ids=task.storage_msg_id)
-                        
                         await client.send_message(
                             receiver,
                             storage_msg, # Передаем весь объект сообщения (фото+текст)
                             reply_to=task.reply_to_msg_id
                         )
-
-
                     task.status = "sent"
                 except Exception as e:
                     print(f"❌ [ОШИБКА РУК]: {e}")
                     task.status = "error"
             await session.commit()
-
-
 # --- ПУНКТ 1: РУКИ (АВТО-КОММЕНТАРИЙ ПРИ УПОМИНАНИИ) ---
 async def worker_mention_task_loop():
     """Следит за таблицей упоминаний и отвечает в комменты"""
     print("💬 [РУКИ] Модуль авто-комментариев запущен.")
     # Список фраз для рандома (потом вынесем в БД)
     RANDOM_PHRASES = ["мать те трахал", "здохни", "сука", "да", "тут", "бабку помой", "бля тут"]
-
     while True:
         await asyncio.sleep(15) # Проверка раз в 15 секунд
         async with async_session() as session:
             from database.models import MentionTask
             me = await client.get_me()
-            
             # Ищем задачи для нашего аккаунта
             query = select(MentionTask).where(
                 MentionTask.worker_tg_id == me.id,
                 MentionTask.status == "pending"
             )
             tasks = (await session.execute(query)).scalars().all()
-
             for task in tasks:
                 try:
                     # Рандомная задержка (мимикрия)
                     delay = random.randint(10, 45)
                     print(f"⏳ [КОММЕНТ] Отвечу в пост {task.post_id} через {delay}с...")
                     await asyncio.sleep(delay)
-
                     # Пишем комментарий
                     # Telethon автоматически находит группу обсуждения через reply_to
                     await client.send_message(
@@ -609,15 +512,12 @@ async def worker_mention_task_loop():
                         message=random.choice(RANDOM_PHRASES),
                         comment_to=task.post_id
                     )
-                    
                     task.status = "completed"
                     print(f"✅ [КОММЕНТ] Успешно ответил на упоминание в посте {task.post_id}")
                 except Exception as e:
                     print(f"❌ [КОММЕНТ] Ошибка: {e}")
                     task.status = "error"
-            
             await session.commit()
-
 # --- ПУНКТ 2: РУКИ (ДЕСАНТ УДАЧИ) ---
 async def worker_luck_raid_loop():
     print("🎯 [РУКИ] Модуль десанта удачи запущен.")
@@ -627,19 +527,15 @@ async def worker_luck_raid_loop():
             from database.models import LuckRaid
             # Ищем только активные рейды
             active_raids = (await session.execute(select(LuckRaid).where(LuckRaid.status == "active"))).scalars().all()
-
             for raid in active_raids:
                 me = await client.get_me()
-                
                 # ИМИТАЦИЯ: Шанс 30%, что этот воркер вступит в этот цикл (так мы получим 3-5 юзеров)
                 if random.random() > 0.3: 
                     continue
-
                 try:
                     delay = random.randint(15, 60) # Увеличили паузы для беспалевности
                     print(f"🎰 [ДЕСАНТ] Аккаунт {me.id} подкинет {raid.emoji} через {delay}с...")
                     await asyncio.sleep(delay)
-                    
                     # ПУНКТ 3: ОТПРАВКА АНИМИРОВАННОГО КУБИКА (УНИВЕРСАЛЬНО)
                     if raid.emoji in ['🎰', '🎯', '🎲', '🏀', '⚽️', '🎳']:
                         from telethon.tl.types import InputMediaDice
@@ -654,21 +550,16 @@ async def worker_luck_raid_loop():
                             raid.emoji, 
                             comment_to=raid.post_id
                         )
-
-                        
                     print(f"✅ [ДЕСАНТ] Аккаунт {me.id} успешно высадился.")
                 except Exception as e:
                     print(f"❌ [ДЕСАНТ] Ошибка: {e}")
-
 # --- ЛОГИКА ВЫПОЛНЕНИЯ ЗАДАЧ ИЗ ПАСПОРТА (Пункт 1) ---
-
 async def passport_execution_loop():
     """
     Улучшенный цикл выполнения задач. 
     Запускает стратегию для паспорта только один раз.
     """
     print(f"⚙️ [ВОРКЕР {GROUP_TAG}] Двигатель задач запущен.")
-    
     while True:
         await asyncio.sleep(30) # Проверяем чуть чаще
         try:
@@ -678,28 +569,22 @@ async def passport_execution_loop():
                     ContestPassport.status == "active"
                 )
                 active_passports = (await session.execute(query)).scalars().all()
-
             for passport in active_passports:
                 # ПРОВЕРКА: Если этот паспорт уже запущен в работу — пропускаем
                 if passport.id in ACTIVE_TASKS_CACHE:
                     continue
-                
                 print(f"🚀 [ЗАПУСК] Начинаю выполнение паспорта #{passport.id}")
                 ACTIVE_TASKS_CACHE.add(passport.id)
-                
                 # Запускаем выполнение
                 asyncio.create_task(run_passport_strategy(passport))
-                
         except Exception as e:
             print(f"❌ [LOOP] Ошибка в цикле паспортов: {e}")
-
 async def run_passport_strategy(passport):
     """
     Рассчитывает 'эстафету' и ЗАВЕРШАЕТ паспорт после выполнения.
     """
     intensity_map = {1: 1200, 2: 600, 3: 300, 4: 60}
     slot_duration = intensity_map.get(passport.intensity_level, 600)
-
     async with async_session() as session:
         res = await session.execute(
             select(WorkerAccount).where(
@@ -708,15 +593,12 @@ async def run_passport_strategy(passport):
             ).order_by(WorkerAccount.id)
         )
         workers = res.scalars().all()
-
     if not workers: 
         # Если воркеров нет, выкидываем паспорт из кэша, чтобы попробовать позже
         ACTIVE_TASKS_CACHE.discard(passport.id)
         return
-
     # Список задач (фьючерсов) для отслеживания
     tasks = []
-
     if passport.type == "vote":
         target_id = passport.conditions.get("vote_details", {}).get("executor")
         lead = next((w for w in workers if str(w.tg_id) == str(target_id)), None)
@@ -728,12 +610,10 @@ async def run_passport_strategy(passport):
         for i, worker in enumerate(workers):
             wait_for_slot = i * slot_duration
             tasks.append(asyncio.create_task(delayed_worker_execution(worker, passport, wait_for_slot, slot_duration)))
-
     # --- НОВАЯ ЛОГИКА ЗАВЕРШЕНИЯ ---
     # Ждем, пока ВСЕ запущенные задачи (воркеры) в этой эстафете закончат работу
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
-        
         # Когда все закончили — меняем статус в БД на finished
         async with async_session() as session_fin:
             await session_fin.execute(
@@ -742,11 +622,9 @@ async def run_passport_strategy(passport):
                 .values(status="finished")
             )
             await session_fin.commit()
-        
         print(f"🏁 [ПАСПОРТ] Все задачи по паспорту #{passport.id} ВЫПОЛНЕНЫ. Статус: finished.")
         # Удаляем из локального кэша, чтобы освободить память
         ACTIVE_TASKS_CACHE.discard(passport.id)
-
 async def delayed_worker_execution(worker, passport, initial_delay, slot_limit):
     """Ждет свою очередь в эстафете и запускает выполнение"""
     await asyncio.sleep(initial_delay)
@@ -966,131 +844,107 @@ async def invite_handler_loop():
 # Кэш для защиты от повторных запусков одного и того же рапорта
 ACTIVE_GIFTS_CACHE = set()
 
-async def send_gift_via_web(worker_phone, target_username, gift_type):
-    """
-    ОТПРАВКА ПОДАРКА ЧЕРЕЗ TELEGRAM WEB /A/ (ПО КОДУ CODEGEN)
-    """
+async def send_gift_via_web(worker_phone, target_username, gift_type, is_warmup=False):
+    """is_warmup=True добавит только ЖИВУЮ подпись БЕЗ триггеров"""
     clean_phone = str(worker_phone).replace("+", "")
     user_data_dir = f"/var/lib/browser_sessions/session_{clean_phone}"
-
-    print(f"📂 [WEB] Запуск браузера /A/ для {clean_phone}...")
-
+    
     async with async_playwright() as p:
-        context = None
+        context = await p.chromium.launch_persistent_context(
+            user_data_dir, headless=True, slow_mo=1000,
+            args=['--no-sandbox', '--disable-setuid-sandbox']
+        )
+        page = await context.new_page()
         try:
-            context = await p.chromium.launch_persistent_context(
-                user_data_dir,
-                headless=True,
-                slow_mo=1200, # Немного медленнее для стабильности
-                args=['--no-sandbox', '--disable-setuid-sandbox']
-            )
-            page = await context.new_page()
-
-            # 1. ЗАХОДИМ В /A/
-            await page.goto("https://web.telegram.org/a/", wait_until="networkidle", timeout=60000)
-            await asyncio.sleep(6)
-
-            # 2. ПОИСК ПО ТВОЕМУ МЕТОДУ
-            print(f"🔍 [WEB] Ищу {target_username}...")
+            await page.goto("https://web.telegram.org", timeout=60000)
+            await asyncio.sleep(8)
+            
+            # Поиск юзера и выбор подарка (код как у тебя)
             search_box = page.get_by_role("textbox", name="Search")
-            await search_box.wait_for(state="visible", timeout=15000)
             await search_box.click()
             await search_box.fill(target_username)
             await search_box.press("Enter")
             await asyncio.sleep(4)
-
-            # Выбор чата из результатов
-            # Используем твой селектор "Fedor Maslo last" (универсально через 'last')
             await page.get_by_role("button").filter(has_text=re.compile(r"last", re.IGNORECASE)).first.click()
-            await asyncio.sleep(2)
-
-            # 3. ОТКРЫТИЕ МЕНЮ
+            
             await page.get_by_role("button", name="More actions").click()
             await page.get_by_role("menuitem", name="Send a Gift").click()
-            await asyncio.sleep(5)
-
-            # 4. ВЫБОР ПОДАРКА (ПО ТВОИМ ИНДЕКСАМ)
-            # Мы сопоставим твой выбор с индексами из записи
-            # 🧸 Медведь (в записи был 5-й по счету ️)
-            # 🌹 Роза (️25, 2-й) | 💐 Букет (️50, 2-й) | 🏆 Кубок (️100, 1-й)
-            
-            print(f"🎁 [WEB] Выбираю подарок: {gift_type}")
-            
-            if "Медведь" in gift_type:
-                await page.get_by_role("button", name="️").nth(5).click()
-            elif "Роза" in gift_type:
-                await page.get_by_role("button", name="️25").nth(2).click()
-            elif "Букет" in gift_type:
-                await page.get_by_role("button", name="️50").nth(2).click()
-            elif "Кубок" in gift_type:
-                await page.get_by_role("button", name="️100").first.click()
-            else:
-                # Если не совпало, просто кликаем первый доступный
-                await page.get_by_role("button", name="️").first.click()
-
             await asyncio.sleep(3)
+            
+            idx = 5 if "Медведь" in gift_type else 3
+            await page.get_by_role("button", name="️").nth(idx).click()
+            await asyncio.sleep(2)
 
-            # 5. ФИНАЛЬНАЯ КНОПКА (ТВОЙ СЕЛЕКТОР)
-            # Ты нажал на "Send a Gift for ️"
+            # --- ЛОГИКА ПОДПИСИ (ЧИСТАЯ МИМИКРИЯ) ---
+            if is_warmup:
+                phrases = ["На удачу!", "Лови!", "Прогрев аккаунта.", "Держи медведя!", "Удачи в розыгрыше!"]
+                clean_msg = random.choice(phrases) # НИКАКИХ "СИГНАЛ:ПОДАРОК" ТУТ!
+                msg_field = page.get_by_role("textbox", name="Enter Message (Optional)")
+                if await msg_field.is_visible():
+                    await msg_field.fill(clean_msg)
+                    print(f"✍️ [WEB] Вписана живая подпись: {clean_msg}")
+
+            # Кнопка оплаты
             send_btn = page.get_by_role("button", name=re.compile(r"Send a Gift for", re.IGNORECASE))
+            await send_btn.click()
+            await asyncio.sleep(5)
             
-            if await send_btn.is_visible():
-                print("🔘 [WEB] Нажимаю финальную кнопку отправки...")
-                await send_btn.click()
-                await asyncio.sleep(5)
-                
-                # Проверка: если кнопка всё еще видна — значит баланс 0 или ошибка
-                if await send_btn.is_visible():
-                    print("❌ [WEB] Подарок не ушел (Баланс звезд 0 или ошибка оплаты)")
-                    return False
-                
-                print(f"✅ [WEB] РАПОРТ ВЫПОЛНЕН.")
-                return True
-            
-            return False
-
+            return not await send_btn.is_visible()
         except Exception as e:
-            print(f"❌ [WEB-ERR] Ошибка: {e}")
-            if 'page' in locals():
-                await page.screenshot(path=f"/app/DEBUG_GIFT_{clean_phone}.png")
+            print(f"❌ [WEB-ERR] {e}")
             return False
         finally:
-            if context:
-                await context.close()
-
+            await context.close()
 async def star_execution_loop():
-    """Бесконечный цикл проверки рапортов на подарки"""
-    print(f"⭐ [ВОРКЕР {GROUP_TAG}] Модуль подарков (WEB) активен.")
+    print(f"⭐ [ВОРКЕР {GROUP_TAG}] Модуль подарков активен.")
     while True:
-        await asyncio.sleep(60)
+        await asyncio.sleep(30) # Проверяем чаще, раз в 30 сек
         try:
             async with async_session() as session:
                 me = await client.get_me()
+                # Упрощаем запрос: ищем ЛЮБЫЕ задачи со статусом approved для нашего ID
                 query = select(StarReport).where(
-                    StarReport.status == 'approved',
-                    StarReport.executor_id == me.id
+                    StarReport.executor_id == me.id,
+                    StarReport.status.in_(['approved', 'approved_warmup', 'pending']) # Добавили pending для страховки
                 )
                 reports = (await session.execute(query)).scalars().all()
-
+                
+                # ДОБАВЬ ЭТОТ ПРИНТ - он покажет в логах, видит ли воркер задачу
+                if reports:
+                    print(f"🔍 [DEBUG] Воркер {me.id} НАШЕЛ {len(reports)} задач на отправку звезд/подарков!")
+                
                 for report in reports:
-                    if report.id in ACTIVE_GIFTS_CACHE: continue
+                    # Сразу меняем статус на 'processing', чтобы другие воркеры не перехватили
+                    report.status = "processing"
+                    await session.commit()
                     
-                    ACTIVE_GIFTS_CACHE.add(report.id)
-                    print(f"💰 [WEB-PROCESS] Обработка рапорта #{report.id}...")
+                    is_warmup = (report.status == "approved_warmup") or (report.passport_id == 0)
+                    # ... дальше твой код с send_gift_via_web ...
+
+                    # 1. Отправляем подарок через Браузер (подпись будет чистой)
+                    success = await send_gift_via_web(
+                        str(me.phone), 
+                        report.target_user, 
+                        report.method, 
+                        is_warmup=is_warmup
+                    )
                     
-                    success = await send_gift_via_web(str(me.phone), report.target_user, report.method)
-                    
-                    # Финальное обновление статуса
-                    async with async_session() as session_upd:
-                        new_status = "completed" if success else "error"
-                        await session_upd.execute(
-                            update(StarReport).where(StarReport.id == report.id).values(status=new_status)
-                        )
-                        await session_upd.commit()
-                    
-                    ACTIVE_GIFTS_CACHE.discard(report.id)
+                    if success:
+                        # 2. Если это прогрев — СРАЗУ шлем триггер в ЛС через Telethon
+                        if is_warmup:
+                            try:
+                                await client.send_message(report.target_user, "СИГНАЛ:ПОДАРОК")
+                                print(f"📡 [SIGNAL] Триггер отправлен в ЛС {report.target_user}")
+                            except Exception as se:
+                                print(f"⚠️ Ошибка сигнала: {se}")
+                        
+                        report.status = "completed"
+                    else:
+                        report.status = "error"
+                        
+                    await session.commit()
         except Exception as e:
-            print(f"⚠️ [WEB-LOOP-ERR] {e}")
+            print(f"⚠️ [STAR-LOOP-ERR] {e}")
 
 async def human_click(page, selector):
     """Находит кнопку, наводит на неё и кликает в случайную точку внутри кнопки"""
@@ -1100,12 +954,10 @@ async def human_click(page, selector):
         # Генерируем случайную точку внутри кнопки (не строго в центре)
         x = box['x'] + box['width'] * random.uniform(0.2, 0.8)
         y = box['y'] + box['height'] * random.uniform(0.2, 0.8)
-        
         # Двигаем мышь к этой точке (Playwright делает это плавно)
         await page.mouse.move(x, y, steps=random.randint(5, 15))
         await asyncio.sleep(random.uniform(0.5, 1.5))
         await page.mouse.click(x, y)
-
 async def solve_web_captcha(worker_phone, target_channel_username, post_id):
     """
     Входные данные: телефон воркера, юзернейм канала и ID поста с кнопкой.
@@ -1113,7 +965,6 @@ async def solve_web_captcha(worker_phone, target_channel_username, post_id):
     clean_phone = str(worker_phone).replace("+", "")
     # Путь к сессии браузера (совпадает с твоим docker-compose)
     user_data_dir = f"/var/lib/browser_sessions/session_{clean_phone}"
-
     async with async_playwright() as p:
         # Запускаем браузер с твоими флагами стелса
         context = await p.chromium.launch_persistent_context(
@@ -1123,43 +974,35 @@ async def solve_web_captcha(worker_phone, target_channel_username, post_id):
         )
         page = await context.new_page()
         await stealth_async(page)
-
         try:
             # 1. ТВОЯ ОРИГИНАЛЬНАЯ ЛОГИКА ВХОДА
             await page.goto("https://web.telegram.org", wait_until="networkidle", timeout=60000)
             await asyncio.sleep(8) 
             await page.screenshot(path="/app/step1_web_opened.png")
-
             # 2. ТВОЙ ОРИГИНАЛЬНЫЙ ПЕРЕХОД
             print(f"🌐 [WEB] Переход в канал @{target_channel_username}...")
             await page.goto(f"https://web.telegram.org#?tgaddr=tg%3A%2F%2Fresolve%3Fdomain%3D{target_channel_username}")
             await asyncio.sleep(6)
             await page.screenshot(path="/app/step2_channel_opened.png")
-
                         # 3. УЛУЧШЕННЫЙ ПОИСК КНОПКИ
             print(f"⏳ [WEB] Ожидание появления кнопки в посте {post_id}...")
-            
             # Ждем любой элемент, который похож на кнопку в интерфейсе ТГ
             # Мы ищем кнопки с текстом внутри контейнера сообщений
             button_selector = "button, .btn, .reply-markup-button, [role='button']"
-            
             try:
                 # Даем ТГ 10 секунд, чтобы подгрузить сообщения в канале
                 await page.wait_for_selector(button_selector, timeout=10000)
             except:
                 print("⚠️ [WEB] Кнопки долго не появляются, пробую искать по тексту...")
-
             # Ищем кнопку по твоим ключевым словам (добавил 'Join', так как ссылка английская)
             keywords = ['Участвовать', 'Принять участие', 'Участвую', 'Join', 'Participate', 'Check']
             button = None
-            
             for word in keywords:
                 found = page.locator(f"button:has-text('{word}'), .btn:has-text('{word}')").last
                 if await found.is_visible():
                     button = found
                     print(f"✅ [WEB] Найдена кнопка с текстом: {word}")
                     break
-
             if button:
                 # Скроллим к кнопке, чтобы она точно была в кадре
                 await button.scroll_into_view_if_needed()
@@ -1171,11 +1014,9 @@ async def solve_web_captcha(worker_phone, target_channel_username, post_id):
                 print("❌ [WEB] Кнопка не найдена. Делаю скриншот для диагностики.")
                 await page.screenshot(path="/app/step3_not_found.png")
                 return False
-
                        # 4. ПОДТВЕРЖДЕНИЕ ЗАПУСКА (Launch)
             print("⏳ [WEB] Ожидание окна Launch...")
             confirm_selector = "button:has-text('Launch'), button:has-text('OK'), button:has-text('Открыть'), button.btn-primary"
-            
             try:
                 # Ждем саму модалку, а не просто проверяем видимость
                 confirm_btn = page.locator(confirm_selector).first
@@ -1184,7 +1025,6 @@ async def solve_web_captcha(worker_phone, target_channel_username, post_id):
                 await confirm_btn.click(delay=500)
             except:
                 print("⚠️ [WEB] Модалка Launch не появилась, возможно приложение открылось сразу.")
-
             # --- КРИТИЧЕСКОЕ ИЗМЕНЕНИЕ ТУТ ---
             # 5. ОЖИДАНИЕ И КЛИК ПО IFRAME
             print("⏳ [WEB] Ожидание появления Iframe (капчи)...")
@@ -1197,10 +1037,8 @@ async def solve_web_captcha(worker_phone, target_channel_username, post_id):
                 print("❌ [WEB] Iframe так и не появился.")
                 await page.screenshot(path="/app/5_no_iframe_error.png")
                 return False
-
             # Если фрейм есть, работаем внутри него
             await asyncio.sleep(5) # Даем контенту внутри фрейма прогрузиться
-            
             # Вместо гадания координат, используем JS-клик по ЛЮБОМУ интерактивному элементу внутри
             # Это сработает и на Cloudflare, и на обычной кнопке "Подтвердить"
             try:
@@ -1208,7 +1046,6 @@ async def solve_web_captcha(worker_phone, target_channel_username, post_id):
                 frame = page.frame_locator("iframe").first
                 # Ищем кнопку или чекбокс внутри фрейма
                 target = frame.locator("button, input[type='checkbox'], canvas, [role='button']").first
-                
                 await target.scroll_into_view_if_needed()
                 # JS-клик самый надежный в headless
                 await target.evaluate("node => node.click()") 
@@ -1218,13 +1055,11 @@ async def solve_web_captcha(worker_phone, target_channel_username, post_id):
                 box = await iframe_element.bounding_box()
                 if box:
                     await page.mouse.click(box['x'] + box['width']/2, box['y'] + box['height']/2)
-
             # Финальная пауза и проверка
             print("⏳ [WEB] Ожидание завершения (15 сек)...")
             await asyncio.sleep(15) 
             await page.screenshot(path="/app/step6_final_check.png")
             return True
-
         except Exception as e:
             print(f"❌ [WEB-ERR] Ошибка Playwright: {e}")
             try:
@@ -1236,12 +1071,10 @@ async def solve_web_captcha(worker_phone, target_channel_username, post_id):
             # Закрываем всё по порядку, чтобы не было ошибок "Task was destroyed"
             await page.close()
             await context.close()
-
 async def resolve_channel_ids():
     """Фоновая задача: превращает ссылки в реальные tg_id с префиксом -100"""
     # 1. ИМПОРТ ВНУТРИ (чтобы точно не было ошибки)
     from telethon.tl.functions.channels import JoinChannelRequest
-    
     while True:
         try:
             async with async_session() as session:
@@ -1249,12 +1082,10 @@ async def resolve_channel_ids():
                     select(TargetChannel).where(TargetChannel.tg_id == None)
                 )
                 unknown_channels = res.scalars().all()
-
                 for ch in unknown_channels:
                     try:
                         print(f"🔍 [ID-RESOLVER] Пробую узнать ID для: {ch.username}")
                         entity = await client.get_entity(ch.username)
-                        
                         # 2. ПРАВИЛЬНЫЙ ФОРМАТ ID ДЛЯ BOT API
                         # Telethon выдает 212345678, ботам нужно -100212345678
                         raw_id = entity.id
@@ -1263,26 +1094,20 @@ async def resolve_channel_ids():
                             formatted_id = int(f"-100{abs(raw_id)}")
                         else:
                             formatted_id = raw_id
-                        
                         ch.tg_id = formatted_id
-                        
                         # 3. ВСТУПЛЕНИЕ (теперь импорт виден)
                         try:
                             await client(JoinChannelRequest(channel=entity))
                             print(f"✅ [ID-RESOLVER] Читатель вступил в {ch.username}")
                         except Exception as je:
                             print(f"⚠️ [ID-RESOLVER] Ошибка вступления: {je}")
-
                         print(f"✅ [ID-RESOLVER] Успех! ID сохранен как: {ch.tg_id}")
                     except Exception as e:
                         print(f"❌ [ID-RESOLVER] Ошибка для {ch.username}: {e}")
-                
                 await session.commit()
         except Exception as e:
             print(f"⚠️ [ID-RESOLVER-LOOP] Критическая ошибка: {e}")
-            
         await asyncio.sleep(60)
-
 #Авто настройка-доделать потом когда то через несколько десятилетий
 # async def run_identity_setup(worker):
 #     """
@@ -1292,7 +1117,6 @@ async def resolve_channel_ids():
 #     clean_phone = str(worker.phone).replace("+", "")
 #     # Путь к сессии (соответствует твоему docker-compose)
 #     user_data_dir = f"/var/lib/browser_sessions/session_{clean_phone}"
-    
 #     # 1. ОТКРЫВАЕМ СЕССИЮ БД ДЛЯ РАБОТЫ С РЕСУРСАМИ
 #     async with async_session() as session:
 #         async with async_playwright() as p:
@@ -1309,19 +1133,15 @@ async def resolve_channel_ids():
 #             page = await context.new_page()
 #             # Применяем stealth для обхода проверок на бота
 #             await stealth_async(page)
-
 #             try:
 #                 print(f"🎭 [SETUP] Начало настройки аккаунта {worker.phone}...")
-                
 #                 # Загружаем Telegram Web A (таймаут 60с для медленного прокси/интернета)
 #                 try:
 #                     await page.goto("https://web.telegram.org", wait_until="domcontentloaded", timeout=60000)
 #                 except Exception as e:
 #                     print(f"⚠️ [SETUP] Долгая загрузка {worker.phone}, пробую подождать еще 10с...")
-                
 #                 # Ждем первичную прогрузку интерфейса
 #                 await asyncio.sleep(12)
-
 #                 # --- ШАГ 3: ЗАКРЫВАТЕЛЬ ВСПЛЫВАЮЩИХ ОКОН (Анти-блокер) ---
 #                 print(f"🔍 [SETUP] Проверка на мешающие окна для {worker.phone}...")
 #                 try:
@@ -1335,14 +1155,11 @@ async def resolve_channel_ids():
 #                 except:
 #                     # Если окон нет — просто идем дальше по коду
 #                     pass 
-
 #                 # --- ПОДГОТОВКА СЦЕНАРИЯ ---
 #                 # Формируем список задач и перемешиваем их для уникальности каждого бота
 #                 steps = ['privacy', 'data', 'appearance']
 #                 random.shuffle(steps)
-
 #                 # ТУТ НАЧИНАЕТСЯ ТВОЙ ЦИКЛ: for step in steps:
-
 #                 for step in steps:
 #                     # --- БЛОК 1: ПРИВАТНОСТЬ (Никто/Все) ---
 #                     if step == 'privacy':
@@ -1351,29 +1168,23 @@ async def resolve_channel_ids():
 #                         await page.get_by_role("menuitem", name="Settings").click()
 #                         await page.get_by_role("button", name="Конфиденциальность").click()
 #                         await asyncio.sleep(2)
-
 #                         # Номер телефона -> Не использовать (Nobody)
 #                         await page.get_by_role("button", name=re.compile(r"номер телефона")).click()
 #                         await page.locator("label").filter(has_text="Не использовать").click()
 #                         await page.get_by_role("button", name="Назад").click()
-
 #                         # Последний заход -> Не использовать (Nobody)
 #                         await page.get_by_role("button", name=re.compile(r"последнего захода")).click()
 #                         await page.locator("div").filter(has_text=re.compile(r"^Не использовать$")).nth(1).click()
 #                         await page.get_by_role("button", name="Назад").click()
-
 #                         # Подарки -> Все (Everybody)
 #                         await page.get_by_role("button", name="Подарки").click()
 #                         await page.locator("label").filter(has_text="Все").first.click()
 #                         await page.get_by_role("button", name="Назад").click()
-
 #                         # Приглашения -> Мои контакты (Никто в /a/)
 #                         await page.get_by_role("button", name=re.compile(r"приглашать меня")).click()
 #                         await page.locator(".Radio-main").nth(2).click() # 3-й пункт списка
 #                         await page.get_by_role("button", name="Назад").click()
-                        
 #                         await page.get_by_role("button", name="Назад").click() # Выход в главное меню настроек
-
 #                     # --- БЛОК 2: ДАННЫЕ (Отключение автозагрузки) ---
 #                     elif step == 'data':
 #                         print(f"📦 [SETUP] Отключение автозагрузки медиа...")
@@ -1387,30 +1198,23 @@ async def resolve_channel_ids():
 #                             if await label.locator("input").is_checked():
 #                                 await label.click()
 #                         await page.get_by_role("button", name="Назад").click()
-
 #                     elif step == 'appearance':
 #                         print(f"🎨 [SETUP] Настройка внешности (Монетка)...")
-                    
 #                     # Ждем кнопку меню, чтобы понять, что страница прогрузилась
 #                     await page.wait_for_selector('button[aria-label="Open menu"]', timeout=30000)
-                    
 #                     # Заходим в профиль через прямую ссылку (это быстрее и надежнее кликов)
 #                     await page.goto("https://web.telegram.org")
 #                     await asyncio.sleep(5)
-
 #                     # А) ОБЯЗАТЕЛЬНОЕ: Имя
 #                     # Используем wait_for_selector перед вводом
 #                     name_field = page.get_by_role("textbox", name=re.compile(r"Имя", re.I))
 #                     await name_field.wait_for(state="visible", timeout=10000)
-                    
 #                     name = await get_unique_asset(session, 'name', worker.tg_id)
 #                     if name:
 #                         await name_field.fill(name)
 #                         print(f"👤 Имя установлено: {name}")
-
 #                     # Б) ЮЗЕРНЕЙМ (с проверкой)
 #                     # ... (твой код из шага 3 про юзернейм) ...
-
 #                     # В) МОНЕТКА: О себе (40%)
 #                     if random.random() < 0.4:
 #                         bio = await get_unique_asset(session, 'bio', worker.tg_id)
@@ -1418,7 +1222,6 @@ async def resolve_channel_ids():
 #                             bio_field = page.get_by_role("textbox", name=re.compile(r"О себе", re.I))
 #                             await bio_field.fill(bio)
 #                             print(f"📝 Bio установлено")
-
 #                     # Г) МОНЕТКА: Дата рождения (30%)
 #                         if random.random() < 0.3:
 #                             try:
@@ -1430,7 +1233,6 @@ async def resolve_channel_ids():
 #                                 await page.get_by_text("Сохранить").click()
 #                                 print(f"🎂 ДР установлено")
 #                             except: pass
-
 #                     # Д) АВАТАРКА
 #                         avatar = await get_unique_asset(session, 'avatar', worker.tg_id)
 #                         if avatar:
@@ -1445,21 +1247,15 @@ async def resolve_channel_ids():
 #                                 # Ждем кнопку сохранения (может называться "Set" или "Done")
 #                                 await page.get_by_role("button", name=re.compile(r"Сохранить|Done|Set", re.I)).click()
 #                                 print(f"📸 Аватарка установлена")
-
 #                         await page.goto("https://web.telegram.org") # Возврат на главную
-
-
 #                 print(f"✅ [SETUP] Аккаунт {worker.phone} успешно настроен.")
 #                 return True
-
 #             except Exception as e:
 #                 print(f"❌ [SETUP-ERR] Ошибка в {worker.phone}: {e}")
 #                 await page.screenshot(path=f"/app/debug/error_setup_{clean_phone}.png")
 #                 return False
 #             finally:
 #                 await context.close()
-
-
 # async def identity_manager_loop():
 #     """Фоновая очередь: раз в 10 минут ищет 'новичков' и настраивает их"""
 #     while True:
@@ -1473,22 +1269,18 @@ async def resolve_channel_ids():
 #                     )
 #                 )
 #                 to_setup = res.scalars().all()
-                
 #                 for worker in to_setup:
 #                     # Рандомная задержка перед настройкой (чтобы не все разом)
 #                     delay = random.randint(300, 1200) # 5-20 минут
 #                     print(f"⏳ [SETUP] Аккаунт {worker.phone} в очереди. Ждем {delay}с...")
 #                     await asyncio.sleep(delay)
-                    
 #                     if await run_identity_setup(worker):
 #                         worker.is_configured = True # Помечаем как готовый
 #                         await session.commit()
 #                         print(f"✅ [SETUP] Аккаунт {worker.phone} успешно настроен и помечен в БД.")
 #         except Exception as e:
 #             print(f"⚠️ [SETUP-LOOP] Ошибка цикла: {e}")
-        
 #         await asyncio.sleep(600) # Проверка новых аккаунтов раз в 10 минут
-
 # async def get_unique_asset(session, category, worker_tg_id):
 #     """
 #     Ищет свободный ресурс. Если воркер уже бронировал его — возвращает старый.
@@ -1501,21 +1293,17 @@ async def resolve_channel_ids():
 #     existing = res.scalar_one_or_none()
 #     if existing:
 #         return existing.value
-
 #     # 2. Ищем любой свободный ресурс этой категории
 #     res = await session.execute(
 #         select(Asset).where(Asset.category == category, Asset.is_used == False).limit(1)
 #     )
 #     asset = res.scalar_one_or_none()
-    
 #     if asset:
 #         asset.is_used = True
 #         asset.worker_id = worker_tg_id
 #         await session.commit()
 #         return asset.value
-    
 #     return None # Если в папке/файле ничего не осталось
-
 # async def sync_assets_to_db():
 #     """Синхронизация файлов из папок в Базу Данных (выполняется при старте)"""
 #     async with async_session() as session:
@@ -1527,7 +1315,6 @@ async def resolve_channel_ids():
 #                 if not exists.scalar():
 #                     session.add(Asset(category='avatar', value=filename))
 #                     print(f"📁 Добавлена аватарка: {filename}")
-
 #         # 2. Сканируем имена из файла
 #         if os.path.exists("assets/names.txt"):
 #             with open("assets/names.txt", "r", encoding="utf-8") as f:
@@ -1537,22 +1324,16 @@ async def resolve_channel_ids():
 #                     exists = await session.execute(select(Asset).where(Asset.value == name))
 #                     if not exists.scalar():
 #                         session.add(Asset(category='name', value=name))
-
 #         await session.commit()
-
 # --- ЗАПУСК ---
-
 async def main():
     global client, KEYWORDS_DATA, MY_WORKERS, CHANNELS_MAP
-    
     print(f"📡 Запуск мониторинга группы {GROUP_TAG}...")
-    
     # 1. Получаем аккаунт читателя
     acc = await get_reader_from_db(GROUP_TAG)
     if not acc: 
         print(f"❌ Читатель для группы {GROUP_TAG} не найден в БД!")
         return
-
        # 2. Инициализация Telethon с уникальными данными из БД
     client = TelegramClient(
         StringSession(acc.session_string), 
@@ -1562,60 +1343,166 @@ async def main():
         system_version=acc.os_version, # Поле из обновленной БД
         app_version=acc.app_version     # Поле из обновленной БД
     )
+async def auto_warmup_manager():
+    """Фоновая задача: раз в 10 минут сводит спонсора и новичка для прогрева"""
+    while True:
+        await asyncio.sleep(600) 
+        async with async_session() as session:
+            # 1. Ищем новичка (is_warmed_up = False)
+            res_target = await session.execute(
+                select(WorkerAccount).where(
+                    WorkerAccount.is_warmed_up == False,
+                    WorkerAccount.group_tag == GROUP_TAG
+                ).order_by(func.random()).limit(1)
+            )
+            target = res_target.scalar_one_or_none()
+            if not target: continue
 
+            # 2. ОГРАНИЧЕНИЕ: Не более 1 подарка этому новичку в 30 минут
+            recent_check = await session.execute(text(
+                "SELECT id FROM workers.gift_log WHERE receiver_id = :tid AND sent_at > NOW() - INTERVAL '30 minutes'"
+            ), {"tid": target.tg_id})
+            if recent_check.scalar(): continue
 
+            # 3. Ищем спонсора (Звезды > 30, не сам новичок)
+            res_sponsor = await session.execute(
+                select(WorkerAccount).where(
+                    WorkerAccount.star_balance >= 30,
+                    WorkerAccount.tg_id != target.tg_id,
+                    WorkerAccount.group_tag == GROUP_TAG
+                ).limit(1)
+            )
+            sponsor = res_sponsor.scalar_one_or_none()
+            if not sponsor: continue
+
+            # 4. Проверка: Дарил ли ЭТОТ спонсор ЭТОМУ новичку РАНЕЕ?
+            already_sent = await session.execute(text(
+                "SELECT id FROM workers.gift_log WHERE sender_id = :sid AND receiver_id = :tid"
+            ), {"sid": sponsor.tg_id, "tid": target.tg_id})
+            if already_sent.scalar(): continue
+
+            # ВСЁ ОК: Создаем ПРЯМУЮ задачу для воркера-спонсора (через StarReport)
+            LIVELY_PHRASES = ["На удачу!", "Лови медведя!", "Прогрев аккаунта.", "Для конкурса!"]
+            signal_text = f"{random.choice(LIVELY_PHRASES)} СИГНАЛ:ПОДАРОК"
+            
+            # Создаем системный рапорт, который воркер подхватит в star_execution_loop
+            new_job = StarReport(
+                passport_id=0, # 0 означает внутренний прогрев
+                target_user=f"@{target.username}" if target.username else str(target.tg_id),
+                method="Медведь",
+                star_count=0,
+                executor_id=sponsor.tg_id,
+                status="approved_warmup" # <--- Специальный статус для прогрева
+            )
+            session.add(new_job)
+            # Логируем отправку
+            await session.execute(text(
+                "INSERT INTO workers.gift_log (sender_id, receiver_id) VALUES (:sid, :tid)"
+            ), {"sid": sponsor.tg_id, "tid": target.tg_id})
+            
+            await session.commit()
+            print(f"🤖 [AUTO-WARMUP] Спонсор {sponsor.tg_id} отправлен греть {target.tg_id}")
+
+    # --- ЗАПУСК ---
+async def main():
+    global client, KEYWORDS_DATA, MY_WORKERS, CHANNELS_MAP
+    print(f"📡 Запуск мониторинга группы {GROUP_TAG}...")
+
+    # 1. Получаем аккаунт читателя
+    acc = await get_reader_from_db(GROUP_TAG)
+    if not acc: 
+        print(f"❌ Читатель для группы {GROUP_TAG} не найден в БД!")
+        return
+
+    # 2. Инициализация Telethon
+    client = TelegramClient(
+        StringSession(acc.session_string), 
+        acc.api_id, 
+        acc.api_hash,
+        device_model=acc.device_model,
+        system_version=acc.os_version,
+        app_version=acc.app_version
+    )
     
     await client.start()
+
     # 3. Первичная загрузка данных
     KEYWORDS_DATA, MY_WORKERS, CHANNELS_MAP = await load_all_data()
+
+    # --- РЕГИСТРАЦИЯ ОБРАБОТЧИКОВ СОБЫТИЙ (Events) ---
+    # Личные сообщения (Зеркало ЛС)
     client.add_event_handler(incoming_private_handler, events.NewMessage(incoming=True, func=lambda e: e.is_private))
-    # 4. Регистрация обработчика и запуск фонового обновления
+    
+    # Все сообщения в каналах (Мониторинг конкурсов)
     client.add_event_handler(handler, events.NewMessage())
+    
+
+    # --- ЗАПУСК ФОНОВЫХ ЗАДАЧ (Tasks) ---
     asyncio.create_task(data_refresher())
-    print(f"🚀 Система онлайн. Слов: {len(KEYWORDS_DATA)}, Каналов: {len(CHANNELS_MAP)}")
-        # Запускаем "руки" в фоновом режиме
     asyncio.create_task(worker_outgoing_loop())
-        # Запускаем десант в фоновом режиме
     asyncio.create_task(worker_luck_raid_loop())
     asyncio.create_task(worker_mention_task_loop())
     asyncio.create_task(vote_execution_loop())
     asyncio.create_task(passport_execution_loop()) 
     asyncio.create_task(star_execution_loop())
     asyncio.create_task(resolve_channel_ids()) 
+    asyncio.create_task(stars_monitoring_loop())
+    asyncio.create_task(ensure_gift_goals())
+
     # asyncio.create_task(identity_manager_loop())
-    # await sync_assets_to_db() # Чтобы при каждом запуске база обновлялась новыми файлами
+    # await sync_assets_to_db()
+
+    print(f"🚀 Система онлайн. Слов: {len(KEYWORDS_DATA)}, Каналов: {len(CHANNELS_MAP)}")
+    print("💎 Обработчик подарков АКТИВИРОВАН.")
+
     await client.run_until_disconnected()
-# --- ПУНКТ 3: ЗЕРКАЛО ЛС (ПРИЕМ СООБЩЕНИЙ) ---
+
+async def process_potential_gift_signal(msg, worker_tg_id):
+    """Логика зачета подарка по тексту: проверяет отправителя и обновляет БД"""
+    text_val = (msg.message or "").strip().upper()
+    if "СИГНАЛ:ПОДАРОК" not in text_val:
+        return False
+
+    # Получаем ID отправителя
+    sender_id = msg.from_id.user_id if hasattr(msg.from_id, 'user_id') else msg.from_id
+    if not sender_id: return False
+
+    async with async_session() as session:
+        # Проверяем, что отправитель — наш воркер из базы
+        is_worker = await session.execute(select(WorkerAccount).where(WorkerAccount.tg_id == sender_id))
+        if not is_worker.scalar():
+            print(f"⚠️ [SECURITY] Чужой юзер {sender_id} прислал сигнал!")
+            return False
+
+        # Находим себя (получателя)
+        res_me = await session.execute(select(WorkerAccount).where(WorkerAccount.tg_id == worker_tg_id))
+        me_db = res_me.scalar_one_or_none()
+        
+        if me_db:
+            me_db.gifts_received = (me_db.gifts_received or 0) + 1
+            # Проверяем прогрев
+            if me_db.gifts_required and me_db.gifts_received >= me_db.gifts_required:
+                me_db.is_warmed_up = True
+            
+            print(f"🎯 [GIFT-OK] Аккаунт {worker_tg_id} зачел сигнал от {sender_id}!")
+            await session.commit()
+            try:
+                await msg.delete() # Удаляем, чтобы не висело в ЛС
+            except: pass
+            return True
+    return False
+
 async def incoming_private_handler(event):
-    sender = await event.get_sender()
-    if sender.bot: return 
-    msg_obj = event.message
-    m_type = "text"
-    s_media_id = None
-    # Если есть медиа — пересылаем в MONITOR_STORAGE
-    if msg_obj.photo or msg_obj.voice or msg_obj.video or msg_obj.document:
-        try:
-            # Пересылаем в твое хранилище (из config.py)
-            fwd = await msg_obj.forward_to(MONITOR_STORAGE)
-            s_media_id = fwd.id
-            m_type = "photo" if msg_obj.photo else "media" # Упростим для примера
-        except Exception as e:
-            print(f"❌ Ошибка зеркала медиа: {e}")
-    me = await client.get_me()
-    async with async_session() as session_msg:
-        from database.models import AccountMessage
-        new_msg = AccountMessage(
-            msg_id=msg_obj.id,
-            worker_tg_id=me.id,
-            sender_id=event.sender_id,
-            text=msg_obj.message or f"[{m_type.upper()}]",
-            media_type=m_type,
-            storage_media_id=s_media_id, # Тот самый ID из хранилища
-            is_read=False
-        )
-        session_msg.add(new_msg)
-        await session_msg.commit()
-    print(f"📩 [ЛС] Сообщение (тип: {m_type}) сохранено.")
+    me = await event.client.get_me()
+    
+    # Сначала проверяем на СИГНАЛ подарка
+    is_gift = await process_potential_gift_signal(event.message, me.id)
+    
+    # Если это НЕ подарок, сохраняем как обычное ЛС через универсальную функцию
+    if not is_gift:
+        # Передаем: текущий клиент, сообщение, свой ID
+        await mirror_private_message(event.client, event.message, me.id)
+
 async def vote_execution_loop():
     print("🗳 [ВОРКЕР] Модуль голосований ВКЛЮЧЕН в очередь...")
     await asyncio.sleep(5) # Даем время на подключение основного клиента
@@ -1696,6 +1583,237 @@ async def vote_execution_loop():
                         print(f"❌ [ГОЛОС] Ошибка выполнения рапорта #{r_id}: {e}")
         except Exception as e:
             print(f"⚠️ [ГОЛОС] Ошибка цикла: {e}")
+async def check_stars_balance(worker_client, worker_tg_id):
+    try:
+        stars_status = await worker_client(GetStarsStatusRequest(peer='me'))
+        # Используем .amount, чтобы получить чистое число
+        balance = int(stars_status.balance.amount) 
+        
+        # ЛОГИКА ТРИГГЕРА: 30+ звезд
+        is_ready = balance >= 30
+        status_text = "✅ ГОТОВ" if is_ready else "⏳ МАЛО"
+        
+        print(f"🌟 [FIN-LOG] Воркер {worker_tg_id} | Баланс: {balance} ⭐ | Фин. доступ: {status_text}")
+        
+        async with async_session() as session:
+            await session.execute(
+                update(WorkerAccount)
+                .where(WorkerAccount.tg_id == worker_tg_id)
+                .values(
+                    star_balance=balance,
+                    is_ready_for_finance=is_ready # Устанавливаем статус Да/Нет
+                )
+            )
+            await session.commit()
+            
+        return balance
+    except Exception as e:
+        print(f"❌ [BALANCE-ERR] Ошибка воркера {worker_tg_id}: {e}")
+        return 0
+async def stars_monitoring_loop():
+    while True:
+        async with async_session() as session:
+            res = await session.execute(
+                select(WorkerAccount).where(WorkerAccount.group_tag == GROUP_TAG, WorkerAccount.is_alive == True)
+            )
+            workers = res.scalars().all()
+            all_my_workers = [w.tg_id for w in workers]
+        
+        print(f"🔄 [STARS-SYNC] Обход {len(workers)} воркеров...")
+
+        for worker in workers:
+            w_client = TelegramClient(StringSession(worker.session_string), worker.api_id, worker.api_hash)
+            try:
+                await w_client.connect()
+                
+                # --- МЕТОД ГЛУБОКОГО СКАНИРОВАНИЯ ---
+                # 1. Получаем список всех последних диалогов (чатов)
+                dialogs = await w_client.get_dialogs(limit=10)
+                
+                for dialog in dialogs:
+                    # Нас интересуют только ЛС с людьми (не каналы и не боты)
+                    if not dialog.is_user or dialog.entity.bot:
+                        continue
+                    
+                    # 2. Для каждого чата ПРИНУДИТЕЛЬНО выкачиваем историю
+                    async for msg in w_client.iter_messages(dialog.id, limit=5):
+                        # Сначала проверяем на подарок/сигнал
+                        is_gift = await process_potential_gift_signal(msg, worker.tg_id)
+                        
+                        # Если не подарок — сохраняем в CRM для оператора
+                        if not is_gift:
+                            await mirror_private_message(w_client, msg, worker.tg_id)
+
+                # 3. Проверка баланса звезд (как и была)
+                await check_stars_balance(w_client, worker.tg_id)
+                
+            except Exception as e:
+                print(f"⚠️ [SYNC-ERR] Аккаунт {worker.tg_id}: {e}")
+            finally:
+                await w_client.disconnect()
+            await asyncio.sleep(2)
+            
+        await asyncio.sleep(600)
+
+
+
+async def ensure_gift_goals():
+    # Оборачиваем ВСЁ в async with
+    async with async_session() as session:
+        res = await session.execute(select(WorkerAccount).where(WorkerAccount.gifts_required == None))
+        new_workers = res.scalars().all()
+        if new_workers:
+            for worker in new_workers:
+                worker.gifts_required = random.randint(1, 10)
+            await session.commit()
+
+from telethon import events
+from telethon.tl.types import MessageActionGiftStars
+
+async def gift_handler(event):
+    msg_text = (event.message.text or "").strip()
+    
+    # Ищем наш секретный маркер (регистр не важен)
+    if "СИГНАЛ:ПОДАРОК" not in msg_text.upper():
+        return
+
+    sender_id = event.message.from_id
+    if hasattr(sender_id, 'user_id'):
+        sender_id = sender_id.user_id
+
+    me = await event.client.get_me()
+    my_id = me.id
+
+    async with async_session() as session:
+        # 1. СТРОГАЯ ПРОВЕРКА: Кто отправил?
+        res_sender = await session.execute(
+            select(WorkerAccount).where(WorkerAccount.tg_id == sender_id)
+        )
+        # Если отправителя нет в нашей базе — это фейк или чужой юзер, игнорим
+        if not res_sender.scalar():
+            print(f"⚠️ [SECURITY] Юзер {sender_id} пытался симулировать подарок текстом!")
+            return
+
+        # 2. Если свой — обновляем счетчик прогрева у себя
+        res_me = await session.execute(
+            select(WorkerAccount).where(WorkerAccount.tg_id == my_id)
+        )
+        me_db = res_me.scalar_one_or_none()
+        
+        if me_db:
+            me_db.gifts_received = (me_db.gifts_received or 0) + 1
+            
+            # Проверка на статус "Прогрет"
+            if me_db.gifts_required and me_db.gifts_received >= me_db.gifts_required:
+                me_db.is_warmed_up = True
+                print(f"🔥 [WARM-UP] Аккаунт {my_id} ПРОГРЕТ сигналом! ({me_db.gifts_received}/{me_db.gifts_required})")
+            else:
+                print(f"📦 [SIGNAL] Аккаунт {my_id} зачел подарок по сигналу от {sender_id}. Всего: {me_db.gifts_received}")
+            
+            await session.commit()
+
+async def mirror_private_message(client_instance, msg, worker_tg_id):
+    """
+    Универсальный CRM-зеркальщик:
+    Сохраняет текст, фото, видео и ГС для оператора.
+    """
+    # 1. Определяем отправителя
+    sender_id = msg.from_id.user_id if hasattr(msg.from_id, 'user_id') else msg.from_id
+    if not sender_id or sender_id == 777000: return # Игнорим ТГ-сервисы
+
+    # 2. Определяем тип контента и работаем с медиа
+    m_type = "text"
+    s_media_id = None
+    
+    if msg.photo or msg.voice or msg.video or msg.document:
+        try:
+            # Пересылаем в MONITOR_STORAGE (используем тот клиент, который сейчас онлайн)
+            fwd = await client_instance.forward_messages(MONITOR_STORAGE, msg)
+            s_media_id = fwd.id
+            m_type = "photo" if msg.photo else "media"
+        except Exception as e:
+            print(f"❌ Ошибка зеркала медиа для {worker_tg_id}: {e}")
+
+    # 3. Сохраняем в БД
+    async with async_session() as session_msg:
+        from database.models import AccountMessage
+        # Проверка на дубликат (чтобы не сохранять одно и то же при каждом сканировании истории)
+        exists = await session_msg.execute(
+            select(AccountMessage).where(AccountMessage.msg_id == msg.id, AccountMessage.worker_tg_id == worker_tg_id)
+        )
+        if exists.scalar(): return
+
+        new_msg = AccountMessage(
+            msg_id=msg.id,
+            worker_tg_id=worker_tg_id,
+            sender_id=sender_id,
+            text=msg.message or f"[{m_type.upper()}]",
+            media_type=m_type,
+            storage_media_id=s_media_id,
+            is_read=False
+        )
+        session_msg.add(new_msg)
+        await session_msg.commit()
+    print(f"📩 [CRM] Сообщение (тип: {m_type}) для {worker_tg_id} сохранено.")
+
+async def auto_warmup_manager():
+    """Фоновая задача: находит цели для прогрева и создает задачи на подарки"""
+    while True:
+        await asyncio.sleep(600) # Проверка раз в 10 минут
+        async with async_session() as session:
+            # 1. Ищем новичка, которому нужен прогрев
+            res_target = await session.execute(
+                select(WorkerAccount).where(
+                    WorkerAccount.is_warmed_up == False,
+                    WorkerAccount.group_tag == GROUP_TAG
+                ).order_by(func.random()).limit(1)
+            )
+            target = res_target.scalar_one_or_none()
+            if not target: continue
+
+            # 2. Проверяем КД: не получал ли этот новичок подарок за последние 30 минут?
+            # Чтобы не было наплыва
+            recent_check = await session.execute(text(
+                "SELECT id FROM workers.gift_log WHERE receiver_id = :tid AND sent_at > NOW() - INTERVAL '30 minutes'"
+            ), {"tid": target.tg_id})
+            if recent_check.scalar(): continue
+
+            # 3. Ищем спонсора (Звезды > 30, не сам новичок)
+            res_sponsor = await session.execute(
+                select(WorkerAccount).where(
+                    WorkerAccount.is_ready_for_finance == True,
+                    WorkerAccount.tg_id != target.tg_id,
+                    WorkerAccount.group_tag == GROUP_TAG
+                )
+            )
+            sponsors = res_sponsor.scalars().all()
+
+            for sponsor in sponsors:
+                # 4. Проверка: отправлял ли ЭТОТ спонсор ЭТОМУ новичку когда-либо?
+                already_sent = await session.execute(text(
+                    "SELECT id FROM workers.gift_log WHERE sender_id = :sid AND receiver_id = :tid"
+                ), {"sid": sponsor.tg_id, "tid": target.tg_id})
+                
+                if not already_sent.scalar():
+                    # ВСЁ СОВПАЛО: Создаем рапорт на подарок (автоматически одобренный)
+                    new_star_job = StarReport(
+                        passport_id=0, # Системная задача
+                        target_user=f"@{target.username}" if target.username else str(target.tg_id),
+                        method=random.choice(["🧸 Медведь", "🌹 Роза"]),
+                        star_count=0,
+                        executor_id=sponsor.tg_id,
+                        status="approved" # Сразу в работу воркеру!
+                    )
+                    session.add(new_star_job)
+                    # Фиксируем в логе, что "сделка" забита
+                    await session.execute(text(
+                        "INSERT INTO workers.gift_log (sender_id, receiver_id) VALUES (:sid, :tid)"
+                    ), {"sid": sponsor.tg_id, "tid": target.tg_id})
+                    
+                    await session.commit()
+                    print(f"🤖 [AUTO-GIFT] Спонсор {sponsor.tg_id} назначен для {target.tg_id}")
+                    break # Нашли одного спонсора — хватит на этот цикл
+
 if __name__ == "__main__":
     try:
         asyncio.run(main())

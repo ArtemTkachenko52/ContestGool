@@ -109,3 +109,26 @@ CREATE TABLE IF NOT EXISTS watcher.channels (
 
 ALTER TABLE workers.workers ADD COLUMN is_configured BOOLEAN DEFAULT FALSE;
 ALTER TABLE workers.workers ADD COLUMN used_asset_id VARCHAR UNIQUE; -- Чтобы не повторять авы/ники
+
+
+
+
+-- Таблица для учета уникальных ресурсов
+CREATE TABLE IF NOT EXISTS workers.assets (
+    id SERIAL PRIMARY KEY,
+    category VARCHAR, -- 'avatar', 'name', 'username', 'bio'
+    value VARCHAR,    -- путь к файлу или текст
+    worker_id BIGINT UNIQUE, -- ID воркера, который забронировал ресурс
+    is_used BOOLEAN DEFAULT FALSE
+);
+
+
+
+-- 1. Даем новичку цель (если её нет)
+UPDATE workers.workers SET gifts_required = 3 WHERE gifts_required IS NULL;
+
+-- 2. Сбрасываем КД на логи, чтобы менеджер мог создать задачу
+DELETE FROM workers.gift_log;
+
+-- 3. Проверяем, что у спонсора статус готовности стоит в True
+UPDATE workers.workers SET is_ready_for_finance = True WHERE star_balance >= 30;

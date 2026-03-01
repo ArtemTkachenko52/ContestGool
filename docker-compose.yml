@@ -12,14 +12,12 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-
   # Твой редис
   redis:
     image: redis:7-alpine
     container_name: contest_redis
     ports:
       - "6379:6379"
-
   # ТВОЙ ВОРКЕР (Блок обновлен для браузера)
   worker_a1:
     build: 
@@ -44,7 +42,6 @@ services:
     environment:
       - DATABASE_URL=postgresql+asyncpg://admin:password123@db:5432/contest_monitor
       - DISPLAY=:99
-
         # ТВОЙ БОТ (Интерфейс оператора)
   service_bot:
     build: 
@@ -59,8 +56,6 @@ services:
       - BOT_TOKEN=8410272638:AAEwO-OMhqMSj1GNKdsi5fnJwgPZCi6Qzco
     # Команда запуска именно для бота:
     command: python -u service_bot/main.py
-
-
 # --- СЕКЦИЯ ТОМОВ (В самом низу файла) ---
 volumes:
   postgres_data:

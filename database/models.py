@@ -99,6 +99,11 @@ class WorkerAccount(Base, BaseAccount):
     last_sync_subscriptions = Column(DateTime, nullable=True)
     is_configured = Column(Boolean, default=False, index=True) # Флаг: настроен ли профиль
     used_asset_id = Column(String, unique=True, nullable=True)  # ID авы/ника, чтобы не повторять
+    star_balance = Column(Integer, default=0)
+    is_ready_for_finance = Column(Boolean, default=False)
+    gifts_required = Column(Integer)
+    gifts_received = Column(Integer, default=0)
+    is_warmed_up = Column(Boolean, default=False)
 class AccountMessage(Base):
     __tablename__ = 'messages'
     __table_args__ = {"schema": "workers"}
@@ -199,4 +204,11 @@ class Asset(Base):
     value = Column(String)        # путь к файлу или текст
     worker_id = Column(BigInteger, unique=True, nullable=True) 
     is_used = Column(Boolean, default=False)
-
+class GiftLog(Base):
+    """Журнал учета подарков между своими (защита от дублей)"""
+    __tablename__ = 'gift_log'
+    __table_args__ = {"schema": "workers"}
+    id = Column(Integer, primary_key=True)
+    sender_id = Column(BigInteger, index=True)   # Кто дарил
+    receiver_id = Column(BigInteger, index=True) # Кому дарили
+    sent_at = Column(DateTime, server_default=func.now())
