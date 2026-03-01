@@ -11,6 +11,7 @@ import re
 import ddddocr
 import io
 from PIL import Image, ImageOps, ImageEnhance
+from telethon.tl.functions.payments import GetStarsStatusRequest
 import os
 from playwright.async_api import async_playwright
 from telethon.tl import functions
@@ -631,59 +632,79 @@ async def passport_execution_loop():
         except Exception as e:
             print(f"❌ [LOOP] Ошибка в цикле паспортов: {e}")
 async def process_gifts_inventory(worker_phone):
-    """
-    Пункт 2: Вход в подарки, продажа обычных подарков.
-    """
     clean_phone = str(worker_phone).replace("+", "")
     user_data_dir = f"/var/lib/browser_sessions/session_{clean_phone}"
+    
     async with async_playwright() as p:
         context = await p.chromium.launch_persistent_context(
             user_data_dir, headless=True, args=['--no-sandbox', '--disable-setuid-sandbox']
         )
         page = await context.new_page()
         await stealth_async(page)
+        
         try:
-            # 1. Переход сразу в раздел подарков (через прямой URL для экономии времени)
-            await page.goto("https://web.telegram.org")
-            await asyncio.sleep(7) 
+            print(f"🌐 [ИНВЕНТАРЬ] Загрузка Web для {clean_phone}...")
+            await page.goto("https://web.telegram.org", wait_until="networkidle", timeout=60000)
+            await asyncio.sleep(8) 
+
+            # 1. Menu -> My Profile
+            await page.get_by_role("button", name="Open menu").first.click()
+            await asyncio.sleep(2)
+            await page.get_by_role("menuitem", name="My Profile").first.click()
+            await asyncio.sleep(4)
+
+            # 2. Gifts Tab
+            await page.get_by_text("Gifts").first.click()
+            await asyncio.sleep(5)
+
             while True:
-                # 2. Ищем первый доступный подарок в сетке
-                gift = page.locator(".interactive-gift").first
-                if await gift.is_visible(timeout=5000):
-                    print(f"🎁 [ИНВЕНТАРЬ] Обнаружен подарок у {clean_phone}. Открываю...")
-                    await gift.click()
-                    await asyncio.sleep(3)
-                    # 3. Пытаемся найти кнопку продажи (Convert to ... Stars)
-                    # Используем регулярку, так как число звезд всегда разное
-                    convert_btn = page.get_by_text(re.compile(r"Convert to \d+ Stars", re.IGNORECASE))
-                    if await convert_btn.is_visible(timeout=3000):
+                # 1. Клик по Canvas (уже работает)
+                canvas = page.locator("#RightColumn canvas, .gifts-list canvas").first
+                if await canvas.is_visible(timeout=7000):
+                    print(f"📦 [ИНВЕНТАРЬ] Открываю карточку подарка через Canvas...")
+                    await canvas.click(position={"x": 68, "y": 31})
+                    await asyncio.sleep(5) # Даем модалке время на анимацию
+
+                    # 2. Поиск кнопки продажи (Convert)
+                    # Используем get_by_text, так как твой codegen нашел её именно так
+                    convert_btn = page.get_by_text(re.compile(r"Convert to \d+ Stars", re.IGNORECASE)).first
+                    
+                    if await convert_btn.is_visible(timeout=5000):
+                        print(f"💰 [ИНВЕНТАРЬ] Кнопка найдена. Нажимаю Convert...")
                         await convert_btn.click()
-                        print(f"💰 [ИНВЕНТАРЬ] Нажал 'Convert'. Ожидание подтверждения...")
-                        await asyncio.sleep(2)
-                        confirm_btn = page.get_by_role("button", name="Confirm")
-                        if await confirm_btn.is_visible():
+                        await asyncio.sleep(3)
+                        
+                        # 3. Подтверждение (Confirm)
+                        confirm_btn = page.get_by_role("button", name="Confirm").first
+                        if await confirm_btn.is_visible(timeout=3000):
                             await confirm_btn.click()
-                            print(f"✅ [ИНВЕНТАРЬ] Подарок продан.")
-                            await asyncio.sleep(4)
-                            # Закрываем финальное окно (Close)
-                            close_btn = page.get_by_role("button", name="Close")
-                            if await close_btn.is_visible(): await close_btn.click()
+                            print(f"✅ [ИНВЕНТАРЬ] Продажа подтверждена.")
+                            await asyncio.sleep(5)
+                            
+                            # 4. Закрытие окна баланса (Close)
+                            close_btn = page.get_by_role("button", name="Close").first
+                            if await close_btn.is_visible():
+                                await close_btn.click()
+                                print(f"🔘 [ИНВЕНТАРЬ] Окно баланса закрыто.")
+                            else:
+                                await page.keyboard.press("Escape")
                         else:
-                            print("⚠️ [ИНВЕНТАРЬ] Кнопка Confirm не появилась.")
                             await page.keyboard.press("Escape")
                     else:
-                        # Если кнопки продажи нет — это NFT (обработаем позже) или ошибка
-                        print("ℹ️ [ИНВЕНТАРЬ] Кнопка продажи не найдена. Пропускаю объект.")
+                        print("ℹ️ [ИНВЕНТАРЬ] Кнопка Convert не найдена в открытой карточке.")
                         await page.keyboard.press("Escape")
-                        break # Пока выходим, чтобы не зациклиться на одном NFT
-                    await asyncio.sleep(2)
+                        break 
+                    
+                    await asyncio.sleep(3)
                 else:
-                    print(f"📭 [ИНВЕНТАРЬ] Подарков больше нет.")
+                    print(f"📭 [ИНВЕНТАРЬ] Подарков в профиле больше нет.")
                     break
+
         except Exception as e:
-            print(f"❌ [ИНВЕНТАРЬ-ERR] Ошибка Playwright {clean_phone}: {e}")
+            print(f"❌ [ИНВЕНТАРЬ-ERR] Ошибка: {e}")
         finally:
             await context.close()
+
 async def check_stars_balance_api():
     """
     Пункт 1: Проверка баланса звезд в рамках 12-часовых окон (00-12 и 12-24).
@@ -694,10 +715,14 @@ async def check_stars_balance_api():
         # 1. ОПРЕДЕЛЯЕМ ГРАНИЦУ ТЕКУЩЕГО ОКНА
         # Если сейчас меньше 12:00, окно закончится в 12:00 сегодня.
         # Если больше 12:00, окно закончится в 00:00 следующего дня.
+                # ТЕСТОВЫЙ РЕЖИМ: Окно закрывается каждую минуту
+                # ВОЗВРАЩАЕМ: Окна 00-12 и 12-24
         if now.hour < 12:
             current_window_end = now.replace(hour=12, minute=0, second=0, microsecond=0)
         else:
             current_window_end = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+
         async with async_session() as session:
             me = await client.get_me()
             res = await session.execute(
@@ -719,27 +744,35 @@ async def check_stars_balance_api():
             # Считаем сколько секунд осталось до конца окна
             seconds_remaining = (current_window_end - now).total_seconds()
             # Выбираем случайное время ожидания ОТ ТЕКУЩЕГО МОМЕНТА до конца окна
+            seconds_remaining = (current_window_end - now).total_seconds()
             random_wait = random.uniform(0, seconds_remaining)
+
+
             print(f"⏳ [БАЛАНС] {me.id} выставил проверку через {int(random_wait/60)} мин (внутри окна до {current_window_end})")
             await asyncio.sleep(random_wait)
             # 4. ВЫПОЛНЯЕМ ПРОВЕРКУ
             try:
-                # Теперь вызываем через functions.payments
-                result = await client(functions.payments.GetStarTransactionsRequest(offset='', limit=1))
-                current_balance = result.balance
+                # 1. Используем GetStarsStatusRequest (он дает статус баланса)
+                stars_status = await client(GetStarsStatusRequest(peer='me'))
+                
+                # 2. ИСПРАВЛЕНИЕ ОШИБКИ: берем .amount (это целое число)
+                # balance.amount — это то, что нужно для сравнения >= 40
+                current_balance = int(stars_status.balance.amount) 
+                
                 is_ready = current_balance >= 40
-                # Записываем, что окно, заканчивающееся в current_window_end, ВЫПОЛНЕНО
+                
                 await session.execute(
                     update(WorkerAccount)
                     .where(WorkerAccount.tg_id == me.id)
                     .values(
                         stars_balance=current_balance,
                         is_financial_ready=is_ready,
-                        last_check_window_end=current_window_end # Помечаем окно как закрытое
+                        last_check_window_end=current_window_end
                     )
                 )
                 await session.commit()
-                print(f"✅ [БАЛАНС] {me.id}: {current_balance} ⭐. Окно до {current_window_end} закрыто.")
+                print(f"✅ [БАЛАНС] {me.id}: {current_balance} ⭐. Статус готовности: {is_ready}")
+
             except Exception as e:
                 print(f"❌ [БАЛАНС-ERR] {me.id}: {e}")
                 await asyncio.sleep(300) # При ошибке спим 5 минут и пробуем снова
@@ -752,6 +785,7 @@ async def check_inventory_loop():
             current_window_end = now.replace(hour=12, minute=0, second=0, microsecond=0)
         else:
             current_window_end = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+
         async with async_session() as session:
             me = await client.get_me()
             res = await session.execute(select(WorkerAccount).where(WorkerAccount.tg_id == me.id))
@@ -761,6 +795,7 @@ async def check_inventory_loop():
                 continue
             seconds_remaining = (current_window_end - now).total_seconds()
             random_wait = random.uniform(0, seconds_remaining)
+
             print(f"⏳ [ИНВЕНТАРЬ] {me.id} проверит подарки через {int(random_wait/60)} мин.")
             await asyncio.sleep(random_wait)
             try:
