@@ -121,3 +121,50 @@ ALTER TABLE workers.workers RENAME COLUMN last_balance_check TO last_check_windo
 UPDATE workers.workers SET last_check_window_end = NULL;
 
 ALTER TABLE workers.workers ADD COLUMN IF NOT EXISTS last_inventory_check_window_end TIMESTAMP WITHOUT TIME ZONE;
+
+
+
+
+
+
+
+
+
+
+
+
+
+-- 1. Расширяем таблицу каналов (TargetChannel)
+ALTER TABLE watcher.channels ADD COLUMN IF NOT EXISTS main_group VARCHAR;
+ALTER TABLE watcher.channels ADD COLUMN IF NOT EXISTS extra_groups JSONB DEFAULT '[]';
+ALTER TABLE watcher.channels ADD COLUMN IF NOT EXISTS actions_config JSONB DEFAULT '{}';
+ALTER TABLE watcher.channels ADD COLUMN IF NOT EXISTS sync_status JSONB DEFAULT '{}';
+ALTER TABLE watcher.channels ADD COLUMN IF NOT EXISTS comment_chat_id BIGINT;
+
+-- 2. Расширяем таблицу паспортов (ContestPassport)
+ALTER TABLE management.passports ADD COLUMN IF NOT EXISTS participating_groups JSONB DEFAULT '[]';
+
+-- 3. Создаем таблицу подписок (Логи вступлений)
+CREATE TABLE IF NOT EXISTS workers.subscriptions (
+    id SERIAL PRIMARY KEY,
+    worker_tg_id BIGINT REFERENCES workers.workers(tg_id),
+    channel_id BIGINT,
+    status VARCHAR DEFAULT 'left',
+    last_action_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 4. Создаем таблицу лимитов (DailyLimitCounter)
+CREATE TABLE IF NOT EXISTS management.daily_limits (
+    id SERIAL PRIMARY KEY,
+    target_date DATE DEFAULT CURRENT_DATE,
+    entity_type VARCHAR, -- 'worker' или 'channel'
+    entity_id BIGINT,
+    current_count INTEGER DEFAULT 0
+);
+-- Возвращаем имя group_tag, если оно было изменено
+ALTER TABLE watcher.channels RENAME COLUMN main_group TO group_tag;
+
+-- Проверяем наличие остальных полей
+ALTER TABLE watcher.channels ADD COLUMN IF NOT EXISTS extra_groups JSONB DEFAULT '[]';
+ALTER TABLE watcher.channels ADD COLUMN IF NOT EXISTS actions_config JSONB DEFAULT '{}';
+ALTER TABLE watcher.channels ADD COLUMN IF NOT EXISTS sync_status JSONB DEFAULT '{}';

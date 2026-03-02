@@ -29,9 +29,29 @@ class TargetChannel(Base):
     id = Column(Integer, primary_key=True)
     tg_id = Column(BigInteger, unique=True)
     username = Column(String)
-    group_tag = Column(String, index=True)
+    # КТО УПРАВЛЯЕТ (Пункт 1, часть 1)
+    group_tag = Column(String, index=True) # Основная группа (А1)
+    extra_groups = Column(JSON, default=[]) # Доп. группы ["А2", "В1"]
+    # КОНФИГУРАЦИЯ (Пункт 1: действие и статус)
+    # Пример: {"A1": "join", "A2": "join", "B1": "leave"}
+    actions_config = Column(JSON, default={}) 
+    # Пример: {"A1": "ready", "A2": "pending"}
+    sync_status = Column(JSON, default={}) 
     status = Column(String, default="idle") # 'idle' или 'active_monitor'
-    last_read_post_id = Column(Integer, default=0) # ID последнего просмотренного PotentialPost
+    last_read_post_id = Column(Integer, default=0)
+    # ID ЧАТА КОММЕНТАРИЕВ (Пункт 2, часть 1)
+    comment_chat_id = Column(BigInteger, nullable=True)
+class WorkerSubscription(Base):
+    """Таблица логов вступлений (Пункт 1: Хранилище данных)"""
+    __tablename__ = 'subscriptions'
+    __table_args__ = {"schema": "workers"}
+    id = Column(Integer, primary_key=True)
+    worker_tg_id = Column(BigInteger, ForeignKey("workers.workers.tg_id"))
+    channel_id = Column(BigInteger, ForeignKey("watcher.channels.tg_id"))
+    # Статус: 'joined' (состоит), 'left' (не состоит), 'in_progress' (в процессе)
+    status = Column(String, default="left")
+    # Для лимитов (20 тгк в день)
+    last_action_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 class ReaderAccount(Base, BaseAccount):
     __tablename__ = 'readers'
     __table_args__ = {"schema": "watcher"}
@@ -67,6 +87,8 @@ class ContestPassport(Base):
     prize_type = Column(String)
     conditions = Column(JSON) # Здесь лежат sub_links, repost_count, vote_details
     intensity_level = Column(Integer, default=1) # 1-4
+    # Список групп, участвующих в этом паспорте (для единой интенсивности)
+    participating_groups = Column(JSON, default=[]) # ["A1", "A2"]
     status = Column(String, default="active") # 'active', 'finished'
 class VotingReport(Base):
     __tablename__ = 'voting_reports'
@@ -194,3 +216,12 @@ class LuckRaid(Base):
     emoji = Column(String)
     status = Column(String, default="active") # active / finished
     created_at = Column(DateTime, server_default=func.now())
+class DailyLimitCounter(Base):
+    """Контроль лимитов (Пункт 1: 30 акков на ТГК, 20 ТГК на акк)"""
+    __tablename__ = 'daily_limits'
+    __table_args__ = {"schema": "management"}
+    id = Column(Integer, primary_key=True)
+    target_date = Column(DateTime, default=func.current_date())
+    entity_type = Column(String) # 'worker' или 'channel'
+    entity_id = Column(BigInteger) # tg_id воркера или канала
+    current_count = Column(Integer, default=0)

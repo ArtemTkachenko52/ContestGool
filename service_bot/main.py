@@ -369,9 +369,16 @@ async def save_passport(callback: types.CallbackQuery, state: FSMContext):
             } if data['contest_type'] == 'vote' else {}
         }
         # 5. Создаем новую запись в таблице паспортов
+                # Находим все готовые группы для этого канала
+        ready_groups = [g for g, status in (post_raw.sync_status or {}).items() if status == "ready"]
+        # Основная группа всегда считается (если она в конфиге ready)
+        if not ready_groups: ready_groups = [op.group_tag]
+
+        # Создаем паспорт с учетом списка участвующих групп (для единой интенсивности)
         new_passport = ContestPassport(
             post_id=post_id_int,
             group_tag=op.group_tag,
+            participating_groups=ready_groups, # <--- ДОБАВЛЯЕМ ЭТО
             type=data['contest_type'],
             prize_type=data['prize'],
             conditions=conditions_data,
@@ -1575,9 +1582,68 @@ async def decision_channel(callback: types.CallbackQuery):
         await session.commit()
     await callback.message.edit_text(res_text, parse_mode="HTML")
 
+async def sync_groups_readiness_loop():
+    """Фоновый цикл: проверяет, все ли воркеры вступили в канал (Пункт 1)"""
+    print("🧠 [СИНХРОНИЗАТОР] Модуль проверки готовности групп запущен.")
+    while True:
+        await asyncio.sleep(60) # Проверка раз в минуту
+        async with async_session() as session:
+            # 1. Берем все каналы, где есть настройки действий
+            query = select(TargetChannel).where(TargetChannel.actions_config != {})
+            channels = (await session.execute(query)).scalars().all()
+
+            for ch in channels:
+                actions = ch.actions_config or {}
+                current_sync = dict(ch.sync_status) if ch.sync_status else {}
+                changed = False
+
+                for group_tag, action in actions.items():
+                    if current_sync.get(group_tag) == "ready":
+                        continue # Уже готова, пропускаем
+
+                    # 2. Считаем живых воркеров в этой группе
+                    w_count_q = select(func.count(WorkerAccount.id)).where(
+                        WorkerAccount.group_tag == group_tag,
+                        WorkerAccount.is_alive == True
+                    )
+                    total_workers = (await session.execute(w_count_q)).scalar() or 0
+
+                    if total_workers == 0: continue
+
+                    # 3. Считаем, сколько из них реально вступили (по логам subscriptions)
+                    from database.models import WorkerSubscription
+                    sub_count_q = select(func.count(WorkerSubscription.id)).where(
+                        WorkerSubscription.channel_id == ch.tg_id,
+                        WorkerSubscription.status == 'joined'
+                    ).join(WorkerAccount, WorkerAccount.tg_id == WorkerSubscription.worker_tg_id).\
+                      where(WorkerAccount.group_tag == group_tag)
+                    
+                    joined_workers = (await session.execute(sub_count_q)).scalar() or 0
+
+                    # 4. Если все вступили — ставим статус READY
+                    if joined_workers >= total_workers:
+                        current_sync[group_tag] = "ready"
+                        changed = True
+                        print(f"🎉 [СИНХРОНИЗАТОР] Группа {group_tag} ГОТОВА в канале {ch.username or ch.tg_id}")
+
+                # 5. Если действие было 'leave' и все вышли (0 вступивших)
+                # Удаляем канал, если он больше не нужен
+                if all(current_sync.get(g) == "ready" for g in actions.keys()):
+                    # Если все действия были 'leave' — удаляем ТГК (как ты просил в ТЗ)
+                    if all(act == "leave" for act in actions.values()):
+                        print(f"🗑 [СИНХРОНИЗАТОР] Канал {ch.tg_id} полностью отработан. Удаление...")
+                        await session.delete(ch)
+                        changed = False # Чтобы не пытаться обновить удаленное
+                
+                if changed:
+                    ch.sync_status = current_sync
+            
+            await session.commit()
+
 # --- ЗАПУСК --
 async def main():
     print("🚀 Бот-интерфейс запущен...")
+    asyncio.create_task(sync_groups_readiness_loop())
     await dp.start_polling(bot)
 if __name__ == "__main__":
     asyncio.run(main())

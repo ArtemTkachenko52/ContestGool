@@ -1326,6 +1326,106 @@ async def resolve_channel_ids():
             
         await asyncio.sleep(60)
 
+# --- ПУНКТ 1: ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ЛИМИТОВ ---
+
+async def check_limits(session, worker_id, channel_id):
+    """Проверяет суточные лимиты (20 на акк, 30 на канал)"""
+    from database.models import DailyLimitCounter
+    today = datetime.now().date()
+    
+    # Лимит для аккаунта
+    w_res = await session.execute(select(DailyLimitCounter).where(
+        DailyLimitCounter.entity_id == worker_id, 
+        DailyLimitCounter.entity_type == 'worker',
+        DailyLimitCounter.target_date == today
+    ))
+    w_count = w_res.scalar_one_or_none()
+    if w_count and w_count.current_count >= 20: 
+        return False
+    
+    # Лимит для канала
+    c_res = await session.execute(select(DailyLimitCounter).where(
+        DailyLimitCounter.entity_id == channel_id, 
+        DailyLimitCounter.entity_type == 'channel',
+        DailyLimitCounter.target_date == today
+    ))
+    c_count = c_res.scalar_one_or_none()
+    if c_count and c_count.current_count >= 30: 
+        return False
+    
+    return True
+
+async def update_limit_count(session, worker_id, channel_id):
+    """Обновляет счетчики после вступления"""
+    from database.models import DailyLimitCounter
+    today = datetime.now().date()
+    for eid, etype in [(worker_id, 'worker'), (channel_id, 'channel')]:
+        res = await session.execute(select(DailyLimitCounter).where(
+            DailyLimitCounter.entity_id == eid, 
+            DailyLimitCounter.entity_type == etype,
+            DailyLimitCounter.target_date == today
+        ))
+        counter = res.scalar_one_or_none()
+        if not counter:
+            session.add(DailyLimitCounter(entity_id=eid, entity_type=etype, target_date=today, current_count=1))
+        else:
+            counter.current_count += 1
+
+# --- САМ МЕНЕДЖЕР ПОДПИСОК ---
+
+async def subscription_manager_loop():
+    """Фоновый цикл: вступление/выход с рандомизацией"""
+    print(f"📡 [ВОРКЕР {GROUP_TAG}] Модуль контроля подписок запущен.")
+    while True:
+        await asyncio.sleep(random.randint(300, 900)) 
+        async with async_session() as session:
+            me = await client.get_me()
+            query = text("""
+                SELECT tg_id, actions_config->>:tag as action 
+                FROM watcher.channels 
+                WHERE actions_config->>:tag IS NOT NULL 
+                AND (sync_status->>:tag != 'ready' OR sync_status->>:tag IS NULL)
+            """)
+            res = await session.execute(query, {"tag": GROUP_TAG})
+            targets = res.all()
+
+            for ch_tg_id, action in targets:
+                from database.models import WorkerSubscription
+                sub_res = await session.execute(select(WorkerSubscription).where(
+                    WorkerSubscription.worker_tg_id == me.id,
+                    WorkerSubscription.channel_id == ch_tg_id
+                ))
+                sub_log = sub_res.scalar_one_or_none()
+
+                if not sub_log:
+                    sub_log = WorkerSubscription(worker_tg_id=me.id, channel_id=ch_tg_id, status='in_progress')
+                    session.add(sub_log)
+                    await session.commit()
+                    continue
+
+                if sub_log.status != 'in_progress':
+                    continue
+
+                if action == 'join':
+                    if await check_limits(session, me.id, ch_tg_id):
+                        if random.random() < 0.05:
+                            try:
+                                from telethon.tl.functions.channels import JoinChannelRequest
+                                await client(JoinChannelRequest(channel=ch_tg_id))
+                                sub_log.status = 'joined'
+                                await update_limit_count(session, me.id, ch_tg_id)
+                                print(f"✅ [ПОДПИСКА] Аккаунт {me.id} вступил в {ch_tg_id}")
+                            except Exception as e:
+                                print(f"❌ [ПОДПИСКА-ERR] {e}")
+                
+                elif action == 'leave':
+                    try:
+                        from telethon.tl.functions.channels import LeaveChannelRequest
+                        await client(LeaveChannelRequest(channel=ch_tg_id))
+                        sub_log.status = 'left'
+                        print(f"🚪 [ВЫХОД] Аккаунт {me.id} покинул {ch_tg_id}")
+                    except: pass
+            await session.commit()
 
 # --- ЗАПУСК ---
 
@@ -1371,6 +1471,7 @@ async def main():
     asyncio.create_task(resolve_channel_ids())
     asyncio.create_task(check_stars_balance_api()) 
     asyncio.create_task(check_inventory_loop())
+    asyncio.create_task(subscription_manager_loop())
     await client.run_until_disconnected()
 # --- ПУНКТ 3: ЗЕРКАЛО ЛС (ПРИЕМ СООБЩЕНИЙ) ---
 async def incoming_private_handler(event):
