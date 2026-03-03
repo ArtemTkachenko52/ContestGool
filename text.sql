@@ -168,3 +168,43 @@ ALTER TABLE watcher.channels RENAME COLUMN main_group TO group_tag;
 ALTER TABLE watcher.channels ADD COLUMN IF NOT EXISTS extra_groups JSONB DEFAULT '[]';
 ALTER TABLE watcher.channels ADD COLUMN IF NOT EXISTS actions_config JSONB DEFAULT '{}';
 ALTER TABLE watcher.channels ADD COLUMN IF NOT EXISTS sync_status JSONB DEFAULT '{}';
+
+
+
+
+
+
+
+
+
+
+ALTER TABLE watcher.channels 
+ALTER COLUMN extra_groups TYPE JSONB USING extra_groups::JSONB,
+ALTER COLUMN actions_config TYPE JSONB USING actions_config::JSONB,
+ALTER COLUMN sync_status TYPE JSONB USING sync_status::JSONB;
+
+
+
+-- 1. Сначала принудительно конвертируем типы колонок в JSONB
+ALTER TABLE watcher.channels 
+    ALTER COLUMN extra_groups TYPE JSONB USING COALESCE(extra_groups::jsonb, '[]'::jsonb),
+    ALTER COLUMN actions_config TYPE JSONB USING COALESCE(actions_config::jsonb, '{}'::jsonb),
+    ALTER COLUMN sync_status TYPE JSONB USING COALESCE(sync_status::jsonb, '{}'::jsonb);
+
+-- 2. Если поле participating_groups в паспортах еще не JSONB, исправляем и его
+ALTER TABLE management.passports 
+    ALTER COLUMN participating_groups TYPE JSONB USING COALESCE(participating_groups::jsonb, '[]'::jsonb);
+
+-- 3. Вакуум для очистки (необязательно, но полезно)
+ANALYZE watcher.channels;
+
+
+
+
+
+-- Добавляем колонку в таблицу каналов
+ALTER TABLE watcher.channels ADD COLUMN IF NOT EXISTS participating_groups JSONB DEFAULT '[]';
+
+-- Убеждаемся, что в паспортах колонка есть и она типа JSONB
+ALTER TABLE management.passports ADD COLUMN IF NOT EXISTS participating_groups JSONB DEFAULT '[]';
+ALTER TABLE management.passports ALTER COLUMN participating_groups TYPE JSONB USING participating_groups::JSONB;

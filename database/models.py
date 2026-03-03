@@ -1,6 +1,7 @@
 from sqlalchemy import Column, BigInteger, String, Integer, Boolean, DateTime, ForeignKey, JSON, Text
 from sqlalchemy.sql import func
 from database.base import Base
+from sqlalchemy.dialects.postgresql import JSONB
 # Общий класс для всех типов аккаунтов (Читатели и Исполнители)
 class BaseAccount:
     id = Column(Integer, primary_key=True)
@@ -31,16 +32,17 @@ class TargetChannel(Base):
     username = Column(String)
     # КТО УПРАВЛЯЕТ (Пункт 1, часть 1)
     group_tag = Column(String, index=True) # Основная группа (А1)
-    extra_groups = Column(JSON, default=[]) # Доп. группы ["А2", "В1"]
+    extra_groups = Column(JSONB, server_default='[]')    # Доп. группы ["А2", "В1"]
     # КОНФИГУРАЦИЯ (Пункт 1: действие и статус)
     # Пример: {"A1": "join", "A2": "join", "B1": "leave"}
-    actions_config = Column(JSON, default={}) 
+    actions_config = Column(JSONB, server_default='{}') 
     # Пример: {"A1": "ready", "A2": "pending"}
-    sync_status = Column(JSON, default={}) 
+    sync_status = Column(JSONB, server_default='{}') 
     status = Column(String, default="idle") # 'idle' или 'active_monitor'
     last_read_post_id = Column(Integer, default=0)
     # ID ЧАТА КОММЕНТАРИЕВ (Пункт 2, часть 1)
     comment_chat_id = Column(BigInteger, nullable=True)
+    participating_groups = Column(JSONB, server_default='[]')
 class WorkerSubscription(Base):
     """Таблица логов вступлений (Пункт 1: Хранилище данных)"""
     __tablename__ = 'subscriptions'
@@ -88,7 +90,7 @@ class ContestPassport(Base):
     conditions = Column(JSON) # Здесь лежат sub_links, repost_count, vote_details
     intensity_level = Column(Integer, default=1) # 1-4
     # Список групп, участвующих в этом паспорте (для единой интенсивности)
-    participating_groups = Column(JSON, default=[]) # ["A1", "A2"]
+    participating_groups = Column(JSONB, server_default='[]') # ["A1", "A2"]
     status = Column(String, default="active") # 'active', 'finished'
 class VotingReport(Base):
     __tablename__ = 'voting_reports'

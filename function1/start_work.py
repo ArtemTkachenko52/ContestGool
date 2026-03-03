@@ -452,67 +452,46 @@ async def data_refresher():
         await asyncio.sleep(5) 
 
 # --- ПУНКТ 3: РУКИ (ОТПРАВКА ИСХОДЯЩИХ) ---
-async def worker_outgoing_loop():
+async def worker_outgoing_loop(w_client, w_id):
+    """Персональный цикл отправки ответов оператора"""
     while True:
         await asyncio.sleep(5)
         async with async_session() as session:
-            me = await client.get_me()
-            # Берем задачи для текущего воркера
+            from database.models import OutgoingMessage
+            # Берем задачи ТОЛЬКО для этого воркера
             tasks = (await session.execute(select(OutgoingMessage).where(
-                OutgoingMessage.worker_tg_id == me.id, 
+                OutgoingMessage.worker_tg_id == w_id, 
                 OutgoingMessage.status == "pending"
             ))).scalars().all()
 
             for task in tasks:
                 try:
-                    receiver = await client.get_input_entity(task.receiver_id)
-                    
-                    # ПУНКТ 1: ПОМЕТКА ПРОЧИТАННЫМ (Всегда при ответе)
-                    await client.send_read_acknowledge(receiver)
+                    receiver = await w_client.get_input_entity(task.receiver_id)
+                    await w_client.send_read_acknowledge(receiver)
 
-                    # ПУНКТ 3: РЕАКЦИИ
                     if task.task_type == "reaction":
-                        await client(SendReactionRequest(
+                        from telethon.tl.functions.messages import SendReactionRequest
+                        from telethon.tl.types import ReactionEmoji
+                        await w_client(SendReactionRequest(
                             peer=receiver,
                             msg_id=task.reply_to_msg_id,
                             reaction=[ReactionEmoji(emoticon=task.reaction_data)]
                         ))
-                        print(f"✅ [РЕАКЦИЯ] Поставил {task.reaction_data}")
+                    
+                    elif task.task_type == "text":
+                        async with w_client.action(receiver, 'typing'):
+                            await asyncio.sleep(random.randint(2, 5))
+                            await w_client.send_message(receiver, task.text, reply_to=task.reply_to_msg_id)
 
-                    # ПУНКТ 2: ТЕКСТ И МЕДИА
-                    elif task.task_type == "text":
-                        async with client.action(receiver, 'typing'):
-                            await asyncio.sleep(random.randint(3, 7))
-                            await client.send_message(receiver, task.text, reply_to=task.reply_to_msg_id)
-                    
-                                        # ПУНКТ 2: ТЕКСТ
-                    elif task.task_type == "text":
-                        if not task.text: raise Exception("Пустое текстовое сообщение")
-                        async with client.action(receiver, 'typing'):
-                            await asyncio.sleep(random.randint(3, 7))
-                            await client.send_message(receiver, task.text, reply_to=task.reply_to_msg_id)
-                    
-                    # ПУНКТ 4: МЕДИА (ФОТО/ГС/ВИДЕО)
                     elif task.task_type == "media":
-                        print(f"🖼 [РУКИ] Пересылка медиа из хранилища для {task.receiver_id}...")
-                        
-                        # Копируем сообщение из хранилища напрямую пользователю
-                        # send_message с объектом сообщения — это самый чистый способ
-                        storage_msg = await client.get_messages(MONITOR_STORAGE, ids=task.storage_msg_id)
-                        
-                        await client.send_message(
-                            receiver,
-                            storage_msg, # Передаем весь объект сообщения (фото+текст)
-                            reply_to=task.reply_to_msg_id
-                        )
-
+                        storage_msg = await w_client.get_messages(MONITOR_STORAGE, ids=task.storage_msg_id)
+                        await w_client.send_message(receiver, storage_msg, reply_to=task.reply_to_msg_id)
 
                     task.status = "sent"
                 except Exception as e:
-                    print(f"❌ [ОШИБКА РУК]: {e}")
+                    print(f"❌ [ОШИБКА CRM] Аккаунт {w_id}: {e}")
                     task.status = "error"
             await session.commit()
-
 
 # --- ПУНКТ 1: РУКИ (АВТО-КОММЕНТАРИЙ ПРИ УПОМИНАНИИ) ---
 async def worker_mention_task_loop():
@@ -558,47 +537,34 @@ async def worker_mention_task_loop():
             await session.commit()
 
 # --- ПУНКТ 2: РУКИ (ДЕСАНТ УДАЧИ) ---
-async def worker_luck_raid_loop():
-    print("🎯 [РУКИ] Модуль десанта удачи запущен.")
+# --- ПУНКТ 3: ДЕСАНТ УДАЧИ (РЕЙДЫ) ---
+async def worker_luck_raid_loop(w_client, w_id):
+    """Персональный цикл участия в рейдах удачи"""
     while True:
         await asyncio.sleep(15) 
         async with async_session() as session:
             from database.models import LuckRaid
-            # Ищем только активные рейды
             active_raids = (await session.execute(select(LuckRaid).where(LuckRaid.status == "active"))).scalars().all()
 
             for raid in active_raids:
-                me = await client.get_me()
-                
-                # ИМИТАЦИЯ: Шанс 30%, что этот воркер вступит в этот цикл (так мы получим 3-5 юзеров)
-                if random.random() > 0.3: 
-                    continue
+                # Шанс 30%, что именно ЭТОТ воркер вступит в рейд в этом цикле
+                if random.random() > 0.3: continue
 
                 try:
-                    delay = random.randint(15, 60) # Увеличили паузы для беспалевности
-                    print(f"🎰 [ДЕСАНТ] Аккаунт {me.id} подкинет {raid.emoji} через {delay}с...")
+                    delay = random.randint(10, 60)
                     await asyncio.sleep(delay)
-                    
-                    # ПУНКТ 3: ОТПРАВКА АНИМИРОВАННОГО КУБИКА (УНИВЕРСАЛЬНО)
+
                     if raid.emoji in ['🎰', '🎯', '🎲', '🏀', '⚽️', '🎳']:
                         from telethon.tl.types import InputMediaDice
-                        await client.send_message(
+                        await w_client.send_message(
                             raid.channel_id,
-                            file=InputMediaDice(raid.emoji), # Отправка анимации
+                            file=InputMediaDice(raid.emoji),
                             comment_to=raid.post_id
                         )
                     else:
-                        await client.send_message(
-                            raid.channel_id, 
-                            raid.emoji, 
-                            comment_to=raid.post_id
-                        )
-
-                        
-                    print(f"✅ [ДЕСАНТ] Аккаунт {me.id} успешно высадился.")
-                except Exception as e:
-                    print(f"❌ [ДЕСАНТ] Ошибка: {e}")
-
+                        await w_client.send_message(raid.channel_id, raid.emoji, comment_to=raid.post_id)
+                    print(f"✅ [РЕЙД] Аккаунт {w_id} высадился в пост {raid.post_id}")
+                except: pass
 # --- ЛОГИКА ВЫПОЛНЕНИЯ ЗАДАЧ ИЗ ПАСПОРТА (Пункт 1) ---
 
 async def passport_execution_loop():
@@ -705,65 +671,41 @@ async def process_gifts_inventory(worker_phone):
         finally:
             await context.close()
 
-async def check_stars_balance_api():
-    """
-    Пункт 1: Проверка баланса звезд в рамках 12-часовых окон (00-12 и 12-24).
-    """
-    print(f"💰 [ЭКОНОМИКА] Модуль контроля баланса (ОКНА) запущен для {GROUP_TAG}.")
+async def check_stars_balance_api(w_client, w_id):
+    """Персональная проверка баланса звезд для конкретного воркера"""
+    print(f"💰 [ЭКОНОМИКА] Контроль звезд запущен для аккаунта {w_id}.")
+    
     while True:
         now = datetime.now()
-        # 1. ОПРЕДЕЛЯЕМ ГРАНИЦУ ТЕКУЩЕГО ОКНА
-        # Если сейчас меньше 12:00, окно закончится в 12:00 сегодня.
-        # Если больше 12:00, окно закончится в 00:00 следующего дня.
-                # ТЕСТОВЫЙ РЕЖИМ: Окно закрывается каждую минуту
-                # ВОЗВРАЩАЕМ: Окна 00-12 и 12-24
+        # ОПРЕДЕЛЯЕМ ОКНО (00-12 или 12-24)
         if now.hour < 12:
             current_window_end = now.replace(hour=12, minute=0, second=0, microsecond=0)
         else:
             current_window_end = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
 
-
         async with async_session() as session:
-            me = await client.get_me()
-            res = await session.execute(
-                select(WorkerAccount).where(WorkerAccount.tg_id == me.id)
-            )
+            res = await session.execute(select(WorkerAccount).where(WorkerAccount.tg_id == w_id))
             worker = res.scalar_one_or_none()
-            if not worker: 
-                await asyncio.sleep(60)
+            
+            if not worker or worker.last_check_window_end == current_window_end:
+                # Если уже проверяли в этом окне — спим до следующего + запас
+                wait = (current_window_end - now).total_seconds() + random.randint(60, 300)
+                await asyncio.sleep(wait)
                 continue
-            # 2. ПРОВЕРЯЕМ: Отработано ли текущее окно?
-            # Если в базе записан конец текущего окна, значит в этом промежутке мы уже проверялись.
-            if worker.last_check_window_end == current_window_end:
-                # Ждем до начала следующего окна + небольшой запас (10-30 сек)
-                wait_until_next = (current_window_end - now).total_seconds() + random.randint(10, 30)
-                print(f"💤 [БАЛАНС] {me.id} уже проверялся в этом окне. Сон до {current_window_end}")
-                await asyncio.sleep(wait_until_next)
-                continue
-            # 3. ВЫБИРАЕМ РАНДОМНЫЙ МОМЕНТ В ОСТАВШЕМСЯ ВРЕМЕНИ ОКНА
-            # Считаем сколько секунд осталось до конца окна
-            seconds_remaining = (current_window_end - now).total_seconds()
-            # Выбираем случайное время ожидания ОТ ТЕКУЩЕГО МОМЕНТА до конца окна
-            seconds_remaining = (current_window_end - now).total_seconds()
-            random_wait = random.uniform(0, seconds_remaining)
 
+            # Рандомное ожидание внутри окна (мимикрия)
+            seconds_remaining = (current_window_end - now).total_seconds()
+            await asyncio.sleep(random.uniform(0, min(seconds_remaining, 3600))) # Ждем до 1 часа макс для тестов
 
-            print(f"⏳ [БАЛАНС] {me.id} выставил проверку через {int(random_wait/60)} мин (внутри окна до {current_window_end})")
-            await asyncio.sleep(random_wait)
-            # 4. ВЫПОЛНЯЕМ ПРОВЕРКУ
             try:
-                # 1. Используем GetStarsStatusRequest (он дает статус баланса)
-                stars_status = await client(GetStarsStatusRequest(peer='me'))
-                
-                # 2. ИСПРАВЛЕНИЕ ОШИБКИ: берем .amount (это целое число)
-                # balance.amount — это то, что нужно для сравнения >= 40
+                from telethon.tl.functions.payments import GetStarsStatusRequest
+                stars_status = await w_client(GetStarsStatusRequest(peer='me'))
                 current_balance = int(stars_status.balance.amount) 
-                
                 is_ready = current_balance >= 40
-                
+
                 await session.execute(
                     update(WorkerAccount)
-                    .where(WorkerAccount.tg_id == me.id)
+                    .where(WorkerAccount.tg_id == w_id)
                     .values(
                         stars_balance=current_balance,
                         is_financial_ready=is_ready,
@@ -771,42 +713,50 @@ async def check_stars_balance_api():
                     )
                 )
                 await session.commit()
-                print(f"✅ [БАЛАНС] {me.id}: {current_balance} ⭐. Статус готовности: {is_ready}")
+                print(f"✅ [БАЛАНС] Аккаунт {w_id}: {current_balance} ⭐. Готовность: {is_ready}")
 
             except Exception as e:
-                print(f"❌ [БАЛАНС-ERR] {me.id}: {e}")
-                await asyncio.sleep(300) # При ошибке спим 5 минут и пробуем снова
-async def check_inventory_loop():
-    """Фоновый цикл для проверки подарков раз в 12 часов (по окнам)"""
-    print(f"📦 [ЭКОНОМИКА] Модуль инвентаризации запущен для {GROUP_TAG}.")
+                print(f"❌ [БАЛАНС-ERR] Аккаунт {w_id}: {e}")
+                await asyncio.sleep(600)
+
+async def check_inventory_loop(w_id, w_phone):
+    """Персональная проверка подарков (Web Playwright)"""
+    print(f"📦 [ЭКОНОМИКА] Модуль инвентаря запущен для аккаунта {w_id}.")
+    
     while True:
         now = datetime.now()
+        # Аналогичная логика окон 00-12 / 12-24
         if now.hour < 12:
             current_window_end = now.replace(hour=12, minute=0, second=0, microsecond=0)
         else:
             current_window_end = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
 
         async with async_session() as session:
-            me = await client.get_me()
-            res = await session.execute(select(WorkerAccount).where(WorkerAccount.tg_id == me.id))
+            res = await session.execute(select(WorkerAccount).where(WorkerAccount.tg_id == w_id))
             worker = res.scalar_one_or_none()
+            
             if not worker or worker.last_inventory_check_window_end == current_window_end:
-                await asyncio.sleep(600) # Проверка раз в 10 мин
+                await asyncio.sleep(600)
                 continue
-            seconds_remaining = (current_window_end - now).total_seconds()
-            random_wait = random.uniform(0, seconds_remaining)
 
-            print(f"⏳ [ИНВЕНТАРЬ] {me.id} проверит подарки через {int(random_wait/60)} мин.")
-            await asyncio.sleep(random_wait)
+            # Спим рандомно перед запуском тяжелого браузера
+            await asyncio.sleep(random.randint(120, 1800))
+
             try:
-                await process_gifts_inventory(me.phone)
+                # ВЫЗЫВАЕМ ТВОЮ ФУНКЦИЮ ИЗ ПРОШЛЫХ ЧАСТЕЙ
+                # Убедись, что process_gifts_inventory определена в файле
+                await process_gifts_inventory(w_phone)
+                
                 await session.execute(
-                    update(WorkerAccount).where(WorkerAccount.tg_id == me.id)
+                    update(WorkerAccount).where(WorkerAccount.tg_id == w_id)
                     .values(last_inventory_check_window_end=current_window_end)
                 )
                 await session.commit()
+                print(f"✅ [ИНВЕНТАРЬ] Аккаунт {w_id} очистил подарки.")
             except Exception as e:
-                print(f"❌ [ИНВЕНТАРЬ-LOOP-ERR] {e}")
+                print(f"❌ [ИНВЕНТАРЬ-ERR] Аккаунт {w_id}: {e}")
+                await asyncio.sleep(300)
+
 async def run_passport_strategy(passport):
     """
     Рассчитывает 'эстафету' и ЗАВЕРШАЕТ паспорт после выполнения.
@@ -1333,7 +1283,7 @@ async def check_limits(session, worker_id, channel_id):
     from database.models import DailyLimitCounter
     today = datetime.now().date()
     
-    # Лимит для аккаунта
+    # 1. Лимит для конкретного АККАУНТА (воркера)
     w_res = await session.execute(select(DailyLimitCounter).where(
         DailyLimitCounter.entity_id == worker_id, 
         DailyLimitCounter.entity_type == 'worker',
@@ -1343,7 +1293,7 @@ async def check_limits(session, worker_id, channel_id):
     if w_count and w_count.current_count >= 20: 
         return False
     
-    # Лимит для канала
+    # 2. Лимит для КАНАЛА
     c_res = await session.execute(select(DailyLimitCounter).where(
         DailyLimitCounter.entity_id == channel_id, 
         DailyLimitCounter.entity_type == 'channel',
@@ -1356,7 +1306,7 @@ async def check_limits(session, worker_id, channel_id):
     return True
 
 async def update_limit_count(session, worker_id, channel_id):
-    """Обновляет счетчики после вступления"""
+    """Обновляет счетчики после успешного вступления"""
     from database.models import DailyLimitCounter
     today = datetime.now().date()
     for eid, etype in [(worker_id, 'worker'), (channel_id, 'channel')]:
@@ -1373,32 +1323,39 @@ async def update_limit_count(session, worker_id, channel_id):
 
 # --- САМ МЕНЕДЖЕР ПОДПИСОК ---
 
-async def subscription_manager_loop():
-    """Фоновый цикл: вступление/выход с рандомизацией"""
-    print(f"📡 [ВОРКЕР {GROUP_TAG}] Модуль контроля подписок запущен.")
+async def subscription_manager_loop(w_client, w_id):
+    """Персональный цикл вступления/выхода для конкретного воркера"""
+    print(f"📡 [ПОДПИСКИ] Аккаунт {w_id} начал мониторинг задач на вступление.")
+    
     while True:
-        await asyncio.sleep(random.randint(300, 900)) 
+        # Проверка раз в 10-20 минут
+        await asyncio.sleep(random.randint(600, 1200)) 
+        
         async with async_session() as session:
-            me = await client.get_me()
+            # Ищем каналы, где нашей группе (A1) приказано 'join' или 'leave'
+            # И где этот воркер (w_id) еще не завершил действие
             query = text("""
-                SELECT tg_id, actions_config->>:tag as action 
-                FROM watcher.channels 
-                WHERE actions_config->>:tag IS NOT NULL 
-                AND (sync_status->>:tag != 'ready' OR sync_status->>:tag IS NULL)
+                SELECT c.tg_id, c.actions_config->>:tag as action 
+                FROM watcher.channels c
+                WHERE c.actions_config->>:tag IS NOT NULL 
+                AND (c.sync_status->>:tag != 'ready' OR c.sync_status->>:tag IS NULL)
             """)
             res = await session.execute(query, {"tag": GROUP_TAG})
             targets = res.all()
 
             for ch_tg_id, action in targets:
                 from database.models import WorkerSubscription
+                
+                # Проверяем статус в логах именно для этого воркера
                 sub_res = await session.execute(select(WorkerSubscription).where(
-                    WorkerSubscription.worker_tg_id == me.id,
+                    WorkerSubscription.worker_tg_id == w_id,
                     WorkerSubscription.channel_id == ch_tg_id
                 ))
                 sub_log = sub_res.scalar_one_or_none()
 
+                # Если записи нет — создаем её (in_progress)
                 if not sub_log:
-                    sub_log = WorkerSubscription(worker_tg_id=me.id, channel_id=ch_tg_id, status='in_progress')
+                    sub_log = WorkerSubscription(worker_tg_id=w_id, channel_id=ch_tg_id, status='in_progress')
                     session.add(sub_log)
                     await session.commit()
                     continue
@@ -1406,25 +1363,32 @@ async def subscription_manager_loop():
                 if sub_log.status != 'in_progress':
                     continue
 
+                # ЛОГИКА ВСТУПЛЕНИЯ
                 if action == 'join':
-                    if await check_limits(session, me.id, ch_tg_id):
+                    # 1. Проверяем лимиты
+                    if await check_limits(session, w_id, ch_tg_id):
+                        # 2. Рандомный шанс (имитация распределения на 24 часа)
                         if random.random() < 0.05:
                             try:
                                 from telethon.tl.functions.channels import JoinChannelRequest
-                                await client(JoinChannelRequest(channel=ch_tg_id))
+                                await w_client(JoinChannelRequest(channel=ch_tg_id))
+                                
                                 sub_log.status = 'joined'
-                                await update_limit_count(session, me.id, ch_tg_id)
-                                print(f"✅ [ПОДПИСКА] Аккаунт {me.id} вступил в {ch_tg_id}")
+                                await update_limit_count(session, w_id, ch_tg_id)
+                                print(f"✅ [ПОДПИСКА] Аккаунт {w_id} успешно вступил в {ch_tg_id}")
                             except Exception as e:
-                                print(f"❌ [ПОДПИСКА-ERR] {e}")
+                                print(f"❌ [ПОДПИСКА-ERR] Аккаунт {w_id}: {e}")
                 
+                # ЛОГИКА ВЫХОДА
                 elif action == 'leave':
                     try:
                         from telethon.tl.functions.channels import LeaveChannelRequest
-                        await client(LeaveChannelRequest(channel=ch_tg_id))
+                        await w_client(LeaveChannelRequest(channel=ch_tg_id))
                         sub_log.status = 'left'
-                        print(f"🚪 [ВЫХОД] Аккаунт {me.id} покинул {ch_tg_id}")
-                    except: pass
+                        print(f"🚪 [ВЫХОД] Аккаунт {w_id} покинул {ch_tg_id}")
+                    except: 
+                        sub_log.status = 'left' # Помечаем как вышедший даже при ошибке
+                
             await session.commit()
 
 # --- ЗАПУСК ---
@@ -1455,7 +1419,6 @@ async def main():
     await client.start()
     # 3. Первичная загрузка данных
     KEYWORDS_DATA, MY_WORKERS, CHANNELS_MAP = await load_all_data()
-    client.add_event_handler(incoming_private_handler, events.NewMessage(incoming=True, func=lambda e: e.is_private))
     # 4. Регистрация обработчика и запуск фонового обновления
     client.add_event_handler(handler, events.NewMessage())
     asyncio.create_task(data_refresher())
@@ -1474,36 +1437,48 @@ async def main():
     asyncio.create_task(subscription_manager_loop())
     await client.run_until_disconnected()
 # --- ПУНКТ 3: ЗЕРКАЛО ЛС (ПРИЕМ СООБЩЕНИЙ) ---
-async def incoming_private_handler(event):
-    sender = await event.get_sender()
-    if sender.bot: return 
-    msg_obj = event.message
-    m_type = "text"
-    s_media_id = None
-    # Если есть медиа — пересылаем в MONITOR_STORAGE
-    if msg_obj.photo or msg_obj.voice or msg_obj.video or msg_obj.document:
-        try:
-            # Пересылаем в твое хранилище (из config.py)
-            fwd = await msg_obj.forward_to(MONITOR_STORAGE)
-            s_media_id = fwd.id
-            m_type = "photo" if msg_obj.photo else "media" # Упростим для примера
-        except Exception as e:
-            print(f"❌ Ошибка зеркала медиа: {e}")
-    me = await client.get_me()
-    async with async_session() as session_msg:
-        from database.models import AccountMessage
-        new_msg = AccountMessage(
-            msg_id=msg_obj.id,
-            worker_tg_id=me.id,
-            sender_id=event.sender_id,
-            text=msg_obj.message or f"[{m_type.upper()}]",
-            media_type=m_type,
-            storage_media_id=s_media_id, # Тот самый ID из хранилища
-            is_read=False
-        )
-        session_msg.add(new_msg)
-        await session_msg.commit()
-    print(f"📩 [ЛС] Сообщение (тип: {m_type}) сохранено.")
+# --- ПУНКТ 3: ЗЕРКАЛО ЛС (ПЕРСОНАЛЬНОЕ ДЛЯ КАЖДОГО ВОРКЕРА) ---
+
+async def start_private_mirror(w_client, w_id):
+    """Регистрирует слушателя ЛС для конкретного воркера"""
+    
+    @w_client.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
+    async def handler_ls(event):
+        sender = await event.get_sender()
+        # Игнорируем ботов
+        if sender and hasattr(sender, 'bot') and sender.bot: 
+            return 
+            
+        msg_obj = event.message
+        m_type = "text"
+        s_media_id = None
+        
+        # Если есть медиа — пересылаем в MONITOR_STORAGE
+        if msg_obj.photo or msg_obj.voice or msg_obj.video or msg_obj.document:
+            try:
+                fwd = await msg_obj.forward_to(MONITOR_STORAGE)
+                s_media_id = fwd.id
+                m_type = "photo" if msg_obj.photo else "media"
+            except Exception as e:
+                print(f"❌ [ЛС-ЗЕРКАЛО] Ошибка медиа: {e}")
+        
+        # Сохраняем в БД именно для этого воркера (w_id)
+        async with async_session() as session_msg:
+            from database.models import AccountMessage
+            new_msg = AccountMessage(
+                msg_id=msg_obj.id,
+                worker_tg_id=w_id,        # ПРАВИЛЬНЫЙ ID ВОРКЕРА
+                sender_id=event.sender_id,
+                text=msg_obj.message or f"[{m_type.upper()}]",
+                media_type=m_type,
+                storage_media_id=s_media_id,
+                is_read=False
+            )
+            session_msg.add(new_msg)
+            await session_msg.commit()
+            
+        print(f"📩 [ЛС] Аккаунт {w_id} получил сообщение от {event.sender_id}")
+
 async def vote_execution_loop():
     print("🗳 [ВОРКЕР] Модуль голосований ВКЛЮЧЕН в очередь...")
     await asyncio.sleep(5) # Даем время на подключение основного клиента
@@ -1584,6 +1559,108 @@ async def vote_execution_loop():
                         print(f"❌ [ГОЛОС] Ошибка выполнения рапорта #{r_id}: {e}")
         except Exception as e:
             print(f"⚠️ [ГОЛОС] Ошибка цикла: {e}")
+
+# --- ФУНКЦИЯ ЗАПУСКА ИНСТАНСА (Для каждого воркера свой мир) ---
+
+async def run_worker_instance(w_data):
+    """Запускает индивидуальный клиент и все его циклы"""
+    w_id = w_data.tg_id
+    
+    # Создаем персональный клиент
+    w_client = TelegramClient(
+        StringSession(w_data.session_string), 
+        w_data.api_id, w_data.api_hash,
+        device_model=w_data.device_model,
+        system_version=w_data.os_version,
+        app_version=w_data.app_version
+    )
+    
+    try:
+        await w_client.connect()
+        if not await w_client.is_user_authorized():
+            print(f"⚠️ [ВОРКЕР {w_id}] Не авторизован! Пропуск.")
+            return
+
+        # 1. ВКЛЮЧАЕМ СЛУШАТЕЛЯ ЛС (Зеркало)
+        await start_private_mirror(w_client, w_id)
+
+        # 2. ЗАПУСКАЕМ ВСЕ ПЕРСОНАЛЬНЫЕ ЦИКЛЫ
+        tasks = [
+            asyncio.create_task(subscription_manager_loop(w_client, w_id)),
+            asyncio.create_task(check_stars_balance_api(w_client, w_id)),
+            asyncio.create_task(check_inventory_loop(w_id, w_data.phone)),
+            asyncio.create_task(worker_outgoing_loop(w_client, w_id)),
+            asyncio.create_task(worker_luck_raid_loop(w_client, w_id)),
+            # Добавь сюда остальные циклы, если они есть (например, mention_loop)
+        ]
+        
+        print(f"✅ [ВОРКЕР {w_id}] Все модули активны.")
+        
+        # Держим соединение этого воркера
+        await w_client.run_until_disconnected()
+        
+    except Exception as e:
+        print(f"❌ [ВОРКЕР {w_id}] Критическая ошибка: {e}")
+    finally:
+        if w_client.is_connected():
+            await w_client.disconnect()
+
+# --- ГЛАВНАЯ ФУНКЦИЯ (ОРКЕСТРАТОР) ---
+
+async def main():
+    global client, KEYWORDS_DATA, MY_WORKERS, CHANNELS_MAP
+
+    print(f"📡 [ГРУППА {GROUP_TAG}] Полный запуск системы...")
+
+    # 1. ЗАПУСК ЧИТАТЕЛЯ (Глобальный мониторинг)
+    acc = await get_reader_from_db(GROUP_TAG)
+    if not acc:
+        print(f"❌ Читатель для {GROUP_TAG} не найден!")
+        return
+
+    client = TelegramClient(
+        StringSession(acc.session_string), 
+        acc.api_id, acc.api_hash,
+        device_model=acc.device_model,
+        system_version=acc.os_version,
+        app_version=acc.app_version
+    )
+    await client.start()
+    
+    # Загружаем кэш данных
+    KEYWORDS_DATA, MY_WORKERS, CHANNELS_MAP = await load_all_data()
+    
+    # Обработчик постов (Только читатель видит каналы!)
+    client.add_event_handler(handler, events.NewMessage())
+    
+    # Фоновые задачи читателя
+    asyncio.create_task(data_refresher())
+    asyncio.create_task(resolve_channel_ids())
+    asyncio.create_task(passport_execution_loop()) # Двигатель паспортов (один на группу)
+
+    # 2. ЗАПУСК ВСЕХ ВОРКЕРОВ ГРУППЫ
+    async with async_session() as session:
+        res = await session.execute(
+            select(WorkerAccount).where(
+                WorkerAccount.group_tag == GROUP_TAG, 
+                WorkerAccount.is_alive == True
+            )
+        )
+        workers_list = res.scalars().all()
+        
+    print(f"🚀 [ОРКЕСТРАТОР] Найдено {len(workers_list)} живых воркеров. Запуск...")
+
+    for w_data in workers_list:
+        # Запускаем каждого воркера как отдельную задачу
+        asyncio.create_task(run_worker_instance(w_data))
+        # Спим 3 секунды между входами, чтобы не словить бан за массовый логин
+        await asyncio.sleep(3) 
+
+    print(f"✨ [СИСТЕМА] Группа {GROUP_TAG} полностью развернута. Мониторинг активен.")
+    
+    # Основной цикл держит Читатель
+    await client.run_until_disconnected()
+
 if __name__ == "__main__":
     try:
         asyncio.run(main())

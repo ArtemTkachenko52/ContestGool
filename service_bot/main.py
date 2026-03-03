@@ -1560,21 +1560,33 @@ async def decision_channel(callback: types.CallbackQuery):
         if not sub: return
 
         if decision == "ok":
-            # Балансировка: ищем группу, где меньше всего каналов
-            # Используем схему watcher для таблицы channels
+            # 1. Балансировка: ищем группу, где меньше всего каналов
             group_query = text("SELECT group_tag, COUNT(*) as cnt FROM watcher.channels GROUP BY group_tag ORDER BY cnt ASC LIMIT 1")
             res_group = await session.execute(group_query)
-            best_group = res_group.first()
-            target_group = best_group[0] if best_group else "A1"
+            row = res_group.first()
+            target_group = row[0] if row else "A1"
 
-            # Добавляем канал в работу
-            new_channel = TargetChannel(username=sub.username, group_tag=target_group, status="idle")
+            # 2. Добавляем канал с предустановками (Пункт 1 ТЗ)
+            new_channel = TargetChannel(
+                username=sub.username, 
+                group_tag=target_group, # Основная группа
+                status="idle",
+                # СРАЗУ СТАВИМ ЗАДАЧУ НА ВСТУПЛЕНИЕ
+                actions_config={target_group: "join"},
+                # СТАВИМ СТАТУС "НЕ ГОТОВ" (pending)
+                sync_status={target_group: "pending"},
+                extra_groups=[]
+            )
             session.add(new_channel)
             
-            # Начисляем бонус оператору
-            await session.execute(update(Operator).where(Operator.tg_id == sub.operator_id).values(count_approved=Operator.count_approved + 1))
+            # 3. Начисляем бонус оператору
+            await session.execute(
+                update(Operator)
+                .where(Operator.tg_id == sub.operator_id)
+                .values(count_approved=Operator.count_approved + 1)
+            )
             sub.status = "approved"
-            res_text = f"✅ Одобрено! Канал ушел в группу <b>{target_group}</b>"
+            res_text = f"✅ Одобрено! Канал ушел в группу <b>{target_group}</b>. Инициировано вступление аккаунтов."
         else:
             sub.status = "declined"
             res_text = "❌ Заявка отклонена."
@@ -1582,63 +1594,69 @@ async def decision_channel(callback: types.CallbackQuery):
         await session.commit()
     await callback.message.edit_text(res_text, parse_mode="HTML")
 
+
 async def sync_groups_readiness_loop():
-    """Фоновый цикл: проверяет, все ли воркеры вступили в канал (Пункт 1)"""
+    """Фоновый цикл: проверяет готовность групп (Пункт 1: Исправленный)"""
     print("🧠 [СИНХРОНИЗАТОР] Модуль проверки готовности групп запущен.")
     while True:
-        await asyncio.sleep(60) # Проверка раз в минуту
-        async with async_session() as session:
-            # 1. Берем все каналы, где есть настройки действий
-            query = select(TargetChannel).where(TargetChannel.actions_config != {})
-            channels = (await session.execute(query)).scalars().all()
+        await asyncio.sleep(60) 
+        try:
+            async with async_session() as session:
+                # 1. Просто берем все каналы без условий в SQL
+                query = select(TargetChannel)
+                result = await session.execute(query)
+                channels = result.scalars().all()
 
-            for ch in channels:
-                actions = ch.actions_config or {}
-                current_sync = dict(ch.sync_status) if ch.sync_status else {}
-                changed = False
+                for ch in channels:
+                    # 2. Проверка пустоты конфига уже на стороне Python (безопасно)
+                    if not ch.actions_config:
+                        continue
+                        
+                    actions = dict(ch.actions_config)
+                    current_sync = dict(ch.sync_status) if ch.sync_status else {}
+                    changed = False
 
-                for group_tag, action in actions.items():
-                    if current_sync.get(group_tag) == "ready":
-                        continue # Уже готова, пропускаем
+                    for group_tag, action in actions.items():
+                        if current_sync.get(group_tag) == "ready":
+                            continue
 
-                    # 2. Считаем живых воркеров в этой группе
-                    w_count_q = select(func.count(WorkerAccount.id)).where(
-                        WorkerAccount.group_tag == group_tag,
-                        WorkerAccount.is_alive == True
-                    )
-                    total_workers = (await session.execute(w_count_q)).scalar() or 0
+                        # Считаем живых воркеров группы
+                        w_count_q = select(func.count(WorkerAccount.id)).where(
+                            WorkerAccount.group_tag == group_tag,
+                            WorkerAccount.is_alive == True
+                        )
+                        total_workers = (await session.execute(w_count_q)).scalar() or 0
+                        if total_workers == 0: continue
 
-                    if total_workers == 0: continue
+                        # Считаем вступивших по логам
+                        from database.models import WorkerSubscription
+                        sub_count_q = select(func.count(WorkerSubscription.id)).where(
+                            WorkerSubscription.channel_id == ch.tg_id,
+                            WorkerSubscription.status == 'joined'
+                        ).join(WorkerAccount, WorkerAccount.tg_id == WorkerSubscription.worker_tg_id).\
+                          where(WorkerAccount.group_tag == group_tag)
+                        
+                        joined_workers = (await session.execute(sub_count_q)).scalar() or 0
 
-                    # 3. Считаем, сколько из них реально вступили (по логам subscriptions)
-                    from database.models import WorkerSubscription
-                    sub_count_q = select(func.count(WorkerSubscription.id)).where(
-                        WorkerSubscription.channel_id == ch.tg_id,
-                        WorkerSubscription.status == 'joined'
-                    ).join(WorkerAccount, WorkerAccount.tg_id == WorkerSubscription.worker_tg_id).\
-                      where(WorkerAccount.group_tag == group_tag)
+                        if joined_workers >= total_workers:
+                            current_sync[group_tag] = "ready"
+                            changed = True
+                            print(f"🎉 [СИНХРОНИЗАТОР] Группа {group_tag} ГОТОВА в {ch.username or ch.tg_id}")
+
+                    # 3. Логика удаления отработанных ТГК (действие 'leave')
+                    if all(current_sync.get(g) == "ready" for g in actions.keys()):
+                        if all(act == "leave" for act in actions.values()):
+                            print(f"🗑 [СИНХРОНИЗАТОР] Канал {ch.tg_id} удален после выхода групп.")
+                            await session.delete(ch)
+                            changed = False 
                     
-                    joined_workers = (await session.execute(sub_count_q)).scalar() or 0
-
-                    # 4. Если все вступили — ставим статус READY
-                    if joined_workers >= total_workers:
-                        current_sync[group_tag] = "ready"
-                        changed = True
-                        print(f"🎉 [СИНХРОНИЗАТОР] Группа {group_tag} ГОТОВА в канале {ch.username or ch.tg_id}")
-
-                # 5. Если действие было 'leave' и все вышли (0 вступивших)
-                # Удаляем канал, если он больше не нужен
-                if all(current_sync.get(g) == "ready" for g in actions.keys()):
-                    # Если все действия были 'leave' — удаляем ТГК (как ты просил в ТЗ)
-                    if all(act == "leave" for act in actions.values()):
-                        print(f"🗑 [СИНХРОНИЗАТОР] Канал {ch.tg_id} полностью отработан. Удаление...")
-                        await session.delete(ch)
-                        changed = False # Чтобы не пытаться обновить удаленное
+                    if changed:
+                        ch.sync_status = current_sync
                 
-                if changed:
-                    ch.sync_status = current_sync
-            
-            await session.commit()
+                await session.commit()
+        except Exception as e:
+            print(f"⚠️ [СИНХРОНИЗАТОР-ERR] Ошибка цикла: {e}")
+
 
 # --- ЗАПУСК --
 async def main():
