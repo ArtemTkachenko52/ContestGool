@@ -208,3 +208,23 @@ ALTER TABLE watcher.channels ADD COLUMN IF NOT EXISTS participating_groups JSONB
 -- Убеждаемся, что в паспортах колонка есть и она типа JSONB
 ALTER TABLE management.passports ADD COLUMN IF NOT EXISTS participating_groups JSONB DEFAULT '[]';
 ALTER TABLE management.passports ALTER COLUMN participating_groups TYPE JSONB USING participating_groups::JSONB;
+
+
+
+
+
+
+
+
+
+
+
+
+CREATE TABLE IF NOT EXISTS workers.fast_tasks (
+    id SERIAL PRIMARY KEY,
+    channel_id BIGINT,
+    post_id INTEGER,
+    group_tag VARCHAR,
+    status VARCHAR DEFAULT 'pending', -- 'pending', 'completed'
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);

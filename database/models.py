@@ -227,3 +227,13 @@ class DailyLimitCounter(Base):
     entity_type = Column(String) # 'worker' или 'channel'
     entity_id = Column(BigInteger) # tg_id воркера или канала
     current_count = Column(Integer, default=0)
+class FastTask(Base):
+    """Таблица для мгновенных ответов 'Кто первый' (Пункт 9)"""
+    __tablename__ = 'fast_tasks'
+    __table_args__ = {"schema": "workers"}
+    id = Column(Integer, primary_key=True)
+    channel_id = Column(BigInteger)
+    post_id = Column(Integer)
+    group_tag = Column(String)
+    status = Column(String, default="pending") # 'pending', 'completed'
+    created_at = Column(DateTime, server_default=func.now())
