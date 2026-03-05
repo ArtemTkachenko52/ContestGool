@@ -15,7 +15,6 @@ class BaseAccount:
     device_model = Column(String)
     os_version = Column(String)
     app_version = Column(String)
-    # ----------------------------------
     system_lang = Column(String, default="ru-RU")
 # --- СХЕМА WATCHER (Мониторинг) ---
 class Keyword(Base):
@@ -125,7 +124,6 @@ class WorkerAccount(Base, BaseAccount):
     is_financial_ready = Column(Boolean, default=False)
     last_check_window_end = Column(DateTime, nullable=True)
     last_inventory_check_window_end = Column(DateTime, nullable=True)
-
 class AccountMessage(Base):
     __tablename__ = 'messages'
     __table_args__ = {"schema": "workers"}

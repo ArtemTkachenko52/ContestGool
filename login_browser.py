@@ -15,7 +15,6 @@ async def login():
         page = await context.new_page()
         # ЗАХОДИМ СТРОГО В ВЕРСИЮ /A/
         await page.goto('https://web.telegram.org')
-
         print("🔓 ВНИМАНИЕ: Залогинься в Телеграм через QR или СМС.")
         print("🔓 Дождись появления списка чатов.")
         print("❌ Как только увидишь свои чаты — ЗАКРОЙ ОКНО БРАУЗЕРА.")
