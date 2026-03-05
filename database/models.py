@@ -42,6 +42,8 @@ class TargetChannel(Base):
     # ID ЧАТА КОММЕНТАРИЕВ (Пункт 2, часть 1)
     comment_chat_id = Column(BigInteger, nullable=True)
     participating_groups = Column(JSONB, server_default='[]')
+    trigger_count = Column(Integer, default=0) # Сколько раз сработал за всё время
+    last_trigger_at = Column(DateTime, server_default=func.now(), onupdate=func.now()) # Дата последней активности
 class WorkerSubscription(Base):
     """Таблица логов вступлений (Пункт 1: Хранилище данных)"""
     __tablename__ = 'subscriptions'
@@ -197,7 +199,7 @@ class OutgoingMessage(Base):
     __table_args__ = {"schema": "workers"}
     id = Column(Integer, primary_key=True)
     worker_tg_id = Column(BigInteger)
-    receiver_id = Column(BigInteger)
+    receiver_id = Column(String) # Теперь принимает и ID (как строку), и @username
     reply_to_msg_id = Column(Integer, nullable=True)
     text = Column(Text, nullable=True)
     task_type = Column(String, default="text") # text, reaction, media
@@ -235,3 +237,12 @@ class FastTask(Base):
     group_tag = Column(String)
     status = Column(String, default="pending") # 'pending', 'completed'
     created_at = Column(DateTime, server_default=func.now())
+class WinHunt(Base):
+    """Модель для отслеживания контакта админа после победы"""
+    __tablename__ = 'win_hunts'
+    __table_args__ = {"schema": "workers"}
+    id = Column(Integer, primary_key=True)
+    worker_tg_id = Column(BigInteger) # Кто победил
+    channel_id = Column(BigInteger)   # В каком канале
+    counter = Column(Integer, default=0) # Сколько постов пропустили (0-3)
+    status = Column(String, default="active") # active / finished

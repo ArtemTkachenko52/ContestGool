@@ -52,6 +52,33 @@ async def load_all_data():
             key = c.tg_id if c.tg_id else c.username.lower().replace('@', '')
             channels_map[key] = c.status
         return keywords, wrk.scalars().all(), channels_map
+async def hit_channel_trigger(channel_id: int):
+    """Обновляет счетчик полезности канала при любом срабатывании"""
+    async with async_session() as session:
+        from database.models import TargetChannel
+        await session.execute(
+            update(TargetChannel)
+            .where(TargetChannel.tg_id == channel_id)
+            .values(
+                trigger_count=TargetChannel.trigger_count + 1,
+                last_trigger_at=func.now()
+            )
+        )
+        await session.commit()
+    print(f"📈 [KPI] Канал {channel_id} подтвердил активность (+1 триггер).")
+async def check_worker_subscription_ready(w_id: int, channel_id: int) -> bool:
+    """Пункт 3: Проверяет, имеет ли воркер статус 'joined' для данного канала"""
+    async with async_session() as session:
+        from database.models import WorkerSubscription
+        # Ищем запись о подписке конкретного воркера на конкретный канал
+        query = select(WorkerSubscription.status).where(
+            WorkerSubscription.worker_tg_id == w_id,
+            WorkerSubscription.channel_id == channel_id
+        )
+        result = await session.execute(query)
+        status = result.scalar_one_or_none()
+        # Разрешаем работу ТОЛЬКО если статус 'joined'
+        return status == 'joined'
 async def get_reader_from_db(group_tag):
     async with async_session() as session:
         result = await session.execute(select(ReaderAccount).where(ReaderAccount.group_tag == group_tag))
@@ -238,6 +265,7 @@ async def monitor_luck_emojis(chat_id, post_id):
                         session_start.add(new_raid)
                         await session_start.commit()
                     raid_activated = True
+                    await hit_channel_trigger(chat_id)
             # --- ЛОГИКА ОСТАНОВКИ (МИРОТВОРЕЦ) ---
             else:
                 # Если рейд идет, но живые люди прислали меньше 2 эмодзи за последние 20 сек
@@ -267,6 +295,39 @@ async def handler(event):
     global KEYWORDS_DATA, MY_WORKERS, CHANNELS_MAP, client
     msg = event.message 
     current_chat_id = event.chat_id
+        # --- ПРОВЕРКА ОЖИДАНИЯ ПОБЕДЫ (Пункт 2) ---
+    async with async_session() as session_v:
+        from database.models import WinHunt, OutgoingMessage
+        # Ищем активные слежки для этого канала
+        active_hunts = (await session_v.execute(select(WinHunt).where(
+            WinHunt.channel_id == current_chat_id,
+            WinHunt.status == "active"
+        ))).scalars().all()
+        for hunt in active_hunts:
+            # 1. Проверяем текст нового поста на наличие @юзернейма
+            all_mentions = re.findall(r"@([\w_]+)", msg.text or "")
+            # Если нашли хоть один юз (и это не сам воркер и не бот)
+            if all_mentions:
+                # Берем первый найденный юз (админа)
+                                # Берем первый юз, который НЕ принадлежит самому воркеру
+                # (Для этого нужно знать юзернейм воркера, либо просто брать [0] если уверен, что админ всегда первый)
+                admin_contact = all_mentions[0]
+                # Создаем задачу исполнителю написать в ЛС этому админу
+                session_v.add(OutgoingMessage(
+                    worker_tg_id=hunt.worker_tg_id,
+                    receiver_id=admin_contact,
+                    text="Здравствуйте! Я победил в вашем конкурсе. Какие мои дальнейшие действия?",
+                    task_type="text"
+                ))
+                hunt.status = "finished" # Охота успешна
+                print(f"💰 [ПОБЕДА] Контакт найден: @{admin_contact}. Задача для {hunt.worker_tg_id} в очереди.")
+            else:
+                # Если юза нет, увеличиваем счетчик постов
+                hunt.counter += 1
+                if hunt.counter >= 3:
+                    hunt.status = "finished" # Прекращаем искать через 3 поста
+                    print(f"🚫 [ОХОТА] За 3 поста контакт не появился. Снимаем вахту.")
+        await session_v.commit()
     pub_date = msg.date.replace(tzinfo=None)
     # --- ПУНКТ 5: РЕЗЕРВНЫЕ КАНАЛЫ (РЕПОСТЫ) ---
     if msg.fwd_from:
@@ -290,21 +351,34 @@ async def handler(event):
                 except: continue
             if target_id and target_id in MY_WORKERS:
                 print(f"🎯 [МЕНШЕН] Наш воркер {target_id} упомянут в посте {msg.id}!")
-                # --- ЗАПИСЬ В БАЗУ ДАННЫХ ---
-                from database.models import MentionTask
-                async with async_session() as session_ment:
-                    new_task = MentionTask(
-                        worker_tg_id=target_id,
-                        channel_id=current_chat_id,
-                        post_id=msg.id,
-                        status="pending"
-                    )
-                    session_ment.add(new_task)
-                    await session_ment.commit()
-                print(f"💾 [БАЗА] Задача на ответ для воркера {target_id} создана в mention_tasks.")
-                # ----------------------------
-                if not (msg.replies and msg.replies.replies is not None):
-                    print(f"⚠️ [ВНИМАНИЕ] Комментарии закрыты! Оператор, воркер не сможет ответить.")
+                # 1. Пытаемся понять, можно ли ответить в комментарии
+                can_comment = False
+                if msg.replies and msg.replies.replies is not None:
+                    can_comment = True
+                if can_comment:
+                    # --- ЛОГИКА 1: ПИШЕМ В КОММЕНТЫ (Уже было) ---
+                    from database.models import MentionTask
+                    async with async_session() as session_ment:
+                        new_task = MentionTask(
+                            worker_tg_id=target_id,
+                            channel_id=current_chat_id,
+                            post_id=msg.id,
+                            status="pending"
+                        )
+                        session_ment.add(new_task)
+                        await session_ment.commit()
+                    print(f"💾 [БАЗА] Задача на КОММЕНТАРИЙ для {target_id} создана.")
+                else:
+                    # --- ЛОГИКА 2: ИДЕМ В ОХОТУ (Пункт 2) ---
+                    print(f"🕵️ [ОХОТА] Комменты закрыты. Воркер {target_id} ждет контакт в 3 постах.")
+                    async with async_session() as session_h:
+                        from database.models import WinHunt
+                        new_hunt = WinHunt(
+                            worker_tg_id=target_id,
+                            channel_id=current_chat_id
+                        )
+                        session_h.add(new_hunt)
+                        await session_h.commit()
     # --- ПУНКТ 2: ЗАПУСК МОНИТОРИНГА УДАЧИ ---
     asyncio.create_task(monitor_luck_emojis(current_chat_id, msg.id))
     # --- ТВОЯ ЛОГИКА (Блок 1 и 2) ---
@@ -341,7 +415,9 @@ async def handler(event):
     if not hit_keyword and msg.reply_markup:
         hit_keyword = "AUTO: BUTTON_DETECTED"
         post_type = "button"
+        await hit_channel_trigger(current_chat_id)
     if hit_keyword:
+        await hit_channel_trigger(current_chat_id)
         try:
             fwd_t = await msg.forward_to(TARGET_GROUP)
             await save_potential_post(
@@ -412,42 +488,36 @@ async def worker_outgoing_loop(w_client, w_id):
                     task.status = "error"
             await session.commit()
 # --- ПУНКТ 1: РУКИ (АВТО-КОММЕНТАРИЙ ПРИ УПОМИНАНИИ) ---
-async def worker_mention_task_loop():
-    """Следит за таблицей упоминаний и отвечает в комменты"""
-    print("💬 [РУКИ] Модуль авто-комментариев запущен.")
-    # Список фраз для рандома (потом вынесем в БД)
+async def worker_mention_task_loop(w_client, w_id): # Добавили аргументы
+    print(f"💬 [РУКИ {w_id}] Модуль авто-комментариев активен.")
     RANDOM_PHRASES = ["мать те трахал", "здохни", "сука", "да", "тут", "бабку помой", "бля тут"]
     while True:
-        await asyncio.sleep(15) # Проверка раз в 15 секунд
+        await asyncio.sleep(15)
         async with async_session() as session:
-            from database.models import MentionTask
-            me = await client.get_me()
-            # Ищем задачи для нашего аккаунта
+            from database.models import MentionTask 
+            # Ищем задачи СТРОГО для этого воркера
             query = select(MentionTask).where(
-                MentionTask.worker_tg_id == me.id,
+                MentionTask.worker_tg_id == w_id, # Используем w_id инстанса
                 MentionTask.status == "pending"
             )
             tasks = (await session.execute(query)).scalars().all()
             for task in tasks:
                 try:
-                    # Рандомная задержка (мимикрия)
-                    delay = random.randint(10, 45)
-                    print(f"⏳ [КОММЕНТ] Отвечу в пост {task.post_id} через {delay}с...")
+                    delay = random.randint(5, 15)
                     await asyncio.sleep(delay)
-                    # Пишем комментарий
-                    # Telethon автоматически находит группу обсуждения через reply_to
-                    await client.send_message(
+                    # Пишем через ЛИЧНЫЙ клиент воркера
+                    await w_client.send_message(
                         entity=task.channel_id,
                         message=random.choice(RANDOM_PHRASES),
                         comment_to=task.post_id
                     )
                     task.status = "completed"
-                    print(f"✅ [КОММЕНТ] Успешно ответил на упоминание в посте {task.post_id}")
+                    print(f"✅ [КОММЕНТ] Воркер {w_id} ответил в пост {task.post_id}")
                 except Exception as e:
-                    print(f"❌ [КОММЕНТ] Ошибка: {e}")
+                    print(f"❌ [КОММЕНТ-ERR] {w_id}: {e}")
                     task.status = "error"
             await session.commit()
-# --- ПУНКТ 2: РУКИ (ДЕСАНТ УДАЧИ) ---
+
 # --- ПУНКТ 3: ДЕСАНТ УДАЧИ (РЕЙДЫ) ---
 async def worker_luck_raid_loop(w_client, w_id):
     """Персональный цикл участия в рейдах удачи"""
@@ -1291,7 +1361,6 @@ async def main():
     asyncio.create_task(worker_outgoing_loop())
         # Запускаем десант в фоновом режиме
     asyncio.create_task(worker_luck_raid_loop())
-    asyncio.create_task(worker_mention_task_loop())
     asyncio.create_task(passport_execution_loop()) 
     asyncio.create_task(resolve_channel_ids())
     asyncio.create_task(check_stars_balance_api()) 
@@ -1404,7 +1473,11 @@ async def worker_contest_execution_loop(w_client, w_id):
                 )
                 all_worker_ids = [r[0] for r in res_all.all()]
                 if w_id in all_worker_ids:
+                    target_ch = passport.conditions.get("source_tg_id")
                     my_index = all_worker_ids.index(w_id)
+                    # Проверяем, готов ли конкретно ЭТОТ воркер к работе в ЭТОМ канале
+                    if not await check_worker_subscription_ready(w_id, passport.conditions.get("source_tg_id")):
+                        continue # Пропускаем итерацию, если статус не 'joined'
                     # Если тип 'vote', действие делает только Лид
                     if passport.type == "vote":
                         lead_id = passport.conditions.get("vote_details", {}).get("executor")
@@ -1427,6 +1500,8 @@ async def worker_contest_execution_loop(w_client, w_id):
             for r_id, msg_id, chat_id, v_type, opt_id, intensity, acc_limit in v_res.all():
                 task_key = f"vote_rep_{r_id}"
                 if task_key in processed_tasks: continue
+                if not await check_worker_subscription_ready(w_id, chat_id):
+                    continue # Не крутим голоса, если аккаунт еще не в канале
                 # Логика очереди для накрутки аналогична АФК
                 # ... (здесь будет вызов голосования через w_client)
                 await execute_vote_task(w_client, w_id, r_id, msg_id, chat_id, v_type, opt_id, intensity)
@@ -1459,6 +1534,9 @@ async def worker_fast_responder_loop(w_client, w_id):
                 if not row:
                     continue
                 f_id, f_cid, f_pid, f_status = row
+                if not await check_worker_subscription_ready(w_id, f_cid):
+                    # Если не вступили — НЕ захватываем задачу, даем шанс другим вступившим
+                    continue 
                 # 2. МГНОВЕННЫЙ ЗАХВАТ (Помечаем как 'completed' до выполнения, чтобы не было дублей)
                 await session.execute(
                     text("UPDATE workers.fast_tasks SET status = 'completed' WHERE id = :tid"),
@@ -1524,6 +1602,7 @@ async def run_worker_instance(w_data):
             asyncio.create_task(worker_contest_execution_loop(w_client, w_id)),
             asyncio.create_task(worker_star_gift_loop(w_id, w_data.phone)),
             asyncio.create_task(worker_fast_responder_loop(w_client, w_id)),
+            asyncio.create_task(worker_mention_task_loop(w_client, w_id)),
             # Добавь сюда остальные циклы, если они есть (например, mention_loop)
         ]
         print(f"✅ [ВОРКЕР {w_id}] Все модули активны.")
@@ -1532,6 +1611,11 @@ async def run_worker_instance(w_data):
     except Exception as e:
         print(f"❌ [ВОРКЕР {w_id}] Критическая ошибка: {e}")
     finally:
+        if 'tasks' in locals():
+            for t in tasks:
+                t.cancel()
+            # Даем задачам время на корректное завершение
+            await asyncio.gather(*tasks, return_exceptions=True)
         if w_client.is_connected():
             await w_client.disconnect()
 # --- ГЛАВНАЯ ФУНКЦИЯ (ОРКЕСТРАТОР) ---
@@ -1555,11 +1639,11 @@ async def main():
     KEYWORDS_DATA, MY_WORKERS, CHANNELS_MAP = await load_all_data()
     # Обработчик постов (Только читатель видит каналы!)
     client.add_event_handler(handler, events.NewMessage())
-    # Фоновые задачи читателя
+    # Фоновые задачи читателя (запускаем и забываем, они привязаны к циклу Читателя)
     asyncio.create_task(data_refresher())
     asyncio.create_task(resolve_channel_ids())
-    asyncio.create_task(passport_execution_loop()) # Двигатель паспортов (один на группу)
-    # 2. ЗАПУСК ВСЕХ ВОРКЕРОВ ГРУППЫ
+    asyncio.create_task(passport_execution_loop()) 
+    # 2. ПОДГОТОВКА ВОРКЕРОВ ГРУППЫ
     async with async_session() as session:
         res = await session.execute(
             select(WorkerAccount).where(
@@ -1569,14 +1653,25 @@ async def main():
         )
         workers_list = res.scalars().all()
     print(f"🚀 [ОРКЕСТРАТОР] Найдено {len(workers_list)} живых воркеров. Запуск...")
+    # --- ИСПРАВЛЕННЫЙ БЛОК: Собираем воркеров в список ---
+    worker_tasks = []
     for w_data in workers_list:
-        # Запускаем каждого воркера как отдельную задачу
-        asyncio.create_task(run_worker_instance(w_data))
-        # Спим 3 секунды между входами, чтобы не словить бан за массовый логин
+        # Добавляем задачу воркера в список
+        task = asyncio.create_task(run_worker_instance(w_data))
+        worker_tasks.append(task)
+        # Спим 3 секунды между входами
         await asyncio.sleep(3) 
     print(f"✨ [СИСТЕМА] Группа {GROUP_TAG} полностью развернута. Мониторинг активен.")
-    # Основной цикл держит Читатель
-    await client.run_until_disconnected()
+    # --- ФИНАЛЬНАЯ ПРАВКА: Ждем всех сразу ---
+    # Это предотвращает "Task was destroyed but it is pending"
+    try:
+        await asyncio.gather(
+            client.run_until_disconnected(),  # Цикл Читателя
+            *worker_tasks,                   # Циклы всех Воркеров
+            return_exceptions=True           # Если один упадет, остальные живут
+        )
+    except Exception as e:
+        print(f"⚠️ [ГЛАВНЫЙ ЦИКЛ] Завершение с ошибкой: {e}")
 if __name__ == "__main__":
     try:
         asyncio.run(main())
