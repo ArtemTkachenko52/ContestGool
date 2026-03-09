@@ -66,19 +66,7 @@ async def hit_channel_trigger(channel_id: int):
         )
         await session.commit()
     print(f"📈 [KPI] Канал {channel_id} подтвердил активность (+1 триггер).")
-async def check_worker_subscription_ready(w_id: int, channel_id: int) -> bool:
-    """Пункт 3: Проверяет, имеет ли воркер статус 'joined' для данного канала"""
-    async with async_session() as session:
-        from database.models import WorkerSubscription
-        # Ищем запись о подписке конкретного воркера на конкретный канал
-        query = select(WorkerSubscription.status).where(
-            WorkerSubscription.worker_tg_id == w_id,
-            WorkerSubscription.channel_id == channel_id
-        )
-        result = await session.execute(query)
-        status = result.scalar_one_or_none()
-        # Разрешаем работу ТОЛЬКО если статус 'joined'
-        return status == 'joined'
+
 async def get_reader_from_db(group_tag):
     async with async_session() as session:
         result = await session.execute(select(ReaderAccount).where(ReaderAccount.group_tag == group_tag))
@@ -1473,11 +1461,7 @@ async def worker_contest_execution_loop(w_client, w_id):
                 )
                 all_worker_ids = [r[0] for r in res_all.all()]
                 if w_id in all_worker_ids:
-                    target_ch = passport.conditions.get("source_tg_id")
                     my_index = all_worker_ids.index(w_id)
-                    # Проверяем, готов ли конкретно ЭТОТ воркер к работе в ЭТОМ канале
-                    if not await check_worker_subscription_ready(w_id, passport.conditions.get("source_tg_id")):
-                        continue # Пропускаем итерацию, если статус не 'joined'
                     # Если тип 'vote', действие делает только Лид
                     if passport.type == "vote":
                         lead_id = passport.conditions.get("vote_details", {}).get("executor")
@@ -1500,8 +1484,6 @@ async def worker_contest_execution_loop(w_client, w_id):
             for r_id, msg_id, chat_id, v_type, opt_id, intensity, acc_limit in v_res.all():
                 task_key = f"vote_rep_{r_id}"
                 if task_key in processed_tasks: continue
-                if not await check_worker_subscription_ready(w_id, chat_id):
-                    continue # Не крутим голоса, если аккаунт еще не в канале
                 # Логика очереди для накрутки аналогична АФК
                 # ... (здесь будет вызов голосования через w_client)
                 await execute_vote_task(w_client, w_id, r_id, msg_id, chat_id, v_type, opt_id, intensity)
@@ -1534,9 +1516,6 @@ async def worker_fast_responder_loop(w_client, w_id):
                 if not row:
                     continue
                 f_id, f_cid, f_pid, f_status = row
-                if not await check_worker_subscription_ready(w_id, f_cid):
-                    # Если не вступили — НЕ захватываем задачу, даем шанс другим вступившим
-                    continue 
                 # 2. МГНОВЕННЫЙ ЗАХВАТ (Помечаем как 'completed' до выполнения, чтобы не было дублей)
                 await session.execute(
                     text("UPDATE workers.fast_tasks SET status = 'completed' WHERE id = :tid"),
