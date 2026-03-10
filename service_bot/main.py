@@ -5,13 +5,13 @@ from aiogram.fsm.context import FSMContext
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from decouple import config
 from sqlalchemy import select, update, func, text  
-from datetime import datetime
+from datetime import datetime, timedelta
 # Импорты из проекта
 from database.config import async_session
 from database.models import (
     Operator, PotentialPost, ContestPassport, 
     TargetChannel, VotingReport, StarReport, 
-    GroupChannelRelation, OutgoingMessage, WorkerAccount,  ChannelSubmission
+    GroupChannelRelation, OutgoingMessage, WorkerAccount,  ChannelSubmission, ExtraChat
 )
 from service_bot.states import ContestForm, ScalerForm
 # Настройки
@@ -33,7 +33,6 @@ def get_conditions_kb(selected_conditions: list):
     options = {
         "sub": "Подписка 📢",
         "reac": "Реакция 👍",
-        "comm": "Комментарий 💬",
         "repost": "Репост 🔄"
     }
     for code, name in options.items():
@@ -172,7 +171,7 @@ async def process_type(callback: types.CallbackQuery, state: FSMContext):
     await state.update_data(contest_type=callback.data.replace("type_", ""))
     await state.set_state(ContestForm.choosing_prize)
     builder = InlineKeyboardBuilder()
-    prizes = ["Деньги 💵", "Звезды ⭐", "NFT 🖼", "Подарок 🎁", "Ценности 🎮", "Другое ⚙️"]
+    prizes = ["Звезды ⭐", "NFT 🖼", "Подарок 🎁", "Другое ⚙️"]
     for p in prizes:
         builder.add(types.InlineKeyboardButton(text=p, callback_data=f"prize_{p}"))
     builder.adjust(2)
@@ -285,14 +284,58 @@ async def process_conditions(callback: types.CallbackQuery, state: FSMContext):
 async def check_afk_substeps(message, state: FSMContext):
     data = await state.get_data()
     conds = data.get("selected_conds", [])
+    # 1. Если выбрана подписка - запрашиваем ссылки
     if "sub" in conds:
         await state.set_state(ContestForm.input_sub_links)
         await message.answer("🔗 Введите ссылки на ТГК для подписки:")
+    # 2. Если выбран репост - запрашиваем количество
     elif "repost" in conds:
         await state.set_state(ContestForm.input_repost_count)
         await message.answer("🔄 Введите количество чатов для репоста:")
+    # 3. ЕСЛИ ВСЕ ВВЕДЕНО - ПЕРЕХОДИМ К ВЫБОРУ ГРУПП (ВМЕСТО ИНТЕНСИВНОСТИ)
     else:
-        await ask_intensity(message, state)
+        await ask_afk_groups(message, state) # <-- ВЫЗОВ НОВОЙ ФУНКЦИИ
+# ВСТАВЬТЕ ЭТУ ФУНКЦИЮ СРАЗУ ПОСЛЕ check_afk_substeps
+async def ask_afk_groups(message, state: FSMContext):
+    data = await state.get_data()
+    post_id = data['current_post_id']
+    async with async_session() as session:
+        # Находим ТГК, чтобы увидеть, какие группы в статусе 'ready'
+        res = await session.execute(
+            select(TargetChannel).join(PotentialPost, PotentialPost.source_tg_id == TargetChannel.tg_id).where(PotentialPost.id == post_id)
+        )
+        ch = res.scalar_one()
+        # Собираем только те группы, где инвайт завершен
+        ready_groups = [g for g, status in (ch.sync_status or {}).items() if status == "ready"]
+    if not ready_groups:
+        await message.answer("⚠️ Нет готовых групп (инвайт еще идет). Используйте только основную.")
+        ready_groups = [ch.group_tag] # Фолбэк на основную
+    builder = InlineKeyboardBuilder()
+    selected = data.get("participating_groups", [])
+    for g in ready_groups:
+        mark = " ✅" if g in selected else ""
+        builder.row(types.InlineKeyboardButton(text=f"Группа {g}{mark}", callback_data=f"afksel_{g}"))
+    builder.row(types.InlineKeyboardButton(text="➡️ Далее (Интенсивность)", callback_data="afksel_done"))
+    await state.set_state(ContestForm.sharing_to_groups) # Используем это состояние для перехвата кликов
+    await message.answer("👥 <b>Выберите группы для участия:</b>", reply_markup=builder.as_markup(), parse_mode="HTML")
+# ОБРАБОТЧИК КЛИКОВ ПО ГРУППАМ (Вставьте ниже)
+@dp.callback_query(ContestForm.sharing_to_groups, F.data.startswith("afksel_"))
+async def process_afk_groups_choice(callback: types.CallbackQuery, state: FSMContext):
+    if callback.data == "afksel_done":
+        data = await state.get_data()
+        if not data.get("participating_groups"):
+             await callback.answer("Выберите хотя бы одну группу!", show_alert=True)
+             return
+        await ask_intensity(callback.message, state) # Теперь переходим к интенсивности
+        return
+    group_tag = callback.data.replace("afksel_", "")
+    data = await state.get_data()
+    selected = data.get("participating_groups", [])
+    if group_tag in selected: selected.remove(group_tag)
+    else: selected.append(group_tag)
+    await state.update_data(participating_groups=selected)
+    # Обновляем галочки в меню (код обновления клавиатуры аналогичен предыдущим шагам)
+    await callback.message.edit_reply_markup(reply_markup=callback.message.reply_markup)
 @dp.message(ContestForm.input_sub_links)
 async def sub_links(message: types.Message, state: FSMContext):
     await state.update_data(sub_links=message.text)
@@ -321,6 +364,45 @@ async def process_intensity(callback: types.CallbackQuery, state: FSMContext):
     builder.row(types.InlineKeyboardButton(text="❌ Отмена", callback_data="passport_cancel"))
     await state.set_state(ContestForm.confirming)
     await callback.message.edit_text(summary, reply_markup=builder.as_markup(), parse_mode="HTML")
+async def resolve_and_distribute_links(links_str: str, parent_tg_id: int, main_group: str):
+    """Превращает ссылки в ТГК или Чаты и распределяет по базе"""
+    links = links_str.replace(',', ' ').split()
+    from telethon.tl.types import Channel, Chat
+    async with async_session() as session:
+        for link in links:
+            clean_link = link.strip().replace("https://t.me", "").replace("@", "")
+            try:
+                # Используем клиент Читателя для проверки ссылки
+                entity = await bot.get_chat(link) # Aiogram метод для быстрой проверки
+                tg_id = entity.id
+                is_group = entity.type in ['group', 'supergroup']
+                if not is_group: # Это КАНАЛ
+                    # Проверяем, нет ли его уже в базе
+                    exists = await session.execute(select(TargetChannel).where(TargetChannel.tg_id == tg_id))
+                    if not exists.scalar():
+                        new_ch = TargetChannel(
+                            tg_id=tg_id,
+                            username=link,
+                            group_tag=main_group,
+                            status="idle",
+                            actions_config={main_group: "join"},
+                            sync_status={main_group: "pending"}
+                        )
+                        session.add(new_ch)
+                        print(f"🆕 [АВТО-ТГК] Добавлен канал {link} для группы {main_group}")
+                else: # Это ЧАТ
+                    exists_chat = await session.execute(select(ExtraChat).where(ExtraChat.tg_id == tg_id))
+                    if not exists_chat.scalar():
+                        new_chat = ExtraChat(
+                            tg_id=tg_id,
+                            username=link,
+                            parent_channel_id=parent_tg_id
+                        )
+                        session.add(new_chat)
+                        print(f"💬 [АВТО-ЧАТ] Чат {link} привязан к ТГК {parent_tg_id}")
+            except Exception as e:
+                print(f"⚠️ [RESOLVER-ERR] Не удалось обработать ссылку {link}: {e}")
+        await session.commit()
 # --- ФИНАЛ: СОХРАНЕНИЕ ПАСПОРТА (ПОЛНАЯ ФУНКЦИЯ) ---
 @dp.callback_query(ContestForm.confirming, F.data == "passport_confirm")
 async def save_passport(callback: types.CallbackQuery, state: FSMContext):
@@ -337,6 +419,15 @@ async def save_passport(callback: types.CallbackQuery, state: FSMContext):
             select(PotentialPost).where(PotentialPost.id == post_id_int)
         )
         post_raw = post_raw_query.scalar_one()
+                # --- НОВЫЙ КИРПИЧИК: РАСПРЕДЕЛЕНИЕ ССЫЛОК ИЗ УСЛОВИЙ ---
+        if data.get("sub_links"):
+            # Запускаем фоновую задачу, чтобы не тормозить оператора
+            asyncio.create_task(resolve_and_distribute_links(
+                data["sub_links"], 
+                post_raw.source_tg_id, 
+                op.group_tag
+            ))
+
         # 2. Помечаем пост-триггер как отработанный (claimed)
         post_raw.is_claimed = True
         post_raw.claimed_at = datetime.now()
@@ -915,32 +1006,60 @@ async def process_report_decision(callback: types.CallbackQuery):
     )
     await callback.answer()
 @dp.callback_query(F.data.startswith("addgr_"))
-async def start_inviting_groups(callback: types.CallbackQuery, state: FSMContext):
+async def start_add_extra_group(callback: types.CallbackQuery, state: FSMContext):
+    """Шаг 1: Оператор выбирает, какую группу добавить как дополнительную в ТГК"""
     passport_id = int(callback.data.split("_")[1])
     await state.update_data(current_passport_id=passport_id)
     async with async_session() as session:
-        # 1. Находим ID канала через паспорт
+        # 1. Находим ТГК через паспорт
         res = await session.execute(
-            select(PotentialPost.source_tg_id).join(ContestPassport).where(ContestPassport.id == passport_id)
+            select(TargetChannel).join(ContestPassport, ContestPassport.post_id == PotentialPost.id).where(ContestPassport.id == passport_id)
         )
-        tg_id = res.scalar()
-        # 2. Находим группы, которые УЖЕ имеют отношение к этому каналу (вступили или инвайтятся)
-        res_rel = await session.execute(
-            select(GroupChannelRelation.group_tag).where(GroupChannelRelation.channel_id == tg_id)
-        )
-        existing_groups = [row[0] for row in res_rel.all()]
-        # 3. Берем ВСЕ группы и убираем те, что уже есть
+        channel = res.scalar_one_or_none()
+        if not channel: return
+        # 2. Собираем список групп, которые уже привязаны (осн + доп)
+        existing_groups = [channel.group_tag]
+        if channel.extra_groups:
+            existing_groups.extend(channel.extra_groups)
+        # 3. Находим все уникальные группы из БД воркеров, которых ТУТ ЕЩЕ НЕТ
         res_all = await session.execute(text("SELECT DISTINCT group_tag FROM workers.workers"))
-        all_groups = [row[0] for row in res_all.all()]
-        available_groups = [g for g in all_groups if g not in existing_groups]
+        all_tags = [row[0] for row in res_all.all()]
+        available_groups = [g for g in all_tags if g not in existing_groups]
     if not available_groups:
-        await callback.answer("✅ Все доступные группы уже состоят в этом канале или в процессе инвайта.", show_alert=True)
+        await callback.answer("✅ Все группы уже привязаны к этому каналу!", show_alert=True)
         return
     builder = InlineKeyboardBuilder()
     for g in available_groups:
-        builder.row(types.InlineKeyboardButton(text=f"➕ Инвайт: Группа {g}", callback_data=f"do_inv_{g}"))
-    await state.set_state(ContestForm.choosing_group_to_invite)
-    await callback.message.answer("👥 <b>Выбор группы для инвайтинга</b>\nВыберите группу для вступления:", reply_markup=builder.as_markup(), parse_mode="HTML")
+        builder.row(types.InlineKeyboardButton(text=f"➕ Добавить Группу {g}", callback_data=f"conf_add_{g}"))
+    await callback.message.edit_text(
+        f"👥 <b>Добавление ресурсов в ТГК</b>\nВыберите группу, которая должна вступить в канал как дополнительная:", 
+        reply_markup=builder.as_markup(), 
+        parse_mode="HTML"
+    )
+@dp.callback_query(F.data.startswith("conf_add_"))
+async def propose_extra_group(callback: types.CallbackQuery, state: FSMContext):
+    group_to_add = callback.data.replace("conf_add_", "")
+    data = await state.get_data()
+    passport_id = data['current_passport_id']
+    async with async_session() as session:
+        # Создаем запись в GroupChannelRelation со статусом 'not_joined'
+        # Именно этот статус триггерит появление заявки в Админ-панели Старшего
+        res = await session.execute(select(TargetChannel.tg_id).join(ContestPassport, ContestPassport.post_id == PotentialPost.id).where(ContestPassport.id == passport_id))
+        tg_id = res.scalar()
+        new_rel = GroupChannelRelation(
+            group_tag=group_to_add,
+            channel_id=tg_id,
+            status='not_joined' 
+        )
+        session.add(new_rel)
+        await session.commit()
+    await callback.message.edit_text(
+        f"📨 <b>Заявка на расширение отправлена!</b>\n"
+        f"Старший оператор должен одобрить вступление Группы {group_to_add}.\n"
+        f"После одобрения группа будет добавлена в список ресурсов канала.", 
+        parse_mode="HTML"
+    )
+    await state.clear()
 @dp.callback_query(ContestForm.choosing_group_to_invite, F.data.startswith("do_inv_"))
 async def process_inviting(callback: types.CallbackQuery, state: FSMContext):
     group_tag = callback.data.replace("do_inv_", "")
@@ -1211,14 +1330,29 @@ async def process_invite_decision(callback: types.CallbackQuery):
     _, decision, rel_id = callback.data.split("_")
     async with async_session() as session:
         if decision == "ok":
-            await session.execute(
-                update(GroupChannelRelation)
-                .where(GroupChannelRelation.id == int(rel_id))
-                .values(status="inviting", invite_started_at=func.now())
-            )
-            txt = "🚀 Инвайтинг запущен (24ч)"
+            # 1. Получаем саму заявку
+            rel = await session.get(GroupChannelRelation, int(rel_id))
+            # 2. Обновляем статус вступления (запускаем 24ч цикл)
+            rel.status = "inviting"
+            rel.invite_started_at = func.now()
+            # 3. --- НОВЫЙ КИРПИЧИК: ОБНОВЛЯЕМ КОНФИГ КАНАЛА ---
+            ch = await session.get(TargetChannel, rel.channel_id)
+            if ch:
+                # Добавляем группу в extra_groups (JSONB список)
+                extras = list(ch.extra_groups) if ch.extra_groups else []
+                if rel.group_tag not in extras:
+                    extras.append(rel.group_tag)
+                ch.extra_groups = extras
+                # Прописываем действие 'join' и статус 'pending' (не готова)
+                configs = dict(ch.actions_config) if ch.actions_config else {}
+                syncs = dict(ch.sync_status) if ch.sync_status else {}
+                configs[rel.group_tag] = "join"
+                syncs[rel.group_tag] = "pending" # <--- Это даст сигнал воркерам
+                ch.actions_config = configs
+                ch.sync_status = syncs
+            txt = f"🚀 Инвайтинг Группы {rel.group_tag} запущен. Группа добавлена в ресурсы ТГК."
         else:
-            txt = "🔴 Заявка отклонена"
+            txt = "🔴 Заявка на инвайтинг отклонена."
         await session.commit()
     await callback.message.edit_text(f"⚖️ Статус инвайта: <b>{txt}</b>", parse_mode="HTML")
 # --- РАЗДЕЛ ЛС: СПИСОК АККАУНТОВ ГРУППЫ ---
@@ -1255,13 +1389,17 @@ async def show_dialogs(callback: types.CallbackQuery):
     worker_id = int(callback.data.split("_")[2])
     async with async_session() as session:
         # Группируем сообщения по отправителям
+                # Группируем сообщения по отправителям, исключая системные ID и своих воркеров
         query = text("""
-            SELECT sender_id, MAX(created_at) as last_date, COUNT(id) FILTER (WHERE is_read = False) as new_msgs
-            FROM workers.messages
-            WHERE worker_tg_id = :wid
-            GROUP BY sender_id
+            SELECT m.sender_id, MAX(m.created_at) as last_date, COUNT(m.id) FILTER (WHERE m.is_read = False) as new_msgs
+            FROM workers.messages m
+            WHERE m.worker_tg_id = :wid 
+            AND m.sender_id != 777000 -- Исключаем Telegram
+            AND m.sender_id NOT IN (SELECT tg_id FROM workers.workers) -- Исключаем всех воркеров из БД
+            GROUP BY m.sender_id
             ORDER BY last_date DESC
         """)
+
         result = await session.execute(query, {"wid": worker_id})
         dialogs = result.all()
     if not dialogs:
@@ -1462,6 +1600,58 @@ async def sync_groups_readiness_loop():
         await asyncio.sleep(60) 
         try:
             async with async_session() as session:
+                # --- НОВЫЙ БЛОК: АВТОМАТИЧЕСКИЙ ВЫХОД ИЗ МЕРТВЫХ КАНАЛОВ (30 дней) ---
+                thirty_days_ago = datetime.now() - timedelta(days=30)
+                # Ищем каналы, где 0 триггеров или последняя активность была > 30 дней назад
+                dead_q = select(TargetChannel).where(
+                    (TargetChannel.last_trigger_at < thirty_days_ago) | (TargetChannel.trigger_count == 0),
+                    TargetChannel.status != "idle" # Только те, что еще в мониторинге
+                )
+                dead_channels = (await session.execute(dead_q)).scalars().all()
+                for dc in dead_channels:
+                    # Важно: даем каналу "фору", если он добавлен совсем недавно (например, менее 30 дней)
+                    # Если в модели нет даты создания, ориентируемся только на триггеры
+                    # Переводим все группы канала в режим выхода
+                    actions = dict(dc.actions_config) if dc.actions_config else {dc.group_tag: "join"}
+                    # Ставим задачу 'leave' и сбрасываем статус в 'pending'
+                    dc.actions_config = {g: "leave" for g in actions.keys()}
+                    dc.sync_status = {g: "pending" for g in actions.keys()}
+                    dc.status = "idle" # Выключаем зеркало немедленно
+                    print(f"💀 [CLEANUP] Канал {dc.username or dc.tg_id} мертв 30 дней. Команда на выход.")
+                await session.commit() # Фиксируем команды на выход
+                # --- КОНЕЦ НОВОГО БЛОКА ---
+                # Далее идет твой старый код: query = select(TargetChannel) ...
+                                # --- НОВЫЙ БЛОК: ДИСПЕТЧЕР ОЧЕРЕДИ ГРУПП (Вступление/Выход по одной) ---
+                # Повторно берем все каналы для управления очередью
+                q_queue = select(TargetChannel)
+                ch_queue = (await session.execute(q_queue)).scalars().all()
+                for ch in ch_queue:
+                    if not ch.actions_config: continue
+                    sync_status = dict(ch.sync_status) if ch.sync_status else {}
+                    changed_queue = False
+                    # 1. Считаем, сколько групп СЕЙЧАС в процессе (статус 'pending')
+                    active_groups = [g for g, s in sync_status.items() if s == "pending"]
+                    # 2. Если никто не в процессе, но есть те, кто в 'waiting' (ожидании)
+                    if len(active_groups) == 0:
+                        waiting_groups = [g for g, s in sync_status.items() if s == "waiting"]
+                        if waiting_groups:
+                            # Берем первую из очереди и даем отмашку 'pending'
+                            next_group = waiting_groups[0]
+                            sync_status[next_group] = "pending"
+                            changed_queue = True
+                            print(f"⏳ [ОЧЕРЕДЬ] Группа {next_group} начала работу в {ch.tg_id} (вышла из ожидания).")
+                    # 3. Если вдруг в 'pending' оказалось больше одной группы (защита от багов)
+                    elif len(active_groups) > 1:
+                        # Оставляем первую, остальных в 'waiting'
+                        for i, g in enumerate(active_groups):
+                            if i == 0: continue # Первую не трогаем
+                            sync_status[g] = "waiting"
+                            changed_queue = True
+                        print(f"⚠️ [ОЧЕРЕДЬ] В канале {ch.tg_id} было несколько активных групп. Лишние отправлены в ожидание.")
+                    if changed_queue:
+                        ch.sync_status = sync_status
+                await session.commit() 
+                # --- КОНЕЦ БЛОКА ОЧЕРЕДИ ---
                 # 1. Просто берем все каналы без условий в SQL
                 query = select(TargetChannel)
                 result = await session.execute(query)

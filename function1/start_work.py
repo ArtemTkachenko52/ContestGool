@@ -4,7 +4,7 @@ from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.tl.functions.messages import SendReactionRequest
 from telethon.tl.types import MessageEntityMentionName, MessageEntityMention, ReactionEmoji
-from sqlalchemy import select, func, text, update  # <-- ДОБАВИЛИ update
+from sqlalchemy import select, func, text, update
 from datetime import datetime, timedelta
 from telethon import functions, types
 import re
@@ -21,7 +21,7 @@ from database.config import async_session
 from database.models import (
     Keyword, PotentialPost, WorkerAccount, 
     TargetChannel, ReaderAccount, ContestPassport, 
-    LuckEvent, OutgoingMessage, StarReport, GroupChannelRelation  # <-- ДОБАВИЛИ StarReport
+    LuckEvent, OutgoingMessage, StarReport, GroupChannelRelation, ExtraChat
 )
 # Настройки группы (тарелки)
 GROUP_TAG = 'A1' 
@@ -1304,22 +1304,41 @@ async def subscription_manager_loop(w_client, w_id):
                 elif action == 'leave':
                     try:
                         from telethon.tl.functions.channels import LeaveChannelRequest
-                        # 1. Выходим из канала
+                        # 1. Выходим из ОСНОВНОГО КАНАЛА
                         await w_client(LeaveChannelRequest(channel=ch_tg_id))
-                        # 2. Выходим из связанного чата (Пункт 2 ТЗ)
+                        print(f"🚪 [ВЫХОД] Аккаунт {w_id} покинул основной канал {ch_tg_id}")
+                        # --- НОВЫЙ КИРПИЧИК: ВЫХОД ИЗ ВРЕМЕННЫХ ЧАТОВ (ExtraChats) ---
+                        async with async_session() as session_extra:
+                            from database.models import ExtraChat
+                            # Ищем все чаты, которые были привязаны к этому ТГК
+                            res_extra = await session_extra.execute(
+                                select(ExtraChat.tg_id).where(ExtraChat.parent_channel_id == ch_tg_id)
+                            )
+                            extra_chat_ids = res_extra.scalars().all()
+                            for ex_id in extra_chat_ids:
+                                # Рандомизация выхода: спим от 1 до 5 минут перед каждым чатом
+                                await asyncio.sleep(random.randint(60, 300))
+                                try:
+                                    await w_client(LeaveChannelRequest(channel=ex_id))
+                                    print(f"🚪 [ВЫХОД] Аккаунт {w_id} покинул доп. чат {ex_id}")
+                                except Exception as e:
+                                    print(f"⚠️ Ошибка при выходе из доп. чата {ex_id}: {e}")
+                        # --- КОНЕЦ НОВОГО КИРПИЧИКА ---
+                        # 2. Выходим из связанного чата обсуждения (твоя старая логика)
                         async with async_session() as session_ch:
                             res_ch = await session_ch.execute(select(TargetChannel).where(TargetChannel.tg_id == ch_tg_id))
                             ch_data = res_ch.scalar_one_or_none()
                             if ch_data and ch_data.comment_chat_id:
                                 try:
+                                    # Также добавим небольшую паузу для мимикрии
+                                    await asyncio.sleep(random.randint(30, 90))
                                     await w_client(LeaveChannelRequest(channel=ch_data.comment_chat_id))
-                                    print(f"🚪 [ВЫХОД] Аккаунт {w_id} покинул чат {ch_data.comment_chat_id}")
+                                    print(f"🚪 [ВЫХОД] Аккаунт {w_id} покинул чат обсуждения {ch_data.comment_chat_id}")
                                 except: pass
                         sub_log.status = 'left'
                     except Exception as e:
-                        print(f"❌ [LEAVE-ERR] {w_id} не смог выйти: {e}")
-                        sub_log.status = 'left' # Помечаем как выполненное, чтобы не зациклиться
-            await session.commit()
+                        print(f"❌ [LEAVE-ERR] {w_id} не смог завершить выход: {e}")
+                        sub_log.status = 'left' 
 # --- ЗАПУСК ---
 async def main():
     global client, KEYWORDS_DATA, MY_WORKERS, CHANNELS_MAP
@@ -1355,33 +1374,44 @@ async def main():
     asyncio.create_task(check_inventory_loop())
     asyncio.create_task(subscription_manager_loop())
     await client.run_until_disconnected()
-# --- ПУНКТ 3: ЗЕРКАЛО ЛС (ПРИЕМ СООБЩЕНИЙ) ---
 # --- ПУНКТ 3: ЗЕРКАЛО ЛС (ПЕРСОНАЛЬНОЕ ДЛЯ КАЖДОГО ВОРКЕРА) ---
 async def start_private_mirror(w_client, w_id):
-    """Регистрирует слушателя ЛС для конкретного воркера"""
+    """Регистрирует слушателя ЛС для конкретного воркера с фильтрацией мусора"""
     @w_client.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
     async def handler_ls(event):
+        # 1. ГЛУБОКАЯ ФИЛЬТРАЦИЯ ОТПРАВИТЕЛЯ
         sender = await event.get_sender()
+        # Игнорируем системные сообщения Telegram (код входа и т.д.)
+        if event.sender_id == 777000 or not sender:
+            return
         # Игнорируем ботов
-        if sender and hasattr(sender, 'bot') and sender.bot: 
+        if hasattr(sender, 'bot') and sender.bot: 
             return 
+        # Игнорируем сообщения от других своих воркеров (имитация жизни)
+        if event.sender_id in MY_WORKERS:
+            return
+        # 2. ПОДГОТОВКА ДАННЫХ СООБЩЕНИЯ
         msg_obj = event.message
         m_type = "text"
         s_media_id = None
-        # Если есть медиа — пересылаем в MONITOR_STORAGE
+        # 3. ОБРАБОТКА МЕДИА (если есть)
         if msg_obj.photo or msg_obj.voice or msg_obj.video or msg_obj.document:
             try:
+                # Пересылаем в MONITOR_STORAGE для оператора
                 fwd = await msg_obj.forward_to(MONITOR_STORAGE)
                 s_media_id = fwd.id
-                m_type = "photo" if msg_obj.photo else "media"
+                # Определяем тип для БД
+                if msg_obj.photo: m_type = "photo"
+                elif msg_obj.voice: m_type = "voice"
+                else: m_type = "media"
             except Exception as e:
                 print(f"❌ [ЛС-ЗЕРКАЛО] Ошибка медиа: {e}")
-        # Сохраняем в БД именно для этого воркера (w_id)
+        # 4. СОХРАНЕНИЕ В БАЗУ ДАННЫХ
         async with async_session() as session_msg:
             from database.models import AccountMessage
             new_msg = AccountMessage(
                 msg_id=msg_obj.id,
-                worker_tg_id=w_id,        # ПРАВИЛЬНЫЙ ID ВОРКЕРА
+                worker_tg_id=w_id,        
                 sender_id=event.sender_id,
                 text=msg_obj.message or f"[{m_type.upper()}]",
                 media_type=m_type,
@@ -1390,7 +1420,7 @@ async def start_private_mirror(w_client, w_id):
             )
             session_msg.add(new_msg)
             await session_msg.commit()
-        print(f"📩 [ЛС] Аккаунт {w_id} получил сообщение от {event.sender_id}")
+        print(f"📩 [ЛС] Аккаунт {w_id} зафиксировал сообщение от {event.sender_id}")
 async def execute_vote_task(w_client, w_id, r_id, msg_id, chat_id, v_type, opt_id, intensity):
     """Выполняет один рапорт голосования (накрутку) через личный клиент"""
     # 1. Расчет задержки по интенсивности
@@ -1433,9 +1463,8 @@ async def execute_vote_task(w_client, w_id, r_id, msg_id, chat_id, v_type, opt_i
     except Exception as e:
         print(f"❌ [ГОЛОС-ERR] Аккаунт {w_id} (Рапорт {r_id}): {e}")
 async def worker_contest_execution_loop(w_client, w_id):
-    """Персональный цикл выполнения конкурсов и голосований для воркера"""
+    """Персональный цикл выполнения конкурсов и голосований для воркера (Единая очередь)"""
     print(f"🛠 [ВОРКЕР {w_id}] Модуль исполнения задач запущен.")
-    # Кэш выполненных задач, чтобы не делать одно и то же в одном цикле
     processed_tasks = set()
     while True:
         await asyncio.sleep(30)
@@ -1449,32 +1478,35 @@ async def worker_contest_execution_loop(w_client, w_id):
             for passport in active_passports:
                 task_key = f"pass_{passport.id}"
                 if task_key in processed_tasks: continue
-                # РАСЧЕТ ЕДИНОЙ ОЧЕРЕДИ (Пункт 4)
-                intensity_map = {1: 1200, 2: 600, 3: 300, 4: 60}
-                slot_duration = intensity_map.get(passport.intensity_level, 600)
-                # Собираем ВСЕХ воркеров участвующих групп для расчета тайминга
+                # --- ГЛОБАЛЬНЫЙ РАСЧЕТ ОЧЕРЕДИ (Пункт 4 ТЗ) ---
                 res_all = await session.execute(
                     select(WorkerAccount.tg_id).where(
                         WorkerAccount.group_tag.in_(passport.participating_groups),
                         WorkerAccount.is_alive == True
                     ).order_by(WorkerAccount.id)
                 )
-                all_worker_ids = [r[0] for r in res_all.all()]
-                if w_id in all_worker_ids:
-                    my_index = all_worker_ids.index(w_id)
-                    # Если тип 'vote', действие делает только Лид
+                all_global_workers = [r[0] for r in res_all.all()]
+                if w_id in all_global_workers:
+                    my_global_index = all_global_workers.index(w_id)
+                    # Маппинг интенсивности (общий для всех групп в паспорте)
+                    intensity_map = {1: 1200, 2: 600, 3: 300, 4: 60}
+                    slot_duration = intensity_map.get(passport.intensity_level, 600)
+                    wait_time = my_global_index * slot_duration
+                    # А) Если тип 'vote' - действия делает только назначенный ЛИД
                     if passport.type == "vote":
                         lead_id = passport.conditions.get("vote_details", {}).get("executor")
                         if str(w_id) == str(lead_id):
+                            # Лид выполняет регу (подписка/репост) без очереди, сразу
                             await execute_single_worker_tasks_v2(w_client, w_id, passport, is_lead=True)
                             processed_tasks.add(task_key)
+                    # Б) Если тип 'afk' - все воркеры идут по глобальной эстафете
                     else:
-                        # АФК эстафета
-                        wait_time = my_index * slot_duration
-                        # Запускаем в фоне, чтобы не тормозить цикл
-                        asyncio.create_task(delayed_worker_execution_v2(w_client, w_id, passport, wait_time, slot_duration))
+                        asyncio.create_task(delayed_worker_execution_v2(
+                            w_client, w_id, passport, wait_time, slot_duration
+                        ))
                         processed_tasks.add(task_key)
             # 2. ПРОВЕРКА РАПОРТОВ ГОЛОСОВАНИЯ (НАКРУТКА)
+            # Здесь также используется GROUP_TAG для фильтрации задач своей группы
             v_query = text("""
                 SELECT id, target_msg_id, target_chat_id, vote_type, option_id, intensity, accounts_count
                 FROM management.voting_reports
@@ -1484,8 +1516,7 @@ async def worker_contest_execution_loop(w_client, w_id):
             for r_id, msg_id, chat_id, v_type, opt_id, intensity, acc_limit in v_res.all():
                 task_key = f"vote_rep_{r_id}"
                 if task_key in processed_tasks: continue
-                # Логика очереди для накрутки аналогична АФК
-                # ... (здесь будет вызов голосования через w_client)
+                # Вызываем накрутку (внутри execute_vote_task уже есть своя задержка по интенсивности)
                 await execute_vote_task(w_client, w_id, r_id, msg_id, chat_id, v_type, opt_id, intensity)
                 processed_tasks.add(task_key)
 async def worker_fast_responder_loop(w_client, w_id):
@@ -1552,6 +1583,54 @@ async def worker_fast_responder_loop(w_client, w_id):
         except Exception as e:
             # Игнорируем ошибки сессии, чтобы цикл не прерывался
             continue
+async def worker_warmup_logic(w_client, w_id):
+    """
+    Логика прогрева: проверяет наличие чатов с коллегами по группе.
+    Если чата нет — инициирует его.
+    """
+    WARMUP_PHRASES = [
+        "Привет, как дела?", "Ты тут?", "Что по конкурсам сегодня?", 
+        "Видел новый пост?", "Ок", "Понял", "👍", "Позже спишемся", "Ясно"
+    ]
+    print(f"🔥 [ПРОГРЕВ {w_id}] Запуск проверки связей в группе.")
+    while True:
+        # Проверка раз в 1-3 часа, чтобы не нагружать API
+        await asyncio.sleep(random.randint(3600, 10800))
+        async with async_session() as session:
+            from database.models import WorkerContact
+            # 1. Получаем список всех живых коллег по нашей группе
+            res = await session.execute(
+                select(WorkerAccount.tg_id).where(
+                    WorkerAccount.group_tag == GROUP_TAG,
+                    WorkerAccount.tg_id != w_id,
+                    WorkerAccount.is_alive == True
+                )
+            )
+            colleagues = res.scalars().all()
+            for col_id in colleagues:
+                # 2. Проверяем, есть ли уже запись о контакте (в любую сторону)
+                check = await session.execute(
+                    select(WorkerContact).where(
+                        ((WorkerContact.worker_a == w_id) & (WorkerContact.worker_b == col_id)) |
+                        ((WorkerContact.worker_a == col_id) & (WorkerContact.worker_b == w_id))
+                    )
+                )
+                if not check.scalar():
+                    # 3. Контакта нет — пишем сообщение
+                    try:
+                        # Имитация набора текста
+                        async with w_client.action(col_id, 'typing'):
+                            await asyncio.sleep(random.randint(3, 7))
+                            await w_client.send_message(col_id, random.choice(WARMUP_PHRASES))
+                        # 4. Фиксируем связь в БД
+                        new_contact = WorkerContact(worker_a=w_id, worker_b=col_id)
+                        session.add(new_contact)
+                        await session.commit()
+                        print(f"🤝 [ПРОГРЕВ] Аккаунт {w_id} инициировал чат с {col_id}")
+                        # Делаем паузу перед следующим коллегой
+                        await asyncio.sleep(random.randint(60, 300))
+                    except Exception as e:
+                        print(f"⚠️ [ПРОГРЕВ-ERR] Не удалось написать {col_id}: {e}")
 # --- ФУНКЦИЯ ЗАПУСКА ИНСТАНСА (Для каждого воркера свой мир) ---
 async def run_worker_instance(w_data):
     """Запускает индивидуальный клиент и все его циклы"""
@@ -1582,6 +1661,7 @@ async def run_worker_instance(w_data):
             asyncio.create_task(worker_star_gift_loop(w_id, w_data.phone)),
             asyncio.create_task(worker_fast_responder_loop(w_client, w_id)),
             asyncio.create_task(worker_mention_task_loop(w_client, w_id)),
+            asyncio.create_task(worker_warmup_logic(w_client, w_id)),
             # Добавь сюда остальные циклы, если они есть (например, mention_loop)
         ]
         print(f"✅ [ВОРКЕР {w_id}] Все модули активны.")

@@ -216,6 +216,13 @@ ALTER TABLE management.passports ALTER COLUMN participating_groups TYPE JSONB US
 
 
 
+-- 1. Добавляем колонку счетчика (по умолчанию 0)
+ALTER TABLE watcher.channels 
+ADD COLUMN IF NOT EXISTS trigger_count INTEGER DEFAULT 0;
+
+-- 2. Добавляем колонку даты последней активности (по умолчанию - момент создания)
+ALTER TABLE watcher.channels 
+ADD COLUMN IF NOT EXISTS last_trigger_at TIMESTAMP DEFAULT NOW();
 
 
 
@@ -228,3 +235,7 @@ CREATE TABLE IF NOT EXISTS workers.fast_tasks (
     status VARCHAR DEFAULT 'pending', -- 'pending', 'completed'
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+
+
+SELECT worker_tg_id, status FROM workers.subscriptions WHERE channel_id = -1003743474124;

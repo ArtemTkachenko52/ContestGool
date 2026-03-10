@@ -44,6 +44,15 @@ class TargetChannel(Base):
     participating_groups = Column(JSONB, server_default='[]')
     trigger_count = Column(Integer, default=0) # Сколько раз сработал за всё время
     last_trigger_at = Column(DateTime, server_default=func.now(), onupdate=func.now()) # Дата последней активности
+class ExtraChat(Base):
+    """Таблица для временных чатов из условий подписки (Пункт 2 ТЗ)"""
+    __tablename__ = 'extra_chats'
+    __table_args__ = {"schema": "watcher"}
+    id = Column(Integer, primary_key=True)
+    tg_id = Column(BigInteger, unique=True)
+    username = Column(String)
+    parent_channel_id = Column(BigInteger) # К какому ТГК привязан (например, №132)
+    created_at = Column(DateTime, server_default=func.now())
 class WorkerSubscription(Base):
     """Таблица логов вступлений (Пункт 1: Хранилище данных)"""
     __tablename__ = 'subscriptions'
@@ -246,3 +255,11 @@ class WinHunt(Base):
     channel_id = Column(BigInteger)   # В каком канале
     counter = Column(Integer, default=0) # Сколько постов пропустили (0-3)
     status = Column(String, default="active") # active / finished
+class WorkerContact(Base):
+    """Таблица установленных связей между воркерами для прогрева"""
+    __tablename__ = 'worker_contacts'
+    __table_args__ = {"schema": "workers"}
+    id = Column(Integer, primary_key=True)
+    worker_a = Column(BigInteger, index=True) # Кто инициировал
+    worker_b = Column(BigInteger, index=True) # С кем чат
+    last_chat_at = Column(DateTime, server_default=func.now())
