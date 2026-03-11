@@ -559,134 +559,134 @@ async def process_gifts_inventory(worker_phone):
     user_data_dir = f"/var/lib/browser_sessions/session_{clean_phone}"
     async with async_playwright() as p:
         context = await p.chromium.launch_persistent_context(
-            user_data_dir, headless=True, args=['--no-sandbox', '--disable-setuid-sandbox']
+            user_data_dir, 
+            headless=True, 
+            args=['--no-sandbox', '--disable-setuid-sandbox']
         )
         page = await context.new_page()
-        await stealth_async(page)
         try:
-            print(f"🌐 [ИНВЕНТАРЬ] Загрузка Web для {clean_phone}...")
-            await page.goto("https://web.telegram.org", wait_until="networkidle", timeout=60000)
-            await asyncio.sleep(8) 
-            # 1. Menu -> My Profile
-            await page.get_by_role("button", name="Open menu").first.click()
+            print(f"🌐 [ИНВЕНТАРЬ] Запуск по записи для {clean_phone}...")
+            # Твой путь
+            await page.goto("https://web.telegram.org/a/")
+            await asyncio.sleep(10) # Даем время на загрузку
+            # --- СКРИНШОТ 1: Проверка входа ---
+            await page.screenshot(path=f"/app/load_{clean_phone}.png")
+            await page.get_by_role("button", name="Open menu").click()
+            await page.get_by_role("menuitem", name="My Profile").click()
             await asyncio.sleep(2)
-            await page.get_by_role("menuitem", name="My Profile").first.click()
+            # --- СКРИНШОТ 2: Проверка открытия профиля ---
+            await page.screenshot(path=f"/app/profile_{clean_phone}.png")
+            await page.get_by_text("Gifts").click()
             await asyncio.sleep(4)
-            # 2. Gifts Tab
-            await page.get_by_text("Gifts").first.click()
-            await asyncio.sleep(5)
+            # ЦИКЛ ПОВТОРЕНИЯ (для 2 и более подарков)
             while True:
-                # 1. Клик по Canvas (уже работает)
-                canvas = page.locator("#RightColumn canvas, .gifts-list canvas").first
-                if await canvas.is_visible(timeout=7000):
-                    print(f"📦 [ИНВЕНТАРЬ] Открываю карточку подарка через Canvas...")
-                    await canvas.click(position={"x": 68, "y": 31})
-                    await asyncio.sleep(5) # Даем модалке время на анимацию
-                    # 2. Поиск кнопки продажи (Convert)
-                    # Используем get_by_text, так как твой codegen нашел её именно так
+                # 1. Твой клик по канвасу по координатам
+                gift_canvas = page.locator("#RightColumn canvas").first
+                if await gift_canvas.is_visible(timeout=7000):
+                    print(f"📦 Клик по подарку (x:71, y:58)...")
+                    await gift_canvas.click(position={"x": 71, "y": 58})
+                    await asyncio.sleep(4)
+                    # --- СКРИНШОТ 3: Проверка открытия карточки подарка ---
+                    await page.screenshot(path=f"/app/gift_open_{clean_phone}.png")
+                    # 2. Поиск кнопки Convert (используем регулярку, чтобы сумма звезд не мешала)
                     convert_btn = page.get_by_text(re.compile(r"Convert to \d+ Stars", re.IGNORECASE)).first
                     if await convert_btn.is_visible(timeout=5000):
-                        print(f"💰 [ИНВЕНТАРЬ] Кнопка найдена. Нажимаю Convert...")
                         await convert_btn.click()
+                        await asyncio.sleep(2)
+                        # 3. Твой Confirm
+                        await page.get_by_role("button", name="Confirm").click()
+                        print(f"✅ Продажа подтверждена.")
+                        await asyncio.sleep(5)
+                        # 4. Твой Close окна баланса
+                        await page.get_by_role("button", name="Close").click()
                         await asyncio.sleep(3)
-                        # 3. Подтверждение (Confirm)
-                        confirm_btn = page.get_by_role("button", name="Confirm").first
-                        if await confirm_btn.is_visible(timeout=3000):
-                            await confirm_btn.click()
-                            print(f"✅ [ИНВЕНТАРЬ] Продажа подтверждена.")
-                            await asyncio.sleep(5)
-                            # 4. Закрытие окна баланса (Close)
-                            close_btn = page.get_by_role("button", name="Close").first
-                            if await close_btn.is_visible():
-                                await close_btn.click()
-                                print(f"🔘 [ИНВЕНТАРЬ] Окно баланса закрыто.")
-                            else:
-                                await page.keyboard.press("Escape")
-                        else:
-                            await page.keyboard.press("Escape")
                     else:
-                        print("ℹ️ [ИНВЕНТАРЬ] Кнопка Convert не найдена в открытой карточке.")
+                        print("ℹ️ Кнопка Convert не найдена в открытой карточке.")
                         await page.keyboard.press("Escape")
                         break 
-                    await asyncio.sleep(3)
                 else:
-                    print(f"📭 [ИНВЕНТАРЬ] Подарков в профиле больше нет.")
+                    print(f"📭 Подарков больше нет.")
                     break
         except Exception as e:
-            print(f"❌ [ИНВЕНТАРЬ-ERR] Ошибка: {e}")
+            # --- СКРИНШОТ 4: Ошибка ---
+            await page.screenshot(path=f"/app/error_{clean_phone}.png")
+            print(f"❌ [ИНВЕНТАРЬ-ERR] {clean_phone}: {e}")
         finally:
             await context.close()
-async def check_stars_balance_api(w_client, w_id):
-    """Персональная проверка баланса звезд для конкретного воркера"""
-    print(f"💰 [ЭКОНОМИКА] Контроль звезд запущен для аккаунта {w_id}.")
+async def check_inventory_loop(w_client, w_id, w_phone):
+    """
+    РАБОЧИЙ РЕЖИМ: Проверка подарков и баланса раз в 12 часов.
+    Окна: 00:00 - 12:00 и 12:00 - 00:00.
+    """
+    print(f"📦 [ЭКОНОМИКА] Модуль инвентаря активен для {w_id} (режим окон).")
     while True:
         now = datetime.now()
-        # ОПРЕДЕЛЯЕМ ОКНО (00-12 или 12-24)
+        # 1. ОПРЕДЕЛЯЕМ ГРАНИЦУ ТЕКУЩЕГО ОКНА
         if now.hour < 12:
             current_window_end = now.replace(hour=12, minute=0, second=0, microsecond=0)
         else:
             current_window_end = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         async with async_session() as session:
-            res = await session.execute(select(WorkerAccount).where(WorkerAccount.tg_id == w_id))
-            worker = res.scalar_one_or_none()
-            if not worker or worker.last_check_window_end == current_window_end:
-                # Если уже проверяли в этом окне — спим до следующего + запас
-                wait = (current_window_end - now).total_seconds() + random.randint(60, 300)
-                await asyncio.sleep(wait)
-                continue
-            # Рандомное ожидание внутри окна (мимикрия)
-            seconds_remaining = (current_window_end - now).total_seconds()
-            await asyncio.sleep(random.uniform(0, min(seconds_remaining, 3600))) # Ждем до 1 часа макс для тестов
-            try:
-                from telethon.tl.functions.payments import GetStarsStatusRequest
-                stars_status = await w_client(GetStarsStatusRequest(peer='me'))
-                current_balance = int(stars_status.balance.amount) 
-                is_ready = current_balance >= 40
-                await session.execute(
-                    update(WorkerAccount)
-                    .where(WorkerAccount.tg_id == w_id)
-                    .values(
-                        stars_balance=current_balance,
-                        is_financial_ready=is_ready,
-                        last_check_window_end=current_window_end
-                    )
-                )
-                await session.commit()
-                print(f"✅ [БАЛАНС] Аккаунт {w_id}: {current_balance} ⭐. Готовность: {is_ready}")
-            except Exception as e:
-                print(f"❌ [БАЛАНС-ERR] Аккаунт {w_id}: {e}")
-                await asyncio.sleep(600)
-async def check_inventory_loop(w_id, w_phone):
-    """Персональная проверка подарков (Web Playwright)"""
-    print(f"📦 [ЭКОНОМИКА] Модуль инвентаря запущен для аккаунта {w_id}.")
-    while True:
-        now = datetime.now()
-        # Аналогичная логика окон 00-12 / 12-24
-        if now.hour < 12:
-            current_window_end = now.replace(hour=12, minute=0, second=0, microsecond=0)
-        else:
-            current_window_end = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-        async with async_session() as session:
+            # Проверяем в БД, не отработал ли этот аккаунт уже в этом окне
             res = await session.execute(select(WorkerAccount).where(WorkerAccount.tg_id == w_id))
             worker = res.scalar_one_or_none()
             if not worker or worker.last_inventory_check_window_end == current_window_end:
+                # Если уже проверяли — спим 10 минут и проверяем снова (наступило ли новое окно?)
                 await asyncio.sleep(600)
                 continue
-            # Спим рандомно перед запуском тяжелого браузера
-            await asyncio.sleep(random.randint(120, 1800))
+            # 2. ВЫБИРАЕМ РАНДОМНЫЙ МОМЕНТ ВНУТРИ ОСТАВШЕГОСЯ ВРЕМЕНИ ОКНА
+            seconds_remaining = (current_window_end - now).total_seconds()
+            # Берем случайную паузу от 0 до конца окна
+            random_wait = random.uniform(0, seconds_remaining)
+            print(f"⏳ [ИНВЕНТАРЬ] Аккаунт {w_id} запланировал вход через {int(random_wait/60)} мин.")
+            await asyncio.sleep(random_wait)
+            # 3. ЗАПУСК ИСПОЛНЕНИЯ (Браузер -> API -> БД)
             try:
-                # ВЫЗЫВАЕМ ТВОЮ ФУНКЦИЮ ИЗ ПРОШЛЫХ ЧАСТЕЙ
-                # Убедись, что process_gifts_inventory определена в файле
+                # А) Продажа подарков
                 await process_gifts_inventory(w_phone)
-                await session.execute(
-                    update(WorkerAccount).where(WorkerAccount.tg_id == w_id)
-                    .values(last_inventory_check_window_end=current_window_end)
-                )
-                await session.commit()
-                print(f"✅ [ИНВЕНТАРЬ] Аккаунт {w_id} очистил подарки.")
+                # Б) Обновление баланса через API
+                await update_stars_balance_single(w_client, w_id)
+                # В) Фиксация окна в базе
+                async with async_session() as session_update:
+                    await session_update.execute(
+                        update(WorkerAccount)
+                        .where(WorkerAccount.tg_id == w_id)
+                        .values(last_inventory_check_window_end=current_window_end)
+                    )
+                    await session_update.commit()
+                print(f"✅ [ЭКОНОМИКА] Аккаунт {w_id} успешно закрыл окно до {current_window_end}")
             except Exception as e:
-                print(f"❌ [ИНВЕНТАРЬ-ERR] Аккаунт {w_id}: {e}")
-                await asyncio.sleep(300)
+                print(f"❌ [ЭКОНОМИКА-ERR] Сбой у {w_id}: {e}")
+                # При ошибке спим 15 минут, чтобы не частить запросами
+                await asyncio.sleep(900)
+async def update_stars_balance_single(w_client, w_id):
+    """
+    Разовая проверка баланса через API.
+    Вызывается строго внутри check_inventory_loop после завершения работы браузера.
+    """
+    print(f"💰 [ЭКОНОМИКА] Обновление баланса аккаунта {w_id} после продажи...")
+    try:
+        from telethon.tl.functions.payments import GetStarsStatusRequest
+        # Запрашиваем актуальное состояние звезд у Telegram
+        stars_status = await w_client(GetStarsStatusRequest(peer='me'))
+        current_balance = int(stars_status.balance.amount) 
+        # Проверяем, достаточно ли звезд для участия в платных активностях (порог 40)
+        is_ready = current_balance >= 40
+        async with async_session() as session:
+            await session.execute(
+                update(WorkerAccount)
+                .where(WorkerAccount.tg_id == w_id)
+                .values(
+                    stars_balance=current_balance,
+                    is_financial_ready=is_ready,
+                    # Обновляем метку времени последней проверки баланса
+                    last_check_window_end=func.now() 
+                )
+            )
+            await session.commit()
+        print(f"✅ [БАЛАНС] Аккаунт {w_id}: {current_balance} ⭐. Статус готовности: {is_ready}")
+    except Exception as e:
+        print(f"❌ [БАЛАНС-ERR] Не удалось обновить звезды для {w_id}: {e}")
 async def run_passport_strategy(passport):
     """
     Рассчитывает 'эстафету' и ЗАВЕРШАЕТ паспорт после выполнения.
@@ -1370,7 +1370,6 @@ async def main():
     asyncio.create_task(worker_luck_raid_loop())
     asyncio.create_task(passport_execution_loop()) 
     asyncio.create_task(resolve_channel_ids())
-    asyncio.create_task(check_stars_balance_api()) 
     asyncio.create_task(check_inventory_loop())
     asyncio.create_task(subscription_manager_loop())
     await client.run_until_disconnected()
@@ -1652,17 +1651,25 @@ async def run_worker_instance(w_data):
         await start_private_mirror(w_client, w_id)
         # 2. ЗАПУСКАЕМ ВСЕ ПЕРСОНАЛЬНЫЕ ЦИКЛЫ
         tasks = [
+            # 1. Менеджер подписок (входы/выходы)
             asyncio.create_task(subscription_manager_loop(w_client, w_id)),
-            asyncio.create_task(check_stars_balance_api(w_client, w_id)),
-            asyncio.create_task(check_inventory_loop(w_id, w_data.phone)),
+            # 2. ЕДИНЫЙ МОДУЛЬ ЭКОНОМИКИ (Инвентарь + Баланс)
+            # Оставляем ТОЛЬКО ЭТУ строку для инвентаря
+            asyncio.create_task(check_inventory_loop(w_client, w_id, w_data.phone)),
+            # 3. CRM-система (ЛС и ответы оператора)
             asyncio.create_task(worker_outgoing_loop(w_client, w_id)),
+            # 4. Десант удачи (эмодзи под посты)
             asyncio.create_task(worker_luck_raid_loop(w_client, w_id)),
+            # 5. Исполнение паспортов (АФК и регистрация)
             asyncio.create_task(worker_contest_execution_loop(w_client, w_id)),
+            # 6. Отправка подарков (Звезды по рапорту)
             asyncio.create_task(worker_star_gift_loop(w_id, w_data.phone)),
+            # 7. Сверхбыстрый перехват (Кто первый/Кнопки)
             asyncio.create_task(worker_fast_responder_loop(w_client, w_id)),
-            asyncio.create_task(worker_mention_task_loop(w_client, w_id)),
+            # 8. Авто-ответы при упоминании (@меншены)
+            asyncio.create_task(worker_mention_task_loop(w_client, w_id)),   
+            # 9. Прогрев аккаунтов (переписка в группе)
             asyncio.create_task(worker_warmup_logic(w_client, w_id)),
-            # Добавь сюда остальные циклы, если они есть (например, mention_loop)
         ]
         print(f"✅ [ВОРКЕР {w_id}] Все модули активны.")
         # Держим соединение этого воркера
