@@ -163,6 +163,8 @@ class StarReport(Base):
     method = Column(String)
     star_count = Column(Integer)
     executor_id = Column(BigInteger) # Лид-аккаунт
+    reason = Column(Text)              # Текст причины
+    proof_media_id = Column(BigInteger) # ID скриншота в MONITOR_STORAGE
     status = Column(String, default="pending")
     created_at = Column(DateTime, server_default=func.now())
 class GroupChannelRelation(Base):

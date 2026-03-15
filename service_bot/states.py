@@ -23,6 +23,8 @@ class ContestForm(StatesGroup):
     # --- РАПОРТ НА ЗВЕЗДЫ ---
     star_target = State()      # Кому (username)
     star_gift_type = State()   # Выбор: Медведь, Роза и т.д.
+    star_reason = State()      # Ввод причины (НОВОЕ)
+    star_proof = State()       # Отправка скриншота (НОВОЕ)
     star_amount = State()      # Сколько звезд
     star_confirm = State()     # Финальное подтверждение
     # --- РАПОРТ НА ГОЛОСОВАНИЕ (НАКРУТКА) ---

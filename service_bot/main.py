@@ -797,28 +797,61 @@ async def cancel_voting_report(callback: types.CallbackQuery, state: FSMContext)
 # --- 1. СТАРТ: ВЫБОР ГРУПП (ТОЛЬКО JOINED) ---
 @dp.callback_query(F.data.startswith("v_rep_"))
 async def start_voting_report(callback: types.CallbackQuery, state: FSMContext):
+    # 1. Извлекаем ID паспорта из callback_data (v_rep_ID)
     passport_id = int(callback.data.split("_")[2])
     async with async_session() as session:
+        # 2. Достаем Паспорт и ID канала одним запросом
         res = await session.execute(
-            select(PotentialPost.source_tg_id).join(ContestPassport).where(ContestPassport.id == passport_id)
+            select(ContestPassport, PotentialPost.source_tg_id)
+            .join(PotentialPost, ContestPassport.post_id == PotentialPost.id)
+            .where(ContestPassport.id == passport_id)
         )
-        tg_id = res.scalar()
+        row = res.first()
+        if not row:
+            await callback.answer("❌ Паспорт не найден!", show_alert=True)
+            return
+        passport, tg_id = row
+        # 3. Извлекаем данные регистрации из паспорта (для контроля оператора)
+        v_details = passport.conditions.get("vote_details", {})
+        reg_info = (
+            f"⚠️ <b>КОНТРОЛЬ ДАННЫХ ПАСПОРТА:</b>\n"
+            f"👤 Регались как: <code>{v_details.get('reg_data', 'Нет данных')}</code>\n"
+            f"📍 Место: <code>{v_details.get('reg_place', 'Нет данных')}</code>\n"
+            f"📸 Фото: {'Загружено ✅' if v_details.get('reg_media_id') else 'Нет ❌'}\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"<i>Старший оператор будет сверять эти данные с целью накрутки!</i>"
+        )
+        # 4. Ищем группы, которые прошли инвайт (как и было)
         query = select(GroupChannelRelation.group_tag).where(
             GroupChannelRelation.channel_id == tg_id,
             GroupChannelRelation.status == 'joined'
         )
         res_gr = await session.execute(query)
-        available_groups = [row[0] for row in res_gr.all()]
+        available_groups = [r[0] for r in res_gr.all()]
     if not available_groups:
         await callback.answer("⚠️ Нет групп, прошедших инвайт в этот канал!", show_alert=True)
         return
-    await state.update_data(v_passport_id=passport_id, v_available_groups=available_groups, v_selected_groups=[])
+    # 5. Сохраняем всё в FSM (включая данные из паспорта для финала)
+    await state.update_data(
+        v_passport_id=passport_id, 
+        v_available_groups=available_groups, 
+        v_selected_groups=[],
+        v_original_reg_data=v_details.get('reg_data') # Сохраняем для проверки в конце
+    )
+    # 6. Формируем интерфейс
     builder = InlineKeyboardBuilder()
     for g in available_groups:
         builder.row(types.InlineKeyboardButton(text=f"Группа {g}", callback_data=f"vsel_{g}"))
     builder.row(types.InlineKeyboardButton(text="➡️ Далее", callback_data="vsel_done"))
     await state.set_state(ContestForm.v_rep_choose_groups)
-    await callback.message.answer("👥 <b>Выберите группы для голосования:</b>", reply_markup=builder.as_markup(), parse_mode="HTML")
+    # Сначала шлем инфо-блок с данными из паспорта, чтобы оператор не «забыл», на кого крутить
+    await callback.message.answer(reg_info, parse_mode="HTML")
+    # Затем шлем выбор групп
+    await callback.message.answer(
+        "👥 <b>Выберите группы для голосования:</b>", 
+        reply_markup=builder.as_markup(), 
+        parse_mode="HTML"
+    )
     await callback.answer()
 # --- 2. ОБРАБОТКА ГАЛОЧЕК И ВЫБОР КОЛИЧЕСТВА ---
 @dp.callback_query(ContestForm.v_rep_choose_groups, F.data.startswith("vsel_"))
@@ -912,7 +945,6 @@ async def admin_panel(message: types.Message):
     builder.row(types.InlineKeyboardButton(text="🗳 Рапорты Голосования", callback_data="adm_list_vote"))
     builder.row(types.InlineKeyboardButton(text="⭐ Рапорты на Звезды", callback_data="adm_list_stars"))
     builder.row(types.InlineKeyboardButton(text="🔎 Проверка новых ТГК", callback_data="adm_list_new_tgc"))
-    builder.row(types.InlineKeyboardButton(text="👥 Заявки на Инвайт", callback_data="adm_list_invite"))
     await message.answer(
         "🛠 <b>Панель управления (Rank 2)</b>\nВыберите категорию для проверки:", 
         reply_markup=builder.as_markup(), 
@@ -943,39 +975,54 @@ async def save_voting_report(callback: types.CallbackQuery, state: FSMContext):
 # --- АДМИНКА: ПРОСМОТР PENDING РАПОРТОВ ---
 # Вместо startswith используем прямое сравнение
 @dp.callback_query(F.data == "adm_list_vote")
-async def admin_view_pending(callback: types.CallbackQuery):
-    # Весь остальной код функции оставляем как есть
-    # ...
+async def admin_view_pending_extended(callback: types.CallbackQuery):
     op = await get_operator(callback.from_user.id)
     if op.rank < 2: return
     async with async_session() as session:
-        # Тянем рапорт + данные паспорта (приз и т.д.)
-        query = select(VotingReport, ContestPassport).join(ContestPassport).\
+        # Тянем Рапорт + Паспорт + Оригинальный пост конкурса (PotentialPost)
+        query = select(VotingReport, ContestPassport, PotentialPost).\
+            join(ContestPassport, VotingReport.passport_id == ContestPassport.id).\
+            join(PotentialPost, ContestPassport.post_id == PotentialPost.id).\
             where(VotingReport.status == "pending").order_by(VotingReport.id.asc())
         results = (await session.execute(query)).all()
     if not results:
-        await callback.message.edit_text("📭 На данный момент новых рапортов нет.")
-        await callback.answer()
+        await callback.message.edit_text("📭 Новых рапортов на голосование нет.")
         return
-    for report, passport in results:
+    for report, passport, post in results:
+        # --- ШАГ 1: ПОКАЗЫВАЕМ СТАРШЕМУ ОРИГИНАЛЬНЫЙ КОНКУРС ---
+        # Чтобы он видел, что вообще за розыгрыш
+        await bot.forward_message(callback.message.chat.id, MONITOR_STORAGE, post.storage_msg_id)
+        # --- ШАГ 2: ПОКАЗЫВАЕМ СКРИНШОТ РЕГИСТРАЦИИ (Если был) ---
+        # Из данных паспорта достаем медиа, которое оператор загрузил при реге лида
+        reg_media = passport.conditions.get("vote_details", {}).get("reg_media_id")
+        if reg_media:
+            await bot.copy_message(callback.message.chat.id, MONITOR_STORAGE, reg_media, 
+                                 caption="📸 <b>Фото/Скрин регистрации из Паспорта</b>", parse_mode="HTML")
+        # --- ШАГ 3: КАРТОЧКА СЛИЧЕНИЯ ДАННЫХ ---
+        v_details = passport.conditions.get("vote_details", {})
         summary = (
-            f"⚠️ <b>РАПОРТ НА ПРОВЕРКУ #{report.id}</b>\n"
+            f"⚖️ <b>СЛИЧЕНИЕ ДАННЫХ РАПОРТА #{report.id}</b>\n"
             f"━━━━━━━━━━━━━━\n"
-            f"📋 <b>ПАСПОРТ:</b> {passport.prize_type} (ID:{passport.id})\n"
-            f"🧩 <b>УСЛОВИЯ:</b> {passport.conditions.get('selected', [])}\n"
-            f"📊 <b>ЦЕЛЬ:</b> {report.vote_type.upper()} -> {report.option_id}\n"
-            f"👥 <b>ГРУППЫ:</b> {', '.join(report.target_groups)}\n"
-            f"🔢 <b>АККАУНТОВ:</b> {'Все' if report.accounts_count == 0 else report.accounts_count}\n"
-            f"🚀 <b>ИНТЕНСИВНОСТЬ:</b> {report.intensity} ур.\n"
-            f"━━━━━━━━━━━━━━"
+            f"📝 <b>В ПАСПОРТЕ (Регистрация):</b>\n"
+            f"└ Аккаунт: <code>{v_details.get('executor')}</code>\n"
+            f"└ Данные: <code>{v_details.get('reg_data')}</code>\n"
+            f"└ Куда: <code>{v_details.get('reg_place')}</code>\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"📊 <b>В РАПОРТЕ (Накрутка):</b>\n"
+            f"└ Метод: <code>{report.vote_type.upper()}</code>\n"
+            f"└ Вариант/ID: <b>{report.option_id}</b>\n"
+            f"└ Группы: <code>{', '.join(report.target_groups)}</code>\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"❓ <i>Совпадают ли данные регистрации в паспорте с целью в голосовании?</i>"
         )
         builder = InlineKeyboardBuilder()
         builder.row(
-            types.InlineKeyboardButton(text="✅ Одобрить", callback_data=f"adm_appr_{report.id}"),
-            types.InlineKeyboardButton(text="❌ Отклонить", callback_data=f"adm_decl_{report.id}")
+            types.InlineKeyboardButton(text="✅ Данные верны (Одобрить)", callback_data=f"adm_appr_{report.id}"),
+            types.InlineKeyboardButton(text="❌ ПОДМЕНА (Отклонить)", callback_data=f"adm_decl_{report.id}")
         )
+        # Пересылаем сам пост-голосование (на который идет накрутка)
+        await bot.forward_message(callback.message.chat.id, callback.message.chat.id, report.target_msg_id)
         await callback.message.answer(summary, reply_markup=builder.as_markup(), parse_mode="HTML")
-    await callback.answer()
 # --- ИСПРАВЛЕННЫЙ ПРИЕМ РЕШЕНИЯ СТАРШЕГО ---
 @dp.callback_query(F.data.startswith("adm_appr_")) # Для кнопок Одобрить
 @dp.callback_query(F.data.startswith("adm_decl_")) # Для кнопок Отклонить
@@ -1042,21 +1089,43 @@ async def propose_extra_group(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     passport_id = data['current_passport_id']
     async with async_session() as session:
-        # Создаем запись в GroupChannelRelation со статусом 'not_joined'
-        # Именно этот статус триггерит появление заявки в Админ-панели Старшего
-        res = await session.execute(select(TargetChannel.tg_id).join(ContestPassport, ContestPassport.post_id == PotentialPost.id).where(ContestPassport.id == passport_id))
-        tg_id = res.scalar()
+        # 1. Получаем ID канала через паспорт
+        res = await session.execute(
+            select(TargetChannel)
+            .join(PotentialPost, PotentialPost.source_tg_id == TargetChannel.tg_id)
+            .join(ContestPassport, ContestPassport.post_id == PotentialPost.id)
+            .where(ContestPassport.id == passport_id)
+        )
+        channel = res.scalar_one_or_none()
+        if not channel:
+            await callback.answer("❌ Ошибка: Канал не найден.")
+            return
+        # 2. Создаем запись об инвайт-процессе (сразу в статусе 'inviting')
         new_rel = GroupChannelRelation(
             group_tag=group_to_add,
-            channel_id=tg_id,
-            status='not_joined' 
+            channel_id=channel.tg_id,
+            status='inviting',        # Сразу ставим активный статус
+            invite_started_at=func.now() # Засекаем время начала (24ч пошли)
         )
         session.add(new_rel)
+        # 3. ОБНОВЛЯЕМ РЕСУРСЫ КАНАЛА (Авто-одобрение)
+        # Добавляем в список доп. групп
+        extras = list(channel.extra_groups) if channel.extra_groups else []
+        if group_to_add not in extras:
+            extras.append(group_to_add)
+        channel.extra_groups = extras
+        # Прописываем задачу на вступление ('join') и статус ожидания ('pending')
+        configs = dict(channel.actions_config) if channel.actions_config else {}
+        syncs = dict(channel.sync_status) if channel.sync_status else {}
+        configs[group_to_add] = "join"
+        syncs[group_to_add] = "pending"
+        channel.actions_config = configs
+        channel.sync_status = syncs
         await session.commit()
     await callback.message.edit_text(
-        f"📨 <b>Заявка на расширение отправлена!</b>\n"
-        f"Старший оператор должен одобрить вступление Группы {group_to_add}.\n"
-        f"После одобрения группа будет добавлена в список ресурсов канала.", 
+        f"🚀 <b>Группа {group_to_add} добавлена автоматически!</b>\n"
+        f"Процесс инвайтинга запущен (24 часа).\n"
+        f"Воркеры группы получили команду на вступление.", 
         parse_mode="HTML"
     )
     await state.clear()
@@ -1127,11 +1196,23 @@ async def star_target_proc(message: types.Message, state: FSMContext):
 @dp.callback_query(ContestForm.star_gift_type)
 async def star_gift_proc(callback: types.CallbackQuery, state: FSMContext):
     gift_name = callback.data.replace("sgift_", "")
-    # Сохраняем только тип подарка, сумму ставим 0 (она не будет видна)
     await state.update_data(s_gift=gift_name, s_amount=0) 
-    # Сразу вызываем показ финальной карточки
-    await show_star_summary(callback.message, state)
+    # ПЕРЕХОДИМ К ПРИЧИНЕ (Вместо финала)
+    await state.set_state(ContestForm.star_reason)
+    await callback.message.edit_text("📝 <b>Введите причину отправки:</b>\n(Например: требование админа для финала)", parse_mode="HTML")
     await callback.answer()
+@dp.message(ContestForm.star_reason)
+async def star_reason_proc(message: types.Message, state: FSMContext):
+    await state.update_data(s_reason=message.text)
+    await state.set_state(ContestForm.star_proof)
+    await message.answer("📸 <b>Отправьте скриншот-доказательство:</b>\n(Перешлите сообщение или загрузите фото)", parse_mode="HTML")
+@dp.message(ContestForm.star_proof, F.photo | F.document)
+async def star_proof_proc(message: types.Message, state: FSMContext):
+    # Пересылаем скриншот в хранилище, чтобы Старший его увидел
+    fwd = await message.forward(MONITOR_STORAGE)
+    await state.update_data(s_proof_id=fwd.message_id)
+    # Теперь вызываем финальную карточку
+    await show_star_summary(message, state)
 async def show_star_summary(message: types.Message, state: FSMContext):
     data = await state.get_data()
     summary = (
@@ -1140,6 +1221,8 @@ async def show_star_summary(message: types.Message, state: FSMContext):
         f"👤 <b>Отправитель:</b> <code>{data['star_executor']}</code>\n"
         f"🎯 <b>Получатель:</b> <code>{data['s_target']}</code>\n"
         f"🎁 <b>Подарок:</b> {data['s_gift']}\n"
+        f"📝 <b>Причина:</b> <i>{data['s_reason']}</i>\n"
+        f"📸 <b>Скриншот:</b> Прикреплен ✅\n"
         f"━━━━━━━━━━━━━━\n"
         f"Отправить Старшему оператору на одобрение?"
     )
@@ -1149,8 +1232,11 @@ async def show_star_summary(message: types.Message, state: FSMContext):
         types.InlineKeyboardButton(text="❌ Отмена", callback_data="star_final_cancel")
     )
     await state.set_state(ContestForm.star_confirm)
-    # Редактируем сообщение, чтобы убрать кнопки выбора подарков
-    await message.edit_text(summary, reply_markup=builder.as_markup(), parse_mode="HTML")
+    # Если это текстовое сообщение (после фото), шлем новое. Если колбэк — редактируем.
+    if message.photo or message.document:
+        await message.answer(summary, reply_markup=builder.as_markup(), parse_mode="HTML")
+    else:
+        await message.edit_text(summary, reply_markup=builder.as_markup(), parse_mode="HTML")
 # --- 5. ФИНАЛЬНОЕ СОХРАНЕНИЕ В БАЗУ ---
 @dp.callback_query(ContestForm.star_confirm, F.data == "star_final_confirm")
 async def save_star_report_final(callback: types.CallbackQuery, state: FSMContext):
@@ -1168,6 +1254,8 @@ async def save_star_report_final(callback: types.CallbackQuery, state: FSMContex
             method=data['s_gift'], # Сохраняем название подарка (Медведь и т.д.)
             star_count=data['s_amount'],
             executor_id=executor_id,
+            reason=data['s_reason'],           # НОВОЕ
+            proof_media_id=data['s_proof_id'],  # НОВОЕ
             status="pending"
         )
         session.add(new_report)
@@ -1280,8 +1368,7 @@ async def adm_view_stars(callback: types.CallbackQuery):
             f"━━━━━━━━━━━━━━\n"
             f"🎁 <b>Конкурс:</b> {passport.prize_type}\n"
             f"👤 <b>Кому:</b> {report.target_user}\n"
-            f"💰 <b>Сумма:</b> {report.star_count} ⭐\n"
-            f"🛠 <b>Метод:</b> {report.method}\n"
+            f"📝 <b>Причина:</b> {report.reason}\n" # НОВОЕ
             f"🤖 <b>Исполнитель ID:</b> {report.executor_id}\n"
             f"━━━━━━━━━━━━━━"
         )
@@ -1290,6 +1377,9 @@ async def adm_view_stars(callback: types.CallbackQuery):
             types.InlineKeyboardButton(text="✅ Одобрить", callback_data=f"starappr_ok_{report.id}"),
             types.InlineKeyboardButton(text="❌ Отклонить", callback_data=f"starappr_no_{report.id}")
         )
+        # Шлем сначала скриншот из хранилища, затем текст с кнопками
+        if report.proof_media_id:
+            await bot.copy_message(callback.message.chat.id, MONITOR_STORAGE, report.proof_media_id)
         await callback.message.answer(summary, reply_markup=builder.as_markup(), parse_mode="HTML")
     await callback.answer()
 @dp.callback_query(F.data.startswith("starappr_"))
