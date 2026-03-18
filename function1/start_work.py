@@ -969,73 +969,86 @@ async def invite_handler_loop():
 ACTIVE_GIFTS_CACHE = set()
 async def send_gift_via_web(worker_phone, target_username, gift_type):
     """
-    ОТПРАВКА ПОДАРКА ЧЕРЕЗ TELEGRAM WEB /A/ (ПО КОДУ CODEGEN)
+    УЛЬТИМАТИВНАЯ ОТПРАВКА ПОДАРКА (25, 50, 100 звезд)
+    Поддерживает: Роза(25), Торт(50), Букет(50), Ракета(50), Шампанское(50), Кубок(100), Кольцо(100), Алмаз(100)
     """
     clean_phone = str(worker_phone).replace("+", "")
     user_data_dir = f"/var/lib/browser_sessions/session_{clean_phone}"
-    print(f"📂 [WEB] Запуск браузера /A/ для {clean_phone}...")
+    # Справочник цен для защиты от ошибок
+    GIFT_PRICES = {
+        "Роза": 25,
+        "Торт": 50, "Букет": 50, "Ракета": 50, "Шампанское": 50,
+        "Кубок": 100, "Кольцо": 100, "Алмаз": 100
+    }
+    target_price = GIFT_PRICES.get(gift_type, 0)
+    if target_price == 0:
+        print(f"❌ [WEB] Неизвестный тип подарка: {gift_type}")
+        return False
+    print(f"📂 [WEB] Запуск браузера для {clean_phone}. Подарок: {gift_type} ({target_price} ⭐)")
     async with async_playwright() as p:
         context = None
         try:
             context = await p.chromium.launch_persistent_context(
                 user_data_dir,
-                headless=True,
-                slow_mo=1200, # Немного медленнее для стабильности
-                args=['--no-sandbox', '--disable-setuid-sandbox']
+                headless=True, # Поменяй на False для дебага на винде
+                slow_mo=500,    # Ускорили, 1200 было слишком долго
+                args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled']
             )
             page = await context.new_page()
-            # 1. ЗАХОДИМ В /A/
+            # 1. ЗАГРУЗКА
             await page.goto("https://web.telegram.org/a/", wait_until="networkidle", timeout=60000)
-            await asyncio.sleep(6)
-            # 2. ПОИСК ПО ТВОЕМУ МЕТОДУ
-            print(f"🔍 [WEB] Ищу {target_username}...")
-            search_box = page.get_by_role("textbox", name="Search")
-            await search_box.wait_for(state="visible", timeout=15000)
-            await search_box.click()
-            await search_box.fill(target_username)
-            await search_box.press("Enter")
-            await asyncio.sleep(4)
-            # Выбор чата из результатов
-            # Используем твой селектор "Fedor Maslo last" (универсально через 'last')
+            await asyncio.sleep(5)
+            # 2. ПОИСК ПОКУПАТЕЛЯ
+            search = page.get_by_role("textbox", name="Search")
+            await search.wait_for(state="visible", timeout=15000)
+            await search.fill(target_username)
+            await asyncio.sleep(3)
+            await search.press("Enter")
+            await asyncio.sleep(2)
+            # Клик по результату поиска (твой селектор с Fedor Maslo)
             await page.get_by_role("button").filter(has_text=re.compile(r"last", re.IGNORECASE)).first.click()
             await asyncio.sleep(2)
-            # 3. ОТКРЫТИЕ МЕНЮ
+            # 3. МЕНЮ ПОДАРКОВ
             await page.get_by_role("button", name="More actions").click()
             await page.get_by_role("menuitem", name="Send a Gift").click()
             await asyncio.sleep(5)
-            # 4. ВЫБОР ПОДАРКА (ПО ТВОИМ ИНДЕКСАМ)
-            # Мы сопоставим твой выбор с индексами из записи
-            # 🧸 Медведь (в записи был 5-й по счету ️)
-            # 🌹 Роза (️25, 2-й) | 💐 Букет (️50, 2-й) | 🏆 Кубок (️100, 1-й)
-            print(f"🎁 [WEB] Выбираю подарок: {gift_type}")
-            if "Медведь" in gift_type:
-                await page.get_by_role("button", name="️").nth(5).click()
-            elif "Роза" in gift_type:
-                await page.get_by_role("button", name="️25").nth(2).click()
-            elif "Букет" in gift_type:
-                await page.get_by_role("button", name="️50").nth(2).click()
-            elif "Кубок" in gift_type:
-                await page.get_by_role("button", name="️100").first.click()
-            else:
-                # Если не совпало, просто кликаем первый доступный
-                await page.get_by_role("button", name="️").first.click()
+            # 4. ПОИСК И ВЫБОР ПОДАРКА (С ПОДДЕРЖКОЙ DIV И BUTTON)
+            price_tag = f"️{target_price}" # Строка вида "️50"
+            # Пытаемся найти подарок как кнопку (для статических) или как div (для анимированных)
+            # Ищем элемент, который содержит и цену, и название подарка (если оно есть в DOM)
+            gift_selector = f"text={price_tag}"
+            # Находим все элементы с такой ценой
+            potential_gifts = page.locator(f"button:has-text('{price_tag}'), div:has-text('{price_tag}')")
+            # Скроллим до нужного подарка. 
+            # Мы используем твой опыт из Codegen: кликаем по элементу с ценой.
+            target_gift = potential_gifts.filter(has_text=re.compile(gift_type, re.IGNORECASE)).first
+            if not await target_gift.is_visible():
+                # Если по названию не нашел, берем первый попавшийся с этой ценой (фолбэк)
+                target_gift = potential_gifts.first
+            await target_gift.scroll_into_view_if_needed()
+            await asyncio.sleep(1)
+            await target_gift.click()
             await asyncio.sleep(3)
-            # 5. ФИНАЛЬНАЯ КНОПКА (ТВОЙ СЕЛЕКТОР)
-            # Ты нажал на "Send a Gift for ️"
-            send_btn = page.get_by_role("button", name=re.compile(r"Send a Gift for", re.IGNORECASE))
+            # 5. ФИНАЛЬНАЯ ПРОВЕРКА И ОТПРАВКА
+            # Ищем кнопку "Send a Gift for ️50"
+            send_btn = page.get_by_role("button", name=re.compile(rf"Send a Gift for.*{target_price}", re.IGNORECASE))
             if await send_btn.is_visible():
-                print("🔘 [WEB] Нажимаю финальную кнопку отправки...")
+                print(f"🔘 [WEB] Нажимаю финальную кнопку оплаты ({target_price} ⭐)...")
                 await send_btn.click()
                 await asyncio.sleep(5)
-                # Проверка: если кнопка всё еще видна — значит баланс 0 или ошибка
-                if await send_btn.is_visible():
-                    print("❌ [WEB] Подарок не ушел (Баланс звезд 0 или ошибка оплаты)")
-                    return False
-                print(f"✅ [WEB] РАПОРТ ВЫПОЛНЕН.")
-                return True
+                # Если появилась кнопка Close - значит баланс был и подарок ушел
+                if await page.get_by_role("button", name="Close").is_visible():
+                    print(f"✅ [WEB] ПОДАРОК ОТПРАВЛЕН УСПЕШНО.")
+                    return True
+                else:
+                    # Если кнопка оплаты всё еще видна - значит не хватило звезд
+                    if await send_btn.is_visible():
+                        print("❌ [WEB] Ошибка: Недостаточно звезд или лимит аккаунта.")
+                        return False
+            print("❌ [WEB] Не удалось выйти на финальную кнопку оплаты.")
             return False
         except Exception as e:
-            print(f"❌ [WEB-ERR] Ошибка: {e}")
+            print(f"❌ [WEB-ERR] Критическая ошибка: {e}")
             if 'page' in locals():
                 await page.screenshot(path=f"/app/DEBUG_GIFT_{clean_phone}.png")
             return False
