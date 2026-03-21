@@ -66,7 +66,6 @@ async def hit_channel_trigger(channel_id: int):
         )
         await session.commit()
     print(f"📈 [KPI] Канал {channel_id} подтвердил активность (+1 триггер).")
-
 async def get_reader_from_db(group_tag):
     async with async_session() as session:
         result = await session.execute(select(ReaderAccount).where(ReaderAccount.group_tag == group_tag))
@@ -278,6 +277,59 @@ async def monitor_luck_emojis(chat_id, post_id):
         )
         await session_final.commit()
     print(f"💤 [УДАЧА] Время мониторинга истекло для поста {post_id}.")
+async def distribute_sales_order_loop():
+    """Фоновый цикл: раз в 2 минуты ищет новые заказы и нарезает задачи воркерам"""
+    print("📦 [СКЛАД] Модуль распределения заказов запущен.")
+    while True:
+        await asyncio.sleep(120) # Проверка каждые 2 минуты
+        async with async_session() as session:
+            # 1. Берем самый старый заказ в очереди
+            from database.models import SalesOrder, WorkerAccount, StarReport
+            order_q = select(SalesOrder).where(SalesOrder.status == "pending").order_by(SalesOrder.created_at.asc())
+            order = (await session.execute(order_q)).scalar_one_or_none()
+            if not order: continue
+            # Цены для расчета (твои условия)
+            prices = {"Роза": 25, "Торт": 50, "Букет": 50, "Ракета": 50, "Шампанское": 50, "Кубок": 100, "Кольцо": 100, "Алмаз": 100}
+            price = prices.get(order.gift_type, 0)
+            if price == 0:
+                order.status = "failed"
+                await session.commit()
+                continue
+            # 2. Ищем богатых воркеров (Баланс > Цена + 25)
+            workers_q = select(WorkerAccount).where(
+                WorkerAccount.group_tag == GROUP_TAG, 
+                WorkerAccount.is_alive == True,
+                WorkerAccount.stars_balance >= (price + 25)
+            ).order_by(WorkerAccount.stars_balance.desc())
+            workers = (await session.execute(workers_q)).scalars().all()
+            needed = order.total_quantity
+            assignments = []
+            # 3. ТВОЙ АЛГОРИТМ: (Баланс - 25) // Цена
+            for w in workers:
+                if needed <= 0: break
+                can_send = (w.stars_balance - 25) // price
+                if can_send > 0:
+                    take = min(can_send, needed)
+                    assignments.append((w.tg_id, take))
+                    needed -= take
+            # 4. ИТОГ: Либо делим, либо отменяем
+            if needed > 0:
+                print(f"❌ [СКЛАД] Не хватило звезд на заказ #{order.id} (нужно еще {needed} шт). ОТМЕНА.")
+                order.status = "failed"
+            else:
+                order.status = "processing"
+                for w_id, count in assignments:
+                    # Создаем столько записей в StarReport, сколько подарков должен отправить воркер
+                    for _ in range(count):
+                        session.add(StarReport(
+                            passport_id=0, # 0 = заказ с FunPay
+                            target_user=order.customer_username,
+                            method=order.gift_type,
+                            executor_id=w_id,
+                            status="approved" # Сразу в работу
+                        ))
+                print(f"✅ [СКЛАД] Заказ #{order.id} на {order.total_quantity} шт. распределен.")
+            await session.commit()
 # --- ОБРАБОТЧИК СООБЩЕНИЙ ---
 async def handler(event):
     global KEYWORDS_DATA, MY_WORKERS, CHANNELS_MAP, client
@@ -1055,36 +1107,35 @@ async def send_gift_via_web(worker_phone, target_username, gift_type):
         finally:
             if context:
                 await context.close()
-async def worker_star_gift_loop(w_id, w_phone):
-    """Персональный цикл подарков: воркер проверяет только СВОИ одобренные рапорты"""
+async def worker_star_gift_loop(w_client, w_id, w_phone):
+    """Персональный цикл воркера: берет одну задачу 'approved' и шлет подарок"""
     print(f"⭐ [ВОРКЕР {w_id}] Модуль подарков (WEB) активен.")
-    # Кэш для защиты от повторных запусков внутри одного воркера
-    local_gift_cache = set()
     while True:
-        await asyncio.sleep(60)
-        try:
-            async with async_session() as session:
-                # Ищем одобренные рапорты, где ИМЕННО ЭТОТ воркер назначен исполнителем
-                query = select(StarReport).where(
-                    StarReport.status == 'approved',
-                    StarReport.executor_id == w_id
-                )
-                reports = (await session.execute(query)).scalars().all()
-                for report in reports:
-                    if report.id in local_gift_cache: continue
-                    local_gift_cache.add(report.id)
-                    print(f"💰 [WEB-PROCESS] Аккаунт {w_id} приступает к рапорту #{report.id}...")
-                    # Вызываем отправку через браузер, передавая телефон именно этого воркера
-                    success = await send_gift_via_web(str(w_phone), report.target_user, report.method)
-                    # Обновляем статус рапорта
-                    new_status = "completed" if success else "error"
-                    await session.execute(
-                        update(StarReport).where(StarReport.id == report.id).values(status=new_status)
-                    )
-                    await session.commit()
-                    local_gift_cache.discard(report.id)
-        except Exception as e:
-            print(f"⚠️ [WEB-LOOP-ERR] Аккаунт {w_id}: {e}")
+        await asyncio.sleep(60) 
+        async with async_session() as session:
+            from database.models import StarReport
+            # Берем одну задачу для этого конкретного воркера
+            task = (await session.execute(
+                select(StarReport).where(
+                    StarReport.executor_id == w_id, 
+                    StarReport.status == "approved"
+                ).limit(1)
+            )).scalar_one_or_none()
+            if task:
+                print(f"🎁 [ВОРКЕР {w_id}] Отправляю {task.method} для {task.target_user}...")
+                # ВЫЗОВ ТВОЕЙ НОВОЙ УЛЬТИМАТИВНОЙ ФУНКЦИИ
+                success = await send_gift_via_web(w_phone, task.target_user, task.method)
+                if success:
+                    task.status = "completed"
+                    # После успеха обновляем баланс через API, чтобы данные в БД были свежими
+                    await update_stars_balance_single(w_client, w_id)
+                    print(f"✅ [ВОРКЕР {w_id}] Подарок ушел успешно.")
+                else:
+                    task.status = "error"
+                    print(f"❌ [ВОРКЕР {w_id}] Ошибка при отправке подарка.")
+                await session.commit()
+                # ПАУЗА ДЛЯ МИМИКРИИ (чтобы не забанили за спам подарками)
+                await asyncio.sleep(random.randint(180, 400)) # 3-6 минут отдыха
 async def human_click(page, selector):
     """Находит кнопку, наводит на неё и кликает в случайную точку внутри кнопки"""
     element = page.locator(selector).first
@@ -1676,7 +1727,7 @@ async def run_worker_instance(w_data):
             # 5. Исполнение паспортов (АФК и регистрация)
             asyncio.create_task(worker_contest_execution_loop(w_client, w_id)),
             # 6. Отправка подарков (Звезды по рапорту)
-            asyncio.create_task(worker_star_gift_loop(w_id, w_data.phone)),
+            asyncio.create_task(worker_star_gift_loop(w_client, w_id, w_data.phone)),
             # 7. Сверхбыстрый перехват (Кто первый/Кнопки)
             asyncio.create_task(worker_fast_responder_loop(w_client, w_id)),
             # 8. Авто-ответы при упоминании (@меншены)
@@ -1722,6 +1773,7 @@ async def main():
     asyncio.create_task(data_refresher())
     asyncio.create_task(resolve_channel_ids())
     asyncio.create_task(passport_execution_loop()) 
+    asyncio.create_task(distribute_sales_order_loop())
     # 2. ПОДГОТОВКА ВОРКЕРОВ ГРУППЫ
     async with async_session() as session:
         res = await session.execute(

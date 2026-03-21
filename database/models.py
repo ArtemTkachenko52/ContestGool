@@ -124,6 +124,18 @@ class ChannelSubmission(Base):
     username = Column(String) # Ссылка или юзернейм
     operator_id = Column(BigInteger) # Кто предложил
     status = Column(String, default="pending") # pending, approved, declined
+class SalesOrder(Base):
+    __tablename__ = 'sales_orders'
+    __table_args__ = {"schema": "management"}
+    id = Column(Integer, primary_key=True)
+    customer_username = Column(String) # Кому шлем
+    gift_type = Column(String)         # Название (Роза, Ракета...)
+    total_quantity = Column(Integer)   # Сколько всего заказано
+    sent_quantity = Column(Integer, default=0) # Сколько уже ушло
+    status = Column(String, default="pending") # pending, processing, completed, failed
+    created_at = Column(DateTime, server_default=func.now())
+    notified = Column(Boolean, default=False) # Было ли отправлено уведомление на FunPay
+    funpay_chat_id = Column(BigInteger) # ID чата на FunPay
 # --- СХЕМА WORKERS (Исполнители) ---
 class WorkerAccount(Base, BaseAccount):
     __tablename__ = 'workers'
