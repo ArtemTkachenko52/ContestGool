@@ -876,18 +876,30 @@ async def execute_single_worker_tasks_v2(w_client, w_id, passport, is_lead=False
                 links = conds.get("sub_links", "").split()
                 for link in links:
                     await join_channel_smart(w_client, link)
-            # 2. РЕАКЦИЯ
+                        # 2. РЕАКЦИЯ (Обновлено)
             elif action == "reac" and target_chat and target_msg:
                 try:
+                    # Достаем ID из условий паспорта, если его нет - ставим рандомный
+                    specific_reac = conds.get("afk_reaction_id")
                     from telethon.tl.functions.messages import SendReactionRequest
-                    from telethon.tl.types import ReactionEmoji
+                    from telethon.tl.types import ReactionEmoji, ReactionCustomEmoji
+                    if specific_reac:
+                        # Если это цифры (Custom Emoji ID)
+                        if str(specific_reac).isdigit():
+                            reaction_obj = [ReactionCustomEmoji(document_id=int(specific_reac))]
+                        else:
+                            reaction_obj = [ReactionEmoji(emoticon=specific_reac)]
+                    else:
+                        # Фолбэк на рандом, если оператор не ввел ID
+                        reaction_obj = [ReactionEmoji(emoticon=random.choice(["👍", "🔥", "❤️"]))]
                     await w_client(SendReactionRequest(
                         peer=target_chat,
                         msg_id=target_msg,
-                        reaction=[ReactionEmoji(emoticon=random.choice(["👍", "❤️", "🔥", "🤩"]))]
+                        reaction=reaction_obj
                     ))
-                    print(f"✅ [РЕАКЦИЯ] Аккаунт {w_id} поставил эмодзи.")
-                except: pass
+                    print(f"✅ [РЕАКЦИЯ] Аккаунт {w_id} поставил {specific_reac or 'рандом'}")
+                except Exception as e:
+                    print(f"❌ [РЕАКЦИЯ-ERR] {w_id}: {e}")
             # 3. РЕПОСТ
             elif action == "repost" and target_chat and target_msg:
                 count = int(conds.get("repost_count", 1))

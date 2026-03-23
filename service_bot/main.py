@@ -288,14 +288,16 @@ async def check_afk_substeps(message, state: FSMContext):
     if "sub" in conds:
         await state.set_state(ContestForm.input_sub_links)
         await message.answer("🔗 Введите ссылки на ТГК для подписки:")
-    # 2. Если выбран репост - запрашиваем количество
+    # 2. НОВОЕ: Если выбрана реакция - запрашиваем ID эмодзи
+    elif "reac" in conds:
+        await state.set_state(ContestForm.waiting_for_reaction) # Используем существующий стейт
+        await message.answer("🔍 Введите **ID или Эмодзи** для реакции под постом:", parse_mode="HTML")
+    # 3. Если выбран репост - запрашиваем количество
     elif "repost" in conds:
         await state.set_state(ContestForm.input_repost_count)
         await message.answer("🔄 Введите количество чатов для репоста:")
-    # 3. ЕСЛИ ВСЕ ВВЕДЕНО - ПЕРЕХОДИМ К ВЫБОРУ ГРУПП (ВМЕСТО ИНТЕНСИВНОСТИ)
     else:
-        await ask_afk_groups(message, state) # <-- ВЫЗОВ НОВОЙ ФУНКЦИИ
-# ВСТАВЬТЕ ЭТУ ФУНКЦИЮ СРАЗУ ПОСЛЕ check_afk_substeps
+        await ask_afk_groups(message, state)
 async def ask_afk_groups(message, state: FSMContext):
     data = await state.get_data()
     post_id = data['current_post_id']
@@ -442,6 +444,7 @@ async def save_passport(callback: types.CallbackQuery, state: FSMContext):
             "selected": data.get("selected_conds", []),
             "sub_links": data.get("sub_links", ""),
             "repost_count": data.get("repost_count", "0"),
+            "afk_reaction_id": data.get("afk_reaction_id"),
             # ВАЖНО: Эти поля воркер будет искать в start_work.py
             "source_tg_id": post_raw.source_tg_id,
             "source_msg_id": post_raw.source_msg_id,
@@ -501,43 +504,49 @@ async def start_reaction_id(message: types.Message, state: FSMContext):
     )
 @dp.message(ContestForm.waiting_for_reaction)
 async def process_reaction_id(message: types.Message, state: FSMContext):
-    # 1. Проверка на СЛОТЫ / КУБИКИ (🎰, 🎲, 🎯, 🏀)
+    # --- 1. ОПРЕДЕЛЯЕМ ID РЕАКЦИИ ---
+    target_id = None
+    res_type = ""
     if message.dice:
-        emoji_code = message.dice.emoji
-        await message.answer(
-            f"🎰 <b>Тип: Анимированный слот/кубик</b>\n"
-            f"ID для рапорта: <code>{emoji_code}</code>\n\n"
-            f"<i>Этот код заставит воркеров отправить именно такой игровой кубик.</i>",
-            parse_mode="HTML"
-        )
-        await state.clear()
-        return
-    # 2. Проверка на КАСТОМНЫЕ ЭМОДЗИ (Premium)
-    if message.entities:
+        target_id = message.dice.emoji
+        res_type = "🎰 Анимированный слот/кубик"
+    elif message.entities:
         for entity in message.entities:
             if entity.type == "custom_emoji":
-                custom_id = entity.custom_emoji_id
-                await message.answer(
-                    f"🌟 <b>Тип: Кастомный эмодзи (Premium)</b>\n"
-                    f"ID для рапорта: <code>{custom_id}</code>\n\n"
-                    f"<i>Используйте это числовое ID в рапорте голосования.</i>",
-                    parse_mode="HTML"
-                )
-                await state.clear()
-                return
-    # 3. Проверка на ОБЫЧНЫЕ ЭМОДЗИ (Unicode)
-    if message.text:
-        # Просто берем первый символ, если прислали пачку
-        emoji = message.text.strip()
+                target_id = entity.custom_emoji_id
+                res_type = "🌟 Кастомный эмодзи (Premium)"
+                break
+    if not target_id and message.text:
+        target_id = message.text.strip()
+        res_type = "😀 Обычный эмодзи"
+    if not target_id:
+        await message.answer("❌ Не удалось распознать тип. Отправьте эмодзи, кубик или кастомный смайл.")
+        return
+    # --- 2. ПРОВЕРЯЕМ КОНТЕКСТ (Паспорт или просто Проверка) ---
+    data = await state.get_data()
+    # Если мы внутри создания паспорта (есть ID поста)
+    if 'current_post_id' in data:
+        await state.update_data(afk_reaction_id=target_id)
+        # Смотрим, нужно ли еще вводить репосты после реакции
+        if "repost" in data.get("selected_conds", []):
+            await state.set_state(ContestForm.input_repost_count)
+            await message.answer(
+                f"✅ Реакция <code>{target_id}</code> сохранена для конкурса.\n"
+                f"🔄 Теперь введите <b>количество репостов</b>:", 
+                parse_mode="HTML"
+            )
+        else:
+            # Если репосты не нужны — идем к выбору групп
+            await ask_afk_groups(message, state)
+    else:
+        # ОБЫЧНЫЙ РЕЖИМ (Кнопка "Узнать ID")
         await message.answer(
-            f"😀 <b>Тип: Обычный эмодзи</b>\n"
-            f"ID для рапорта: <code>{emoji}</code>\n\n"
-            f"<i>Стандартная реакция или текстовый символ.</i>",
+            f"<b>{res_type}</b>\n"
+            f"ID для рапорта: <code>{target_id}</code>\n\n"
+            f"<i>Используйте этот код при оформлении паспорта или рапорта.</i>",
             parse_mode="HTML"
         )
-        await state.clear()
-        return
-    await message.answer("❌ Не удалось распознать тип. Отправьте эмодзи, кубик или кастомный смайл.")
+        await state.clear() # Очищаем стейт только в режиме проверки
 @dp.message(F.text == "📋 Текущие конкурсы")
 async def show_contests_types(message: types.Message):
     builder = InlineKeyboardBuilder()
@@ -1184,14 +1193,45 @@ async def start_stars_report(callback: types.CallbackQuery, state: FSMContext):
 # --- 2. ВЫБОР ТИПА ПОДАРКА (КНОПКАМИ) ---
 @dp.message(ContestForm.star_target)
 async def star_target_proc(message: types.Message, state: FSMContext):
-    await state.update_data(s_target=message.text)
+    target = message.text.strip()
+    await state.update_data(s_target=target)
+    data = await state.get_data()
+    executor_id = data['star_executor']
+    async with async_session() as session:
+        # Получаем актуальный баланс воркера из БД
+        res = await session.execute(select(WorkerAccount.stars_balance).where(WorkerAccount.tg_id == int(executor_id)))
+        balance = res.scalar() or 0
+    await state.set_state(ContestForm.star_amount)
+    # Кнопки для быстрой вставки суммы
     builder = InlineKeyboardBuilder()
-    # Список подарков для выбора
-    gifts = ["🧸 Медведь", "🌹 Роза", "💐 Букет", "🏆 Кубок"]
-    for gift in gifts:
-        builder.row(types.InlineKeyboardButton(text=gift, callback_data=f"sgift_{gift}"))
-    await state.set_state(ContestForm.star_gift_type)
-    await message.answer("🎁 <b>Выберите, какой подарок отправить:</b>", reply_markup=builder.as_markup(), parse_mode="HTML")
+    builder.row(
+        types.InlineKeyboardButton(text="25 ⭐", callback_data="amt_25"),
+        types.InlineKeyboardButton(text="50 ⭐", callback_data="amt_50"),
+        types.InlineKeyboardButton(text="100 ⭐", callback_data="amt_100")
+    )
+    await message.answer(
+        f"💰 <b>Баланс исполнителя:</b> <code>{balance} ⭐</code>\n\n"
+        f"Введите <b>стоимость подарка</b> (25, 50 или 100) или выберите кнопкой:",
+        reply_markup=builder.as_markup(),
+        parse_mode="HTML"
+    )
+@dp.callback_query(ContestForm.star_amount, F.data.startswith("amt_"))
+@dp.message(ContestForm.star_amount)
+async def star_amount_proc(event, state: FSMContext):
+    # Получаем сумму из кнопки или текста
+    amount_raw = event.data.replace("amt_", "") if isinstance(event, types.CallbackQuery) else event.text
+    if not amount_raw.isdigit() or int(amount_raw) not in [25, 50, 100]:
+        msg = event.message if isinstance(event, types.CallbackQuery) else event
+        await msg.answer("❌ Ошибка: Введите ровно 25, 50 или 100 звезд.")
+        return
+    amount = int(amount_raw)
+    # Авто-подбор названия подарка для системной логики (по минимальной цене)
+    gift_names = {25: "Роза", 50: "Торт", 100: "Кубок"}
+    await state.update_data(s_amount=amount, s_gift=gift_names[amount])
+    await state.set_state(ContestForm.star_reason)
+    message = event.message if isinstance(event, types.CallbackQuery) else event
+    await message.answer("📝 <b>Введите причину отправки:</b>\n(Например: подарок админу за победу)")
+    if isinstance(event, types.CallbackQuery): await event.answer()
 # --- 3. ВЫБОР ПОДАРКА И АВТО-ПЕРЕХОД К ФИНАЛУ ---
 @dp.callback_query(ContestForm.star_gift_type)
 async def star_gift_proc(callback: types.CallbackQuery, state: FSMContext):
@@ -1355,7 +1395,6 @@ async def process_sharing_choice(callback: types.CallbackQuery, state: FSMContex
 @dp.callback_query(F.data == "adm_list_stars")
 async def adm_view_stars(callback: types.CallbackQuery):
     async with async_session() as session:
-        # Тянем рапорт + паспорт, чтобы видеть, за какой приз платим
         query = select(StarReport, ContestPassport).join(ContestPassport).\
             where(StarReport.status == "pending").order_by(StarReport.created_at.asc())
         results = (await session.execute(query)).all()
@@ -1366,10 +1405,11 @@ async def adm_view_stars(callback: types.CallbackQuery):
         summary = (
             f"⭐ <b>ЗАЯВКА НА ЗВЕЗДЫ #{report.id}</b>\n"
             f"━━━━━━━━━━━━━━\n"
-            f"🎁 <b>Конкурс:</b> {passport.prize_type}\n"
-            f"👤 <b>Кому:</b> {report.target_user}\n"
-            f"📝 <b>Причина:</b> {report.reason}\n" # НОВОЕ
-            f"🤖 <b>Исполнитель ID:</b> {report.executor_id}\n"
+            f"💰 Сумма: <b>{report.star_count} ⭐</b>\n"
+            f"🎁 Подарок: <code>{report.method}</code>\n"
+            f"👤 Кому: <code>{report.target_user}</code>\n"
+            f"📝 Причина: <i>{report.reason}</i>\n"
+            f"🤖 Исполнитель: <code>{report.executor_id}</code>\n"
             f"━━━━━━━━━━━━━━"
         )
         builder = InlineKeyboardBuilder()
@@ -1377,7 +1417,6 @@ async def adm_view_stars(callback: types.CallbackQuery):
             types.InlineKeyboardButton(text="✅ Одобрить", callback_data=f"starappr_ok_{report.id}"),
             types.InlineKeyboardButton(text="❌ Отклонить", callback_data=f"starappr_no_{report.id}")
         )
-        # Шлем сначала скриншот из хранилища, затем текст с кнопками
         if report.proof_media_id:
             await bot.copy_message(callback.message.chat.id, MONITOR_STORAGE, report.proof_media_id)
         await callback.message.answer(summary, reply_markup=builder.as_markup(), parse_mode="HTML")
