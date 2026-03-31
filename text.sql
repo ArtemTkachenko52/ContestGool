@@ -239,3 +239,10 @@ CREATE TABLE IF NOT EXISTS workers.fast_tasks (
 
 
 SELECT worker_tg_id, status FROM workers.subscriptions WHERE channel_id = -1003743474124;
+
+
+<div class="ripple-container"></div>
+<div role="menuitem" tabindex="0" class="MenuItem compact"><i class="icon icon-user" aria-hidden="true"></i>Мой профиль</div>
+<div class="Tab Tab--interactive"><span class="Tab_inner">Подарки<i class="platform"></i></span></div>
+<div class="Af3tYFMg _I9aOdGr" style="--_bg-light: #e07b85; --_bg-dark: #b65980;"><canvas class="GbpiDSS_ Y5FyX1oo" aria-hidden="true" width="160" height="142"></canvas></div>
+<button type="button" class="Button biAUzmLA default transparentBlured fluid no-upper-case content-with-icon-top" aria-label="Передать" title="Передать"><div class="with-icon-top"><i class="icon icon-gift-transfer-inline APNjRx1K" aria-hidden="true"></i><span class="hsDNs5hG">Передать</span></div></button>

@@ -13,9 +13,8 @@ import io
 from PIL import Image, ImageOps, ImageEnhance
 from telethon.tl.functions.payments import GetStarsStatusRequest
 import os
-from playwright.async_api import async_playwright
+from patchright.async_api import async_playwright
 from telethon.tl import functions
-from playwright_stealth import stealth_async
 # Импорты из обновленной базы
 from database.config import async_session
 from database.models import (
@@ -1158,101 +1157,137 @@ async def human_click(page, selector):
         await page.mouse.move(x, y, steps=random.randint(5, 15))
         await asyncio.sleep(random.uniform(0.5, 1.5))
         await page.mouse.click(x, y)
+import asyncio
+import os
+import pytesseract
+from PIL import Image
+import io
+import random
+import re
+from patchright.async_api import async_playwright # Используем твой Patchright
+
+# В Docker/Linux путь обычно такой, если ставим через apt-get install tesseract-ocr
+# Если запускаешь на Windows, верни свой путь к .exe
+TESSERACT_PATH = '/usr/bin/tesseract' 
+pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+
 async def solve_web_captcha(worker_phone, target_channel_username, post_id):
     """
-    Входные данные: телефон воркера, юзернейм канала и ID поста с кнопкой.
+    Интегрированная логика прохождения капчи через Patchright + Pytesseract.
+    Сохранена вся авторская логика распознавания и циклов.
     """
     clean_phone = str(worker_phone).replace("+", "")
     user_data_dir = f"/var/lib/browser_sessions/session_{clean_phone}"
+    
     async with async_playwright() as p:
+        # Твои настройки контекста Patchright
         context = await p.chromium.launch_persistent_context(
-            user_data_dir,
-            headless=True, 
-            args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled']
+            user_data_dir=user_data_dir,
+            channel="chromium", # Убедись, что Chrome установлен в контейнере
+            headless=True,    # В Docker ставим True
+            no_viewport=True,
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"]
         )
-        page = await context.new_page()
-        await stealth_async(page)
+        
+        page = context.pages[0] if context.pages else await context.new_page()
+        
         try:
-            # 1. ТВОЯ ОРИГИНАЛЬНАЯ ЛОГИКА ВХОДА
-            await page.goto("https://web.telegram.org", wait_until="networkidle", timeout=60000)
-            await asyncio.sleep(8) 
-            await page.screenshot(path="/app/step1_web_opened.png")
-            # 2. ТВОЙ ОРИГИНАЛЬНЫЙ ПЕРЕХОД
-            print(f"🌐 [WEB] Переход в канал @{target_channel_username}...")
-            await page.goto(f"https://web.telegram.org#?tgaddr=tg%3A%2F%2Fresolve%3Fdomain%3D{target_channel_username}")
-            await asyncio.sleep(6)
-            await page.screenshot(path="/app/step2_channel_opened.png")
-                        # 3. УЛУЧШЕННЫЙ ПОИСК КНОПКИ
-            print(f"⏳ [WEB] Ожидание появления кнопки в посте {post_id}...")
-            button_selector = "button, .btn, .reply-markup-button, [role='button']"
+            print(f"🌐 [PATCHRIGHT] Вход в Telegram A для {clean_phone}...")
+            await page.goto("https://web.telegram.org/a/", timeout=60000)
+            await asyncio.sleep(5) 
+
+            # --- ТВОЯ ЛОГИКА ПОИСКА КАНАЛА И ПОСТА ---
+            print(f"🔍 Ищем канал @{target_channel_username}...")
+            search_input = page.locator("#telegram-search-input")
+            await search_input.wait_for(state="visible", timeout=15000)
+            await search_input.click()
+            await page.keyboard.type(target_channel_username, delay=120)
+            await asyncio.sleep(4)
+            
+            # Клик по первому результату (адаптировано под динамический юзернейм)
+            await page.get_by_role("button").filter(has_text=re.compile(target_channel_username, re.IGNORECASE)).first.click()
+            print("✅ Канал открыт")
+            await asyncio.sleep(3)
+
+            # Кнопка Участвовать
+            print(f"🔘 Ищем кнопку в посте {post_id}...")
+            # Пытаемся найти кнопку именно в нужном посте, если post_id передан
+            btn_participate = page.locator(".Message").last.get_by_role("button", name="Участвовать", exact=True)
+            await btn_participate.click()
+            print("✅ Кнопка 'Участвовать' нажата")
+
+            # Кнопка Confirm
             try:
-                await page.wait_for_selector(button_selector, timeout=10000)
-            except:
-                print("⚠️ [WEB] Кнопки долго не появляются, пробую искать по тексту...")
-            keywords = ['Участвовать', 'Принять участие', 'Участвую', 'Join', 'Participate', 'Check']
-            button = None
-            for word in keywords:
-                found = page.locator(f"button:has-text('{word}'), .btn:has-text('{word}')").last
-                if await found.is_visible():
-                    button = found
-                    print(f"✅ [WEB] Найдена кнопка с текстом: {word}")
+                confirm_btn = page.get_by_role("button", name="Confirm")
+                await confirm_btn.wait_for(state="visible", timeout=5000)
+                await confirm_btn.click()
+                print("✅ Confirm нажат")
+            except: pass
+
+            # --- ТВОЙ ЦИКЛ РЕШЕНИЯ КАПЧИ (БЕЗ ИЗМЕНЕНИЙ) ---
+            print("🚀 Запуск цикла решения капчи (14 попыток)...")
+            for attempt in range(1, 15):
+                target_frame = None
+                for _ in range(15): 
+                    for frame in page.frames:
+                        if "randomgodbot.com" in frame.url:
+                            target_frame = frame
+                            break
+                    if target_frame: break
+                    await asyncio.sleep(1)
+                
+                if not target_frame: 
+                    print("❌ Фрейм не найден.")
                     break
-            if button:
-                await button.scroll_into_view_if_needed()
-                await asyncio.sleep(1)
-                await button.click()
-                print("🔘 [WEB] Клик по кнопке выполнен.")
-                await page.screenshot(path="/app/step3_after_click.png")
-            else:
-                print("❌ [WEB] Кнопка не найдена. Делаю скриншот для диагностики.")
-                await page.screenshot(path="/app/step3_not_found.png")
-                return False
-                       # 4. ПОДТВЕРЖДЕНИЕ ЗАПУСКА (Launch)
-            print("⏳ [WEB] Ожидание окна Launch...")
-            confirm_selector = "button:has-text('Launch'), button:has-text('OK'), button:has-text('Открыть'), button.btn-primary"
-            try:
-                confirm_btn = page.locator(confirm_selector).first
-                await confirm_btn.wait_for(state="visible", timeout=10000)
-                print("🚀 [WEB] Кнопка Launch найдена. Нажимаю...")
-                await confirm_btn.click(delay=500)
-            except:
-                print("⚠️ [WEB] Модалка Launch не появилась, возможно приложение открылось сразу.")
-            # 5. ОЖИДАНИЕ И КЛИК ПО IFRAME
-            print("⏳ [WEB] Ожидание появления Iframe (капчи)...")
-            try:
-                await page.wait_for_selector("iframe", timeout=20000)
-                iframe_element = page.locator("iframe").first
-                print("🖼 [WEB] Iframe обнаружен!")
-            except:
-                print("❌ [WEB] Iframe так и не появился.")
-                await page.screenshot(path="/app/5_no_iframe_error.png")
-                return False
-            await asyncio.sleep(5)
-            try:
-                frame = page.frame_locator("iframe").first
-                target = frame.locator("button, input[type='checkbox'], canvas, [role='button']").first
-                await target.scroll_into_view_if_needed()
-                await target.evaluate("node => node.click()") 
-                print("🎯 [WEB] JS-клик внутри Iframe выполнен успешно.")
-            except Exception as e:
-                print(f"⚠️ [WEB] Ошибка JS-клика: {e}. Пробую силовой клик по центру.")
-                box = await iframe_element.bounding_box()
-                if box:
-                    await page.mouse.click(box['x'] + box['width']/2, box['y'] + box['height']/2)
-            print("⏳ [WEB] Ожидание завершения (15 сек)...")
-            await asyncio.sleep(15) 
-            await page.screenshot(path="/app/step6_final_check.png")
+
+                await asyncio.sleep(2)
+                turnstile = target_frame.locator("#turnstile_check")
+                captcha_img = target_frame.locator("img").first
+                captcha_input = target_frame.locator("#turnstile__answer")
+                ok_button = target_frame.locator(".turnstile__answer_button")
+
+                if not await ok_button.is_visible() and not await turnstile.is_visible() and attempt > 1:
+                    print("🎉 Задача выполнена (кнопка исчезла)!")
+                    return True
+
+                if await turnstile.is_visible():
+                    print("🎯 Клик по Turnstile...")
+                    await turnstile.click()
+                    await asyncio.sleep(6)
+                    continue 
+
+                if await captcha_img.is_visible():
+                    img_bytes = await captcha_img.screenshot()
+                    image = Image.open(io.BytesIO(img_bytes))
+                    # ТВОЙ TESSERACT БЛОК
+                    code = pytesseract.image_to_string(image, config='--psm 7 -c tessedit_char_whitelist=0123456789').strip()
+                    code = "".join([c for c in code if c.isdigit()])
+                    
+                    if len(code) < 5:
+                        code += "".join([str(random.randint(0, 9)) for _ in range(5 - len(code))])
+                    else: 
+                        code = code[:5]
+                    
+                    print(f"📝 Попытка {attempt}: Код {code}")
+                    await captcha_input.click()
+                    await captcha_input.fill("")
+                    await captcha_input.type(code, delay=100)
+                    await asyncio.sleep(1)
+                    await ok_button.click(force=True)
+                    await asyncio.sleep(4)
+                else:
+                    await asyncio.sleep(2)
+            
+            await page.screenshot(path=f"/app/final_{clean_phone}.png")
             return True
+
         except Exception as e:
-            print(f"❌ [WEB-ERR] Ошибка Playwright: {e}")
-            try:
-                await page.screenshot(path=f"/app/error_{clean_phone}.png")
-            except:
-                pass
+            print(f"❌ Ошибка в модуле капчи: {e}")
+            await page.screenshot(path=f"/app/err_{clean_phone}.png")
             return False
         finally:
-            await page.close()
             await context.close()
+
 async def resolve_channel_ids():
     """Фоновая задача: превращает ссылки в реальные tg_id с префиксом -100"""
     # 1. ИМПОРТ ВНУТРИ (чтобы точно не было ошибки)

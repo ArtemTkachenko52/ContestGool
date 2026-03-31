@@ -1,5 +1,5 @@
 import asyncio
-from playwright.async_api import async_playwright
+from patchright.async_api import async_playwright
 import os
 PHONE = "918088396263" # Номер без плюса для папки
 async def login():
