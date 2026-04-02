@@ -1165,16 +1165,16 @@ import io
 import random
 import re
 from patchright.async_api import async_playwright # Используем твой Patchright
-
+import base64
 # В Docker/Linux путь обычно такой, если ставим через apt-get install tesseract-ocr
 # Если запускаешь на Windows, верни свой путь к .exe
 TESSERACT_PATH = '/usr/bin/tesseract' 
 pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+ocr = ddddocr.DdddOcr(show_ad=False)
 async def solve_web_captcha(worker_phone, target_channel_username, post_id):
     clean_phone = "".join(filter(str.isdigit, str(worker_phone)))
     user_data_dir = f"/var/lib/browser_sessions/session_{clean_phone}"
     os.makedirs("/app/screenshots", exist_ok=True)
-
     # Очистка замков
     def clear_lock(u_dir):
         for lock in ['SingletonLock', 'SingletonCookie', 'SingletonSocket']:
@@ -1183,25 +1183,29 @@ async def solve_web_captcha(worker_phone, target_channel_username, post_id):
                 try: os.remove(p)
                 except: pass
     clear_lock(user_data_dir)
-
     async with async_playwright() as p:
         context = await p.chromium.launch_persistent_context(
             user_data_dir=user_data_dir,
-            channel="chromium",
+            channel="chrome",
             headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"]
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-infobars", # Убирает плашку "Браузером управляет ПО"
+                "--window-size=1280,720" # Задаем явный размер окна
+                "--disable-gpu", # ОБЯЗАТЕЛЬНО ДЛЯ DOCKER
+                "--disable-dev-shm-usage" # Помогает, если мало памяти в контейнере
+            ]
         )
         page = context.pages[0] if context.pages else await context.new_page()
-
         try:
             # 1. ЗАГРУЗКА (СТРОГО web.telegram.org)
             print(f"🌐 [WEB] Заход по адресу: https://web.telegram.org/a/")
             await page.goto("https://web.telegram.org/a/", timeout=60000)
-            
             # Ожидание прогрузки интерфейса
             await page.wait_for_selector("#telegram-search-input", timeout=30000)
             await asyncio.sleep(3)
-
             # 2. ТВОЙ БЛОК ПОИСКА КАНАЛА
             print(f"🔍 Поиск канала: {target_channel_username}")
             search_input = page.locator("#telegram-search-input")
@@ -1212,16 +1216,13 @@ async def solve_web_captcha(worker_phone, target_channel_username, post_id):
             # Печатаем
             await page.keyboard.type(target_channel_username.replace("@", ""), delay=120)
             print("✅ Название напечатано")
-            
                         # 3. ПЕРЕХОД В КАНАЛ (ИСПРАВЛЕННЫЙ)
             print("⏳ Ожидание появления результатов...")
             await asyncio.sleep(5) 
-            
             # Ищем блок результата. В Web A результаты поиска имеют класс .search-result
             # Мы кликаем по первому доступному элементу в списке поиска
             try:
                 target_chat = page.locator(".search-result .ListItem-button, .chatlist-top .ListItem-button").first
-                
                 if await target_chat.is_visible(timeout=10000):
                     print("🎯 Клик по первому результату поиска...")
                     await target_chat.click()
@@ -1232,56 +1233,108 @@ async def solve_web_captcha(worker_phone, target_channel_username, post_id):
                 print(f"⚠️ Ошибка клика: {e}. Пробую клик по координатам...")
                 # Если селектор подвел, бьем в область первой строчки поиска
                 await page.mouse.click(150, 150) 
-            
             await asyncio.sleep(5)
-                        # 4. НАХОДИМ НУЖНЫЙ ПОСТ И ЖМЕМ КНОПКУ "УЧАСТВОВАТЬ"
-            print(f"🔘 Ищем пост #{post_id}...")
-            target_post_selector = f"#message-{post_id}"
+                                                # 4. УНИВЕРСАЛЬНЫЙ КЛИК (СТРОГО ПО КНОПКАМ ПОД ТЕКСТОМ)
+            print(f"🔘 Ищем кнопки участия в посте #{post_id}...")
             
             try:
-                # Прокрутка к посту, если его нет на экране
-                for _ in range(10):
-                    if await page.locator(target_post_selector).is_visible():
-                        break
-                    print("⏬ Скроллим к посту...")
-                    await page.locator(".MessageList.custom-scroll").evaluate("node => node.scrollTop = node.scrollHeight")
-                    await asyncio.sleep(2)
-
-                # Твой рабочий метод, но ограниченный областью нужного поста
-                # Это гарантирует, что мы жмем "Участвовать" именно в посте post_id
-                print(f"🎯 Жму кнопку 'Участвовать' в посте {post_id}...")
-                btn_participate = page.locator(target_post_selector).get_by_role("button", name="Участвовать", exact=True)
+                # Находим контейнер кнопок ПОД сообщением. 
+                # Это исключает системные кнопки "Share", "Reply" и т.д.
+                buttons_container = page.locator(f"#message-{post_id} .reply-buttons")
                 
-                await btn_participate.wait_for(state="visible", timeout=5000)
-                await btn_participate.click()
-                print("✅ Кнопка 'Участвовать' нажата успешно")
+                # Ждем, пока блок с кнопками под постом прогрузится
+                await buttons_container.wait_for(state="visible", timeout=10000)
+
+                # Берем ПЕРВУЮ кнопку внутри блока кнопок участия
+                # Ищем по классу .reply-buttons-button, который есть у всех кнопок-ботов
+                target_btn = buttons_container.locator(".reply-buttons-button").first
+                
+                if await target_btn.is_visible():
+                    print(f"🎯 Жму кнопку участия в блоке .reply-buttons...")
+                    await target_btn.click()
+                    print("✅ Кнопка нажата успешно")
+                else:
+                    raise Exception("Кнопка участия не видна")
 
             except Exception as e:
-                print(f"❌ Кнопка 'Участвовать' в посте {post_id} не найдена или не нажата: {e}")
-                # Если по ID не вышло, фолбэк на твой оригинальный метод (последнее сообщение)
+                print(f"❌ Ошибка: {e}. Пробую фолбэк (первый div с ролью button)...")
+                # Если контейнер не найден, жмем ПЕРВЫЙ div/button внутри поста, 
+                # НО исключая те, что имеют класс "message-action-button" (это и есть твой Share)
                 try:
-                    await page.locator(".Message").last.get_by_role("button", name="Участвовать", exact=True).click()
-                    print("✅ Нажато через fallback (.last)")
+                    fallback_btn = page.locator(f"#message-{post_id} .reply-buttons-button, #message-{post_id} button:not(.message-action-button)").first
+                    await fallback_btn.click()
+                    print("✅ Нажато через фолбэк (исключая Share)")
                 except:
                     return False
 
-            # 5. КНОПКА CONFIRM
+                                   # 5. КНОПКА CONFIRM + ОЖИДАНИЕ MINI APP
             print("⏳ Ожидание окна Confirm...")
-            await asyncio.sleep(1.5) # Пауза для появления окна
             try:
-                # Используем такой же надежный метод get_by_role для Confirm
-                confirm_btn = page.get_by_role("button", name="Confirm", exact=True)
-                if await confirm_btn.is_visible(timeout=5000):
-                    await confirm_btn.click()
-                    print("✅ Confirm нажат")
-            except:
-                # Если кнопка Confirm называется иначе (например, на русском), пробуем нажать Enter
+                confirm_btn = page.get_by_role("button", name="Confirm")
+                await confirm_btn.wait_for(state="visible", timeout=5000)
+                await confirm_btn.click()
+                print("✅ Confirm нажат")
+            except: 
                 await page.keyboard.press("Enter")
-                print("ℹ️ Окно Confirm не найдено или нажато через Enter")
-
-            await page.screenshot(path=f"/app/screenshots/debug_{clean_phone}_final.png")
+                print("ℹ️ Нажат Enter")
+            # --- ВОТ ТУТ УВЕЛИЧИВАЕМ ВРЕМЯ (Ждем прогрузки Mini App) ---
+            print("⏳ Ждем 10 секунд для полной прогрузки Mini App...")
+            await asyncio.sleep(10) 
+            # --- БЛОК НАЖАТИЯ "Я НЕ РОБОТ" (ВНУТРИ IFRAME) ---
+            try:
+                # Mini App всегда в iframe, поэтому ищем кнопку там
+                app_frame = page.frame_locator("iframe").first
+                check_btn = app_frame.locator("#turnstile_check")
+                # Ждем появления кнопки внутри фрейма еще до 10 сек
+                await check_btn.wait_for(state="visible", timeout=10000)
+                print("🔘 Нажимаю 'Я не робот' внутри Mini App...")
+                await check_btn.click()
+                # Еще чуть-чуть времени, чтобы подгрузилась картинка с цифрами
+                await asyncio.sleep(5)
+                print("✅ Кнопка нажата, ждем появления капчи")
+            except Exception as e:
+                print(f"⚠️ Кнопка 'Я не робот' не найдена во фрейме: {e}")
+                            # --- БЛОК РЕШЕНИЯ КАПЧИ (ИСПРАВЛЕННЫЙ) ---
+            print("🧩 Начинаю цикл распознавания...")
+            app_frame = page.frame_locator("iframe").first
+            while True:
+                try:
+                    # 1. СНАЧАЛА ПРОВЕРЯЕМ: может капча уже исчезла?
+                    answer_input = app_frame.locator("#turnstile__answer")
+                    # Если инпут не виден в течение 3 секунд — значит капча пройдена
+                    if not await answer_input.is_visible(timeout=3000):
+                        print("🎉 Капча исчезла! Похоже, мы успешно участвуем.")
+                        break
+                    # 2. Если инпут всё еще на месте, работаем с картинкой
+                    captcha_img = app_frame.locator("img[alt='captcha']")
+                    if not await captcha_img.is_visible():
+                        print("✅ Картинка не найдена, выходим из цикла.")
+                        break
+                    img_src = await captcha_img.get_attribute("src")
+                    base64_data = img_src.split("base64,")[-1]
+                    img_bytes = base64.b64decode(base64_data)
+                    raw_res = ocr.classification(img_bytes)
+                    digits = "".join(filter(str.isdigit, raw_res))
+                    import random
+                    while len(digits) < 5:
+                        digits += str(random.randint(0, 9))
+                    final_answer = digits[:5]
+                    print(f"🤖 Ввожу ответ: {final_answer}")
+                    # 3. Ввод и ОК
+                    # Используем force=True, если вдруг элемент считается disabled в моменте
+                    await answer_input.fill(final_answer, timeout=5000)
+                    ok_button = app_frame.locator(".turnstile__answer_button")
+                    await ok_button.click()
+                    print("🚀 Нажал ОК, жду 5 сек на проверку...")
+                    # Даем время сайту подумать и скрыть окно
+                    await asyncio.sleep(5)
+                except Exception as e:
+                    # Если во время любой операции (fill/click) элемент исчез — это успех
+                    print(f"ℹ️ Окно капчи закрылось во время работы (Успех)")
+                    break
+            print("✅ Работа с веб-капчей завершена успешно")
+            await page.screenshot(path=f"/app/screenshots/final_success_{clean_phone}.png")
             return True
-
         except Exception as e:
             print(f"❌ [WEB-ERR] Ошибка: {e}")
             if 'page' in locals():
@@ -1289,7 +1342,6 @@ async def solve_web_captcha(worker_phone, target_channel_username, post_id):
             return False
         finally:
             await context.close()
-
 async def resolve_channel_ids():
     """Фоновая задача: превращает ссылки в реальные tg_id с префиксом -100"""
     # 1. ИМПОРТ ВНУТРИ (чтобы точно не было ошибки)
